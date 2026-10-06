@@ -1,0 +1,219 @@
+CREATE TABLE h (
+ts    DATETIME(3) NOT NULL,
+host  VARCHAR(8) NOT NULL COMMENT 'TAG',
+v     INT,
+INDEX ts_idx (ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+# 3 hosts, one row every 10 minutes for 6 hours; first half sealed
+INSERT INTO h SELECT '2026-04-01 00:00:00' + INTERVAL seq * 10 MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_35;
+FLUSH TABLES h;
+INSERT INTO h SELECT '2026-04-01 06:00:00' + INTERVAL seq * 10 MINUTE, CONCAT('h', seq MOD 3), 100 + seq FROM seq_0_to_35;
+# Rows with identical timestamps keep all their copies (06:05, in the MemTable)
+INSERT INTO h VALUES ('2026-04-01 06:05:00.000', 'dup', 1000), ('2026-04-01 06:05:00.000', 'dup', 1001);
+CREATE TABLE ctl (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL, v INT, INDEX(ts)) ENGINE=MyISAM;
+INSERT INTO ctl SELECT * FROM h;
+# ---- EXPLAIN ----
+EXPLAIN SELECT * FROM h WHERE ts BETWEEN '2026-04-01 01:00:00' AND '2026-04-01 02:00:00';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	range	ts_idx	ts_idx	7	NULL	7	#
+EXPLAIN SELECT * FROM h WHERE ts >= '2026-04-01 05:00:00';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	range	ts_idx	ts_idx	7	NULL	44	#
+EXPLAIN SELECT * FROM h WHERE ts = '2026-04-01 05:00:00';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	ref	ts_idx	ts_idx	7	const	1	#
+EXPLAIN SELECT * FROM h ORDER BY ts DESC LIMIT 5;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	index	NULL	ts_idx	7	NULL	5	#
+EXPLAIN SELECT * FROM h ORDER BY ts LIMIT 5;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	index	NULL	ts_idx	7	NULL	5	#
+EXPLAIN SELECT * FROM h WHERE host = 'h1';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	ALL	NULL	NULL	NULL	NULL	74	#
+EXPLAIN SELECT * FROM h WHERE host = 'h1' AND ts > '2026-04-01 03:00:00';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	ALL	ts_idx	NULL	NULL	NULL	74	#
+EXPLAIN SELECT * FROM h WHERE v > 3 ORDER BY ts DESC;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	ALL	NULL	NULL	NULL	NULL	74	#
+EXPLAIN SELECT host, COUNT(*) FROM h GROUP BY host;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	ALL	NULL	NULL	NULL	NULL	74	#
+EXPLAIN SELECT MIN(ts), MAX(ts) FROM h;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	#
+EXPLAIN SELECT a.v, b.v FROM h a JOIN h b ON a.ts = b.ts WHERE a.host = 'h0' AND b.host = 'h1';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	a	ALL	ts_idx	NULL	NULL	NULL	74	#
+1	SIMPLE	b	ref	ts_idx	ts_idx	7	test.a.ts	8	#
+EXPLAIN SELECT * FROM h FORCE INDEX (ts_idx) WHERE v = 3;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	ALL	NULL	NULL	NULL	NULL	74	#
+EXPLAIN SELECT * FROM h IGNORE INDEX (ts_idx) WHERE ts > '2026-04-01 05:00:00';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	ALL	NULL	NULL	NULL	NULL	74	#
+SELECT * FROM h USE INDEX (nope);
+ERROR 42000: Key 'nope' doesn't exist in table 'h'
+EXPLAIN FORMAT=JSON SELECT ts FROM h WHERE ts < '2026-04-01 00:30:00' ORDER BY ts;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": COST,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "h",
+          "access_type": "range",
+          "possible_keys": ["ts_idx"],
+          "key": "ts_idx",
+          "key_length": "7",
+          "used_key_parts": ["ts"],
+          "loops": 1,
+          "rows": 3,
+          "cost": COST,
+          "filtered": 100,
+          "attached_condition": "h.ts < '2026-04-01 00:30:00'"
+        }
+      }
+    ]
+  }
+}
+# Row estimates stay sane: a narrow range is cheaper than the whole table
+EXPLAIN SELECT COUNT(*) FROM h WHERE ts BETWEEN '2026-04-01 00:00:00' AND '2026-04-01 00:09:59';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	h	range	ts_idx	ts_idx	7	NULL	1	#
+SELECT TABLE_ROWS > 0 AS has_estimate FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'h';
+has_estimate
+1
+# ---- ORDER BY / LIMIT / OFFSET ----
+SELECT ts, v FROM h ORDER BY ts LIMIT 3;
+ts	v
+2026-04-01 00:00:00.000	0
+2026-04-01 00:10:00.000	1
+2026-04-01 00:20:00.000	2
+SELECT ts, v FROM h ORDER BY ts DESC LIMIT 3;
+ts	v
+2026-04-01 11:50:00.000	135
+2026-04-01 11:40:00.000	134
+2026-04-01 11:30:00.000	133
+SELECT ts, v FROM h ORDER BY ts LIMIT 3 OFFSET 34;
+ts	v
+2026-04-01 05:40:00.000	34
+2026-04-01 05:50:00.000	35
+2026-04-01 06:00:00.000	100
+SELECT ts, v FROM h ORDER BY ts DESC LIMIT 2 OFFSET 33;
+ts	v
+2026-04-01 06:20:00.000	102
+2026-04-01 06:10:00.000	101
+SELECT ts, v FROM h WHERE ts > '2026-04-01 05:30:00' ORDER BY ts LIMIT 3;
+ts	v
+2026-04-01 05:40:00.000	34
+2026-04-01 05:50:00.000	35
+2026-04-01 06:00:00.000	100
+SELECT ts, v FROM h WHERE ts >= '2026-04-01 05:30:00' ORDER BY ts DESC LIMIT 4 OFFSET 38;
+ts	v
+2026-04-01 05:50:00.000	35
+2026-04-01 05:40:00.000	34
+2026-04-01 05:30:00.000	33
+SELECT ts, v FROM h WHERE ts < '2026-04-01 06:00:00' ORDER BY ts DESC LIMIT 2;
+ts	v
+2026-04-01 05:50:00.000	35
+2026-04-01 05:40:00.000	34
+SELECT ts, v FROM h WHERE ts <= '2026-04-01 06:00:00' ORDER BY ts DESC, v DESC LIMIT 4;
+ts	v
+2026-04-01 06:00:00.000	100
+2026-04-01 05:50:00.000	35
+2026-04-01 05:40:00.000	34
+2026-04-01 05:30:00.000	33
+SELECT ts, host, v FROM h WHERE host = 'dup' ORDER BY ts DESC, v DESC;
+ts	host	v
+2026-04-01 06:05:00.000	dup	1001
+2026-04-01 06:05:00.000	dup	1000
+SELECT ts, v FROM h ORDER BY ts LIMIT 0;
+ts	v
+SELECT ts, v FROM h ORDER BY ts LIMIT 100000 OFFSET 71;
+ts	v
+2026-04-01 11:30:00.000	133
+2026-04-01 11:40:00.000	134
+2026-04-01 11:50:00.000	135
+SELECT ts, v FROM h ORDER BY ts LIMIT 5 OFFSET 100000;
+ts	v
+SELECT COUNT(*) FROM (SELECT ts FROM h ORDER BY ts DESC LIMIT 1000) x;
+COUNT(*)
+74
+# Same answers as the control table for ordered scans (ties broken on v)
+SELECT (SELECT GROUP_CONCAT(v ORDER BY ts, v) FROM h) = (SELECT GROUP_CONCAT(v ORDER BY ts, v) FROM ctl) AS same_order;
+same_order
+1
+SELECT (SELECT GROUP_CONCAT(v ORDER BY ts DESC, v DESC) FROM h) = (SELECT GROUP_CONCAT(v ORDER BY ts DESC, v DESC) FROM ctl) AS same_order_desc;
+same_order_desc
+1
+SELECT MIN(ts), MAX(ts), MIN(v), MAX(v) FROM h;
+MIN(ts)	MAX(ts)	MIN(v)	MAX(v)
+2026-04-01 00:00:00.000	2026-04-01 11:50:00.000	0	1001
+SELECT ts FROM h WHERE ts = (SELECT MAX(ts) FROM h);
+ts
+2026-04-01 11:50:00.000
+SELECT ts FROM h WHERE ts = (SELECT MIN(ts) FROM h);
+ts
+2026-04-01 00:00:00.000
+# Index scan results are the same with the index ignored
+SELECT COUNT(*), SUM(v) FROM h WHERE ts BETWEEN '2026-04-01 02:00:00' AND '2026-04-01 08:00:00';
+COUNT(*)	SUM(v)
+39	3943
+SELECT COUNT(*), SUM(v) FROM h IGNORE INDEX (ts_idx) WHERE ts BETWEEN '2026-04-01 02:00:00' AND '2026-04-01 08:00:00';
+COUNT(*)	SUM(v)
+39	3943
+SELECT COUNT(*), SUM(v) FROM ctl WHERE ts BETWEEN '2026-04-01 02:00:00' AND '2026-04-01 08:00:00';
+COUNT(*)	SUM(v)
+39	3943
+# Direction changes inside one scan (ORDER BY ts DESC on a range, then LIMIT)
+SELECT ts FROM h WHERE ts BETWEEN '2026-04-01 03:00:00' AND '2026-04-01 03:50:00' ORDER BY ts DESC;
+ts
+2026-04-01 03:50:00.000
+2026-04-01 03:40:00.000
+2026-04-01 03:30:00.000
+2026-04-01 03:20:00.000
+2026-04-01 03:10:00.000
+2026-04-01 03:00:00.000
+SELECT ts FROM h WHERE ts BETWEEN '2026-04-01 03:00:00' AND '2026-04-01 03:50:00' ORDER BY ts;
+ts
+2026-04-01 03:00:00.000
+2026-04-01 03:10:00.000
+2026-04-01 03:20:00.000
+2026-04-01 03:30:00.000
+2026-04-01 03:40:00.000
+2026-04-01 03:50:00.000
+SELECT ts FROM h WHERE ts > '2026-04-01 05:50:00' AND ts < '2026-04-01 06:10:00' ORDER BY ts DESC, v DESC;
+ts
+2026-04-01 06:05:00.000
+2026-04-01 06:05:00.000
+2026-04-01 06:00:00.000
+# ---- HANDLER ----
+# The engine does not advertise HA_CAN_SQL_HANDLER, so the server refuses the
+# HANDLER interface for MooseDB tables (documented limitation, not a crash)
+HANDLER h OPEN;
+ERROR HY000: Storage engine MooseDB of the table `test`.`h` doesn't have this option
+HANDLER h OPEN AS a;
+ERROR HY000: Storage engine MooseDB of the table `test`.`h` doesn't have this option
+HANDLER h READ ts_idx FIRST;
+ERROR 42S02: Unknown table 'h' in HANDLER
+HANDLER h CLOSE;
+ERROR 42S02: Unknown table 'h' in HANDLER
+# The table is unaffected
+SELECT COUNT(*) FROM h;
+COUNT(*)
+74
+FLUSH TABLES h;
+SELECT COUNT(*) FROM h;
+COUNT(*)
+74
+TRUNCATE TABLE h;
+HANDLER h OPEN;
+ERROR HY000: Storage engine MooseDB of the table `test`.`h` doesn't have this option
+SELECT COUNT(*) FROM h;
+COUNT(*)
+0
+DROP TABLE h, ctl;

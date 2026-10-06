@@ -1,0 +1,53 @@
+CREATE TABLE t (
+ts      DATETIME(6) NOT NULL,
+site    INT NOT NULL COMMENT 'TAG',
+i8      TINYINT,
+u64     BIGINT UNSIGNED,
+i64     BIGINT,
+f       FLOAT,
+d       DOUBLE,
+dec1    DECIMAL(20,6),
+b       BOOLEAN,
+vc      VARCHAR(100) CHARACTER SET utf8mb4,
+txt     TEXT,
+bin     VARBINARY(16),
+dt      DATE,
+tm      TIME(3),
+e       ENUM('ok','warn','crit'),
+yr      YEAR,
+js      JSON,
+INDEX ts_idx (ts)
+) ENGINE=MooseDB;
+INSERT INTO t VALUES
+('2026-10-01 00:00:00.000001', 1, -128, 18446744073709551615, -9223372036854775808,
+1.5, 2.25, 12345678901234.123456, TRUE, 'ação ☃', REPEAT('x', 300), X'00FF10',
+'2026-02-28', '-12:34:56.789', 'crit', 2026, '{"a": [1, 2]}'),
+('2026-10-01 00:00:00.000002', 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+('1970-01-01 00:00:00', 3, 0, 0, 0, -0.0, -1e300, -0.000001, FALSE, '', '', '',
+'1000-01-01', '00:00:00', 'ok', 1901, 'null'),
+('1969-07-20 20:17:40.5', 4, 1, 1, 1, 0, 0, 0, 1, 'pre-epoch', 'x', X'01',
+'9999-12-31', '838:59:59', 'warn', 2155, '[]');
+SELECT ts, site, i8, u64, i64, f, d, dec1, b, vc, LENGTH(txt), HEX(bin), dt, tm, e, yr, js FROM t ORDER BY site;
+ts	site	i8	u64	i64	f	d	dec1	b	vc	LENGTH(txt)	HEX(bin)	dt	tm	e	yr	js
+2026-10-01 00:00:00.000001	1	-128	18446744073709551615	-9223372036854775808	1.5	2.25	12345678901234.123456	1	ação ☃	300	00FF10	2026-02-28	-12:34:56.789	crit	2026	{"a": [1, 2]}
+2026-10-01 00:00:00.000002	2	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+1970-01-01 00:00:00.000000	3	0	0	0	0	-1e300	-0.000001	0		0		1000-01-01	00:00:00.000	ok	1901	null
+1969-07-20 20:17:40.500000	4	1	1	1	0	0	0.000000	1	pre-epoch	1	01	9999-12-31	838:59:59.000	warn	2155	[]
+FLUSH TABLES t;
+# Same rows after sealing into a chunk
+SELECT ts, site, i8, u64, i64, f, d, dec1, b, vc, LENGTH(txt), HEX(bin), dt, tm, e, yr, js FROM t ORDER BY site;
+ts	site	i8	u64	i64	f	d	dec1	b	vc	LENGTH(txt)	HEX(bin)	dt	tm	e	yr	js
+2026-10-01 00:00:00.000001	1	-128	18446744073709551615	-9223372036854775808	1.5	2.25	12345678901234.123456	1	ação ☃	300	00FF10	2026-02-28	-12:34:56.789	crit	2026	{"a": [1, 2]}
+2026-10-01 00:00:00.000002	2	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+1970-01-01 00:00:00.000000	3	0	0	0	0	-1e300	-0.000001	0		0		1000-01-01	00:00:00.000	ok	1901	null
+1969-07-20 20:17:40.500000	4	1	1	1	0	0	0.000000	1	pre-epoch	1	01	9999-12-31	838:59:59.000	warn	2155	[]
+# Zero dates cannot be stored in the time axis
+SET sql_mode = '';
+INSERT INTO t (ts, site) VALUES ('0000-00-00 00:00:00', 9);
+Got one of the listed errors
+SET sql_mode = DEFAULT;
+SELECT COUNT(*) FROM t;
+COUNT(*)
+4
+DROP TABLE t;

@@ -1,0 +1,42 @@
+#
+# INFORMATION_SCHEMA.MOOSEDB_TABLES and MOOSEDB_CHUNKS.
+#
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE FROM information_schema.PLUGINS
+  WHERE PLUGIN_NAME LIKE 'MOOSEDB%' OR PLUGIN_NAME = 'MooseDB' ORDER BY PLUGIN_NAME;
+SHOW COLUMNS FROM information_schema.MOOSEDB_TABLES;
+SHOW COLUMNS FROM information_schema.MOOSEDB_CHUNKS;
+
+CREATE DATABASE `tf-db`;
+CREATE TABLE `tf-db`.`m-1` (ts DATETIME(6) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v DOUBLE, INDEX(ts))
+  ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR' RETENTION_PERIOD='3650 DAYS';
+INSERT INTO `tf-db`.`m-1` SELECT '2026-01-01' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 4), seq FROM seq_0_to_179;
+FLUSH TABLES `tf-db`.`m-1`;
+INSERT INTO `tf-db`.`m-1` VALUES ('2026-01-01 05:00:00', 'h9', 1);
+
+--echo # Names are decoded from the file system encoding; unsealed rows are PENDING
+SELECT TABLE_SCHEMA, TABLE_NAME, ROW_COUNT, PENDING_ROWS, SERIES, CHUNKS, RETENTION, CHUNK_INTERVAL,
+       COMPRESSION, ENCRYPTED
+  FROM information_schema.MOOSEDB_TABLES WHERE TABLE_SCHEMA = 'tf-db';
+SELECT CHUNK_ID, TS_MIN, TS_MAX, `ROWS`, SERIES, STATUS, COMPRESSION, ENCRYPTED, CHUNK_FILE,
+       DATA_MB > COMPRESSED_MB AS compressed, SEALED_AT > NOW() - INTERVAL 1 HOUR AS recent
+  FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_SCHEMA = 'tf-db' ORDER BY CHUNK_ID;
+
+--echo # Closed tables are read from disk without opening them
+FLUSH TABLES;
+SELECT ROW_COUNT, PENDING_ROWS, CHUNKS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_SCHEMA = 'tf-db';
+
+--echo # Storage internals require the PROCESS privilege
+CREATE USER tf_user;
+GRANT SELECT ON `tf-db`.* TO tf_user;
+connect (u, localhost, tf_user,,);
+SELECT COUNT(*) FROM information_schema.MOOSEDB_TABLES;
+SELECT COUNT(*) FROM information_schema.MOOSEDB_CHUNKS;
+connection default;
+disconnect u;
+DROP USER tf_user;
+
+DROP DATABASE `tf-db`;
+SELECT COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_SCHEMA = 'tf-db';

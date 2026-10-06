@@ -1,0 +1,50 @@
+call mtr.add_suppression("MooseDB");
+call mtr.add_suppression("marked as crashed");
+call mtr.add_suppression("Checking table");
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts))
+ENGINE=MooseDB CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+# Two days far in the past, two days relative to now
+INSERT INTO t VALUES
+('2001-01-01 00:00:00', 1),
+('2001-01-02 00:00:00', 2),
+(NOW() - INTERVAL 1 DAY, 3),
+(NOW(), 4);
+CHECK TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	check	status	OK
+# OPTIMIZE seals the MemTable and applies retention
+OPTIMIZE TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	optimize	status	OK
+SELECT v FROM t ORDER BY v;
+v
+3
+4
+CHECK TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	check	status	OK
+# Corrupt the OLDEST chunk on disk while the table is closed. Recovery
+# only fully verifies the newest chunk, so CHECK TABLE must catch it.
+FLUSH TABLES t;
+CHECK TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	check	Warning	MooseDB: 1 corrupt chunk(s): chunk_X.tfl: test.t/chunk_X.tfl checksum mismatch
+test.t	check	error	Corrupt
+SELECT SUM(v) FROM t;
+ERROR HY000: Table 't' is marked as crashed and should be repaired
+DROP TABLE t;
+# A corrupt NEWEST chunk is quarantined (.tfl.corrupt) when the table
+# is opened, and the table stays usable (spec §12.f).
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO t VALUES ('2026-01-01', 1);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-02', 2);
+FLUSH TABLES t;
+SELECT v FROM t;
+v
+1
+CHECK TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	check	status	OK
+chunk_20260102T000000_20260103T000000_000002.tfl.corrupt
+DROP TABLE t;

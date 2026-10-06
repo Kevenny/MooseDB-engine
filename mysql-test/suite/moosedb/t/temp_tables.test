@@ -1,0 +1,100 @@
+#
+# CREATE TEMPORARY TABLE ... ENGINE=MooseDB is accepted: the table lives in
+# tmpdir, is private to the session and disappears with it. Behavior
+# documented here: it is fully usable (INSERT, scans, ordered scans, pushdown,
+# TRUNCATE, ALTER, RENAME), two sessions can use the same name, and the data
+# never shows up in INFORMATION_SCHEMA.MOOSEDB_TABLES (that view reads the
+# datadir only).
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TEMPORARY TABLE tt (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts))
+  ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+SHOW CREATE TABLE tt;
+INSERT INTO tt SELECT '2026-01-01' + INTERVAL seq * 10 MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_29;
+SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) FROM tt;
+SELECT ts, host, v FROM tt ORDER BY ts DESC LIMIT 3;
+SELECT host, COUNT(*) FROM tt WHERE host = 'h2' GROUP BY host;
+SELECT COUNT(*) FROM tt WHERE ts BETWEEN '2026-01-01 01:00:00' AND '2026-01-01 02:00:00';
+
+--echo # Not visible in INFORMATION_SCHEMA, nor from another session
+SELECT COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'tt';
+connect (con2,localhost,root,,test);
+--error ER_NO_SUCH_TABLE
+SELECT COUNT(*) FROM tt;
+--echo # The same name in two sessions holds independent data
+CREATE TEMPORARY TABLE tt (ts DATETIME NOT NULL, other INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO tt VALUES ('2030-01-01', 1), ('2030-01-02', 2);
+SELECT * FROM tt ORDER BY ts;
+connection default;
+SELECT COUNT(*), SUM(v) FROM tt;
+connection con2;
+FLUSH TABLES;
+SELECT COUNT(*) FROM tt;
+DROP TEMPORARY TABLE tt;
+--error ER_BAD_TABLE_ERROR
+DROP TEMPORARY TABLE tt;
+--error ER_NO_SUCH_TABLE
+SELECT COUNT(*) FROM tt;
+disconnect con2;
+connection default;
+SELECT COUNT(*), SUM(v) FROM tt;
+
+--echo # A temporary table shadows a base table of the same name
+CREATE TABLE shadow (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO shadow VALUES ('2026-05-05', 1);
+CREATE TEMPORARY TABLE shadow (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO shadow VALUES ('2026-06-06', 2), ('2026-06-07', 3);
+SELECT COUNT(*) FROM shadow;
+DROP TEMPORARY TABLE shadow;
+SELECT COUNT(*) FROM shadow;
+DROP TABLE shadow;
+
+--echo # TRUNCATE, ALTER and RENAME of a temporary table
+TRUNCATE TABLE tt;
+SELECT COUNT(*) FROM tt;
+INSERT INTO tt VALUES ('2026-02-02', 'a', 1), ('2026-02-03', 'b', 2);
+ALTER TABLE tt ADD COLUMN w INT DEFAULT 9;
+SELECT * FROM tt ORDER BY ts;
+ALTER TABLE tt RENAME TO tt2;
+SELECT COUNT(*), SUM(w) FROM tt2;
+--error ER_NO_SUCH_TABLE
+SELECT COUNT(*) FROM tt;
+FLUSH TABLES;
+SELECT COUNT(*), SUM(w) FROM tt2;
+--echo # FLUSH TABLES tt2 / OPTIMIZE / CHECK
+OPTIMIZE TABLE tt2;
+CHECK TABLE tt2;
+DROP TEMPORARY TABLE tt2;
+
+--echo # Temporary table with encryption options validates the key too
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TEMPORARY TABLE te (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=99;
+
+--echo # Rows survive a flush into a chunk inside the session
+CREATE TEMPORARY TABLE big (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR' MEMTABLE_SIZE=4096;
+INSERT INTO big SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_1_to_3000;
+SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) FROM big;
+FLUSH TABLES;
+SELECT COUNT(*), SUM(v) FROM big;
+DROP TEMPORARY TABLE big;
+
+--echo # A session that ends with a temporary table does not leave files behind
+connect (con3,localhost,root,,test);
+CREATE TEMPORARY TABLE gone (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO gone SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_1_to_100;
+let $tmpdir= `SELECT @@tmpdir`;
+disconnect con3;
+connection default;
+--let $count_sessions= 1
+--source include/wait_until_count_sessions.inc
+--perl
+use strict;
+my $dir = $ENV{MYSQLTEST_VARDIR} . "/tmp/mysqld.1";
+opendir(my $dh, $dir) or die "opendir $dir: $!";
+my @left = grep { !/^\./ } readdir($dh);
+closedir($dh);
+print "leftover temporary table directories: ", scalar(@left), " (@left)", chr(10);
+EOF

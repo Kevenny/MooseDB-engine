@@ -1,10 +1,10 @@
-# TideFlow development image.
+# MooseDB development image.
 #
 # Contains the Rust toolchain, cbindgen, a C++20 compiler and the MariaDB
 # source tree matching the server version we target. The plugin must be
 # compiled against the exact same source version as the server that loads it.
 #
-#   docker build -f docker/dev.Dockerfile -t tideflow-dev .
+#   docker build -f docker/dev.Dockerfile -t moosedb-dev .
 #
 FROM rust:1-bookworm
 

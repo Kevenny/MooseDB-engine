@@ -1,6 +1,6 @@
 # Runtime/test image: the official MariaDB 11.4 server plus its test framework (MTR).
 #
-#   docker build -f docker/test.Dockerfile -t tideflow-test docker/
+#   docker build -f docker/test.Dockerfile -t moosedb-test docker/
 #
 FROM mariadb:11.4
 

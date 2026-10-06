@@ -1,6 +1,6 @@
-# TideFlow — Guia do usuário
+# MooseDB — Guia do usuário
 
-TideFlow é uma storage engine time-series para MariaDB 11.4+: dados
+MooseDB é uma storage engine time-series para MariaDB 11.4+: dados
 append-only, agrupados em arquivos por intervalo de tempo, comprimidos por
 tipo de coluna e expirados automaticamente.
 
@@ -10,23 +10,23 @@ tipo de coluna e expirados automaticamente.
 # my.cnf — v0.x se declara EXPERIMENTAL
 [mariadb]
 plugin_maturity = experimental
-plugin_load_add = ha_tideflow
+plugin_load_add = ha_moosedb
 ```
 
 ou, com `plugin_maturity = experimental` já no my.cnf (a variável é somente
 leitura), em tempo de execução:
 
 ```sql
-INSTALL SONAME 'ha_tideflow';
-SHOW ENGINES;                                   -- TideFlow | YES
+INSTALL SONAME 'ha_moosedb';
+SHOW ENGINES;                                   -- MooseDB | YES
 ```
 
-Para `CALL tideflow_compact(...)` e `CALL tideflow_apply_retention(...)`,
-instale as procedures em cada banco que tiver tabelas TideFlow:
+Para `CALL moosedb_compact(...)` e `CALL moosedb_apply_retention(...)`,
+instale as procedures em cada banco que tiver tabelas MooseDB:
 
 ```sql
 USE metricas;
-SOURCE /caminho/para/storage/tideflow/sql/tideflow_install.sql;
+SOURCE /caminho/para/storage/moosedb/sql/moosedb_install.sql;
 ```
 
 ## Criando uma tabela
@@ -39,7 +39,7 @@ CREATE TABLE metricas (
     value     DOUBLE,
     value_int BIGINT,
     INDEX ts_idx (ts)
-) ENGINE=TideFlow
+) ENGINE=MooseDB
   CHUNK_INTERVAL    = '1 DAY'
   RETENTION_PERIOD  = '90 DAYS'
   COMPRESSION       = 'ZSTD'
@@ -51,7 +51,8 @@ Regras:
 
 * uma coluna `DATETIME` ou `TIMESTAMP` **NOT NULL** é o eixo do tempo, com um
   índice simples (`INDEX (ts)`); outros índices, `UNIQUE`/`PRIMARY KEY` e
-  `AUTO_INCREMENT` não são aceitos;
+  `AUTO_INCREMENT` não são aceitos, nem `PARTITION BY` (o tempo já é
+  particionado em chunks);
 * colunas com `COMMENT 'TAG'` formam a identidade da **série** (host, sensor,
   métrica…). Filtros `=`/`IN` sobre TAGs leem só as séries correspondentes;
 * `DATETIME` é armazenado como relógio de parede (UTC); `TIMESTAMP`, como
@@ -64,7 +65,7 @@ Regras:
 | `COMPRESSION` | `ZSTD`, `LZ4`, `NONE` (codec dos chunks frios) | `ZSTD` |
 | `COMPRESSION_LEVEL` | 1–19 | 3 |
 | `HOT_THRESHOLD` | período; mais novos = LZ4 | `7 DAYS` |
-| `MEMTABLE_SIZE` | bytes (mín. 4096) | `tideflow_memtable_flush_threshold` |
+| `MEMTABLE_SIZE` | bytes (4096 – 96 MiB) | `moosedb_memtable_flush_threshold` |
 | `TIMESTAMP_COLUMN` | nome da coluna | coluna do índice temporal |
 | `ENCRYPTION` | `YES`/`NO` | `NO` |
 | `ENCRYPTION_KEY_ID` | id no key management | 1 |
@@ -85,7 +86,7 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
   imutáveis. Use `RETENTION_PERIOD` para expirar e `TRUNCATE TABLE` (ou
   `DELETE` sem `WHERE`) para esvaziar.
 * Uma linha está durável quando o statement retorna OK
-  (`tideflow_wal_sync_mode=fsync`). Com `write`, sobrevive a um crash do
+  (`moosedb_wal_sync_mode=fsync`). Com `write`, sobrevive a um crash do
   `mysqld`, mas não a uma queda do sistema operacional.
 
 ## Manutenção
@@ -93,10 +94,14 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
 ```sql
 FLUSH TABLES metricas;     -- sela a MemTable em chunks
 OPTIMIZE TABLE metricas;   -- flush + retenção + compactação de tudo
-CALL tideflow_compact('metricas', '2026-01-01', '2026-06-30');
-CALL tideflow_apply_retention('metricas');
+CALL moosedb_compact('metricas', '2026-01-01', '2026-06-30');
+CALL moosedb_apply_retention('metricas');
 CHECK TABLE metricas;      -- verifica o CRC32 de todos os chunks
 ```
+
+Privilégios: `moosedb_apply_retention` exige `DELETE` na tabela e
+`moosedb_compact`, `ALTER`. As procedures funcionam com qualquer charset de
+cliente (instale o script com o cliente que preferir).
 
 Em background, threads de manutenção aplicam a retenção e compactam os
 intervalos de tempo que acumulam chunks, em tabelas abertas.
@@ -106,11 +111,11 @@ intervalos de tempo que acumulam chunks, em tabelas abertas.
 Requer o privilégio `PROCESS`.
 
 ```sql
-SELECT * FROM information_schema.TIDEFLOW_TABLES;
+SELECT * FROM information_schema.MOOSEDB_TABLES;
 
 SELECT TS_MIN, TS_MAX, `ROWS`, SERIES, DATA_MB, COMPRESSED_MB, RATIO,
        STATUS, COMPRESSION, CHUNK_FILE
-  FROM information_schema.TIDEFLOW_CHUNKS
+  FROM information_schema.MOOSEDB_CHUNKS
  WHERE TABLE_NAME = 'metricas' ORDER BY TS_MIN DESC;
 ```
 
@@ -127,25 +132,30 @@ file_key_management_filename = /etc/mysql/keys.txt   # chaves de 256 bits
 
 ```sql
 CREATE TABLE segura (ts DATETIME(6) NOT NULL, v DOUBLE, INDEX(ts))
-  ENGINE=TideFlow ENCRYPTION='YES' ENCRYPTION_KEY_ID=1;
+  ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=1;
 ```
 
 Chunks e WAL são cifrados com AES-256-CTR. Rotacionar a chave no key
 management é transparente: dados novos usam a versão mais recente e os
 antigos continuam legíveis.
 
+A criptografia protege a **confidencialidade**, não a integridade: quem pode
+escrever no datadir consegue adulterar dados cifrados sem ser detectado. Se a
+chave configurada não decifra a tabela, ela simplesmente não abre — nada é
+descartado; corrija a configuração de chaves e reabra.
+
 ## Variáveis globais
 
 | Variável | Padrão | Efeito |
 |---|---|---|
-| `tideflow_wal_sync_mode` | `fsync` | `fsync` ou `write` no fim do statement |
-| `tideflow_memtable_flush_threshold` | 64 MiB | MemTable padrão por tabela |
-| `tideflow_compaction_trigger_chunks` | 10 | chunks por intervalo que disparam compactação |
-| `tideflow_compaction_threads` | 2 | threads de manutenção (somente leitura) |
-| `tideflow_retention_check_interval` | 3600 | segundos entre varreduras de retenção (0 = desliga) |
-| `tideflow_bloom_filter_false_positive_rate` | 0.01 | Bloom filter dos chunks novos |
-| `tideflow_chunk_cache_size` | 128 MiB | cache de blocos decodificados |
-| `tideflow_max_open_chunks` | 100 | descritores de chunk mantidos abertos |
+| `moosedb_wal_sync_mode` | `fsync` | `fsync` ou `write` no fim do statement |
+| `moosedb_memtable_flush_threshold` | 64 MiB | MemTable padrão por tabela (máx. 96 MiB) |
+| `moosedb_compaction_trigger_chunks` | 10 | chunks por intervalo que disparam compactação |
+| `moosedb_compaction_threads` | 2 | threads de manutenção (somente leitura) |
+| `moosedb_retention_check_interval` | 3600 | segundos entre varreduras de retenção (0 = desliga) |
+| `moosedb_bloom_filter_false_positive_rate` | 0.01 | Bloom filter dos chunks novos |
+| `moosedb_chunk_cache_size` | 128 MiB | cache de blocos decodificados |
+| `moosedb_max_open_chunks` | 100 | descritores de chunk mantidos abertos |
 
 ## Replicação
 

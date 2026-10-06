@@ -1,0 +1,25 @@
+#
+# Dropping a TEMPORARY MooseDB table that still has rows in its MemTable must
+# not log "MooseDB: flush on close failed ... No such file or directory": the
+# table directory is removed before the last handler is closed, and the share
+# must not try to flush into a directory that is gone. The same applies to
+# temporary tables dropped at the end of the session.
+# (MTR fails the test on any unsuppressed warning in the server log.)
+#
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TEMPORARY TABLE tt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO tt VALUES ('2026-01-01', 1);
+DROP TEMPORARY TABLE tt;
+
+--echo # Same, with the temporary table left to die with its session
+connect (con2,localhost,root,,test);
+CREATE TEMPORARY TABLE tt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO tt VALUES ('2026-01-01', 1);
+disconnect con2;
+connection default;
+--echo # ... and a base table with pending rows
+CREATE TABLE bt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO bt VALUES ('2026-01-01', 1);
+DROP TABLE bt;
+SELECT 'done' AS status;

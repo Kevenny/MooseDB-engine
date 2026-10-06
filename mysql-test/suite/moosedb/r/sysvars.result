@@ -1,0 +1,276 @@
+# ---- Scope: all variables are global-only ----
+SET SESSION moosedb_wal_sync_mode = 'write';
+ERROR HY000: Variable 'moosedb_wal_sync_mode' is a GLOBAL variable and should be set with SET GLOBAL
+SET moosedb_max_open_chunks = 5;
+ERROR HY000: Variable 'moosedb_max_open_chunks' is a GLOBAL variable and should be set with SET GLOBAL
+SELECT @@SESSION.moosedb_chunk_cache_size;
+ERROR HY000: Variable 'moosedb_chunk_cache_size' is a GLOBAL variable
+SELECT @@GLOBAL.moosedb_chunk_cache_size = @@moosedb_chunk_cache_size;
+@@GLOBAL.moosedb_chunk_cache_size = @@moosedb_chunk_cache_size
+1
+# ---- moosedb_compaction_threads is read-only ----
+SET GLOBAL moosedb_compaction_threads = 4;
+ERROR HY000: Variable 'moosedb_compaction_threads' is a read only variable
+SELECT @@GLOBAL.moosedb_compaction_threads;
+@@GLOBAL.moosedb_compaction_threads
+2
+# ---- moosedb_wal_sync_mode (ENUM) ----
+SET GLOBAL moosedb_wal_sync_mode = 'write';
+SELECT @@GLOBAL.moosedb_wal_sync_mode;
+@@GLOBAL.moosedb_wal_sync_mode
+write
+SET GLOBAL moosedb_wal_sync_mode = 'FSYNC';
+SELECT @@GLOBAL.moosedb_wal_sync_mode;
+@@GLOBAL.moosedb_wal_sync_mode
+fsync
+SET GLOBAL moosedb_wal_sync_mode = 0;
+SELECT @@GLOBAL.moosedb_wal_sync_mode;
+@@GLOBAL.moosedb_wal_sync_mode
+fsync
+SET GLOBAL moosedb_wal_sync_mode = 1;
+SELECT @@GLOBAL.moosedb_wal_sync_mode;
+@@GLOBAL.moosedb_wal_sync_mode
+write
+SET GLOBAL moosedb_wal_sync_mode = 'none';
+ERROR 42000: Variable 'moosedb_wal_sync_mode' can't be set to the value of 'none'
+SET GLOBAL moosedb_wal_sync_mode = 7;
+ERROR 42000: Variable 'moosedb_wal_sync_mode' can't be set to the value of '7'
+SET GLOBAL moosedb_wal_sync_mode = '';
+ERROR 42000: Variable 'moosedb_wal_sync_mode' can't be set to the value of ''
+SET GLOBAL moosedb_wal_sync_mode = 1.5;
+ERROR 42000: Incorrect argument type to variable 'moosedb_wal_sync_mode'
+SET GLOBAL moosedb_wal_sync_mode = DEFAULT;
+SELECT @@GLOBAL.moosedb_wal_sync_mode;
+@@GLOBAL.moosedb_wal_sync_mode
+fsync
+# ---- Numeric limits: out-of-range values are clamped with a warning ----
+SET GLOBAL moosedb_max_open_chunks = 0;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_max_open_chunks value: '0'
+SELECT @@GLOBAL.moosedb_max_open_chunks;
+@@GLOBAL.moosedb_max_open_chunks
+1
+SET GLOBAL moosedb_max_open_chunks = 100000000;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_max_open_chunks value: '100000000'
+SELECT @@GLOBAL.moosedb_max_open_chunks;
+@@GLOBAL.moosedb_max_open_chunks
+1000000
+SET GLOBAL moosedb_max_open_chunks = 'many';
+ERROR 42000: Incorrect argument type to variable 'moosedb_max_open_chunks'
+SET GLOBAL moosedb_max_open_chunks = 1.5;
+ERROR 42000: Incorrect argument type to variable 'moosedb_max_open_chunks'
+SET GLOBAL moosedb_max_open_chunks = -1;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_max_open_chunks value: '-1'
+SELECT @@GLOBAL.moosedb_max_open_chunks;
+@@GLOBAL.moosedb_max_open_chunks
+1
+SET GLOBAL moosedb_compaction_trigger_chunks = 1;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_compaction_trigger_ch... value: '1'
+SELECT @@GLOBAL.moosedb_compaction_trigger_chunks;
+@@GLOBAL.moosedb_compaction_trigger_chunks
+2
+SET GLOBAL moosedb_compaction_trigger_chunks = 99999;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_compaction_trigger_ch... value: '99999'
+SELECT @@GLOBAL.moosedb_compaction_trigger_chunks;
+@@GLOBAL.moosedb_compaction_trigger_chunks
+10000
+SET GLOBAL moosedb_memtable_flush_threshold = 100;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_memtable_flush_threshold value: '100'
+SELECT @@GLOBAL.moosedb_memtable_flush_threshold;
+@@GLOBAL.moosedb_memtable_flush_threshold
+4096
+SET GLOBAL moosedb_memtable_flush_threshold = 1073741824;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_memtable_flush_threshold value: '1073741824'
+SELECT @@GLOBAL.moosedb_memtable_flush_threshold;
+@@GLOBAL.moosedb_memtable_flush_threshold
+100663296
+SET GLOBAL moosedb_bloom_filter_false_positive_rate = 0;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_bloom_filter_false_po... value: '0'
+SELECT @@GLOBAL.moosedb_bloom_filter_false_positive_rate;
+@@GLOBAL.moosedb_bloom_filter_false_positive_rate
+0.000001
+SET GLOBAL moosedb_bloom_filter_false_positive_rate = 0.9;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_bloom_filter_false_po... value: '0.9'
+SELECT @@GLOBAL.moosedb_bloom_filter_false_positive_rate;
+@@GLOBAL.moosedb_bloom_filter_false_positive_rate
+0.500000
+SET GLOBAL moosedb_bloom_filter_false_positive_rate = -0.5;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_bloom_filter_false_po... value: '-0.5'
+SELECT @@GLOBAL.moosedb_bloom_filter_false_positive_rate;
+@@GLOBAL.moosedb_bloom_filter_false_positive_rate
+0.000001
+SET GLOBAL moosedb_bloom_filter_false_positive_rate = 0.25;
+SELECT @@GLOBAL.moosedb_bloom_filter_false_positive_rate;
+@@GLOBAL.moosedb_bloom_filter_false_positive_rate
+0.250000
+SET GLOBAL moosedb_retention_check_interval = 0;
+SELECT @@GLOBAL.moosedb_retention_check_interval;
+@@GLOBAL.moosedb_retention_check_interval
+0
+SET GLOBAL moosedb_retention_check_interval = 4294967295;
+SELECT @@GLOBAL.moosedb_retention_check_interval;
+@@GLOBAL.moosedb_retention_check_interval
+4294967295
+SET GLOBAL moosedb_chunk_cache_size = 0;
+SELECT @@GLOBAL.moosedb_chunk_cache_size;
+@@GLOBAL.moosedb_chunk_cache_size
+0
+SET GLOBAL moosedb_chunk_cache_size = 18446744073709551615;
+SELECT @@GLOBAL.moosedb_chunk_cache_size;
+@@GLOBAL.moosedb_chunk_cache_size
+18446744073709551615
+SET GLOBAL moosedb_chunk_cache_size = DEFAULT;
+SELECT @@GLOBAL.moosedb_chunk_cache_size;
+@@GLOBAL.moosedb_chunk_cache_size
+134217728
+SET GLOBAL moosedb_max_open_chunks = DEFAULT, moosedb_compaction_trigger_chunks = DEFAULT,
+moosedb_memtable_flush_threshold = DEFAULT, moosedb_bloom_filter_false_positive_rate = DEFAULT,
+moosedb_retention_check_interval = DEFAULT;
+SELECT @@GLOBAL.moosedb_max_open_chunks, @@GLOBAL.moosedb_compaction_trigger_chunks,
+@@GLOBAL.moosedb_memtable_flush_threshold, @@GLOBAL.moosedb_bloom_filter_false_positive_rate,
+@@GLOBAL.moosedb_retention_check_interval;
+@@GLOBAL.moosedb_max_open_chunks	@@GLOBAL.moosedb_compaction_trigger_chunks	@@GLOBAL.moosedb_memtable_flush_threshold	@@GLOBAL.moosedb_bloom_filter_false_positive_rate	@@GLOBAL.moosedb_retention_check_interval
+100	10	67108864	0.010000	3600
+# ---- Variables listed in the server's catalogue ----
+SELECT VARIABLE_NAME, VARIABLE_SCOPE, VARIABLE_TYPE, READ_ONLY, NUMERIC_MIN_VALUE, NUMERIC_MAX_VALUE
+FROM information_schema.SYSTEM_VARIABLES WHERE VARIABLE_NAME LIKE 'MOOSEDB%' ORDER BY VARIABLE_NAME;
+VARIABLE_NAME	VARIABLE_SCOPE	VARIABLE_TYPE	READ_ONLY	NUMERIC_MIN_VALUE	NUMERIC_MAX_VALUE
+MOOSEDB_BLOOM_FILTER_FALSE_POSITIVE_RATE	GLOBAL	DOUBLE	NO	0.000001	0.5
+MOOSEDB_CHUNK_CACHE_SIZE	GLOBAL	BIGINT UNSIGNED	NO	0	18446744073709551615
+MOOSEDB_COMPACTION_THREADS	GLOBAL	INT UNSIGNED	YES	1	64
+MOOSEDB_COMPACTION_TRIGGER_CHUNKS	GLOBAL	INT UNSIGNED	NO	2	10000
+MOOSEDB_MAX_OPEN_CHUNKS	GLOBAL	INT UNSIGNED	NO	1	1000000
+MOOSEDB_MEMTABLE_FLUSH_THRESHOLD	GLOBAL	BIGINT UNSIGNED	NO	4096	100663296
+MOOSEDB_RETENTION_CHECK_INTERVAL	GLOBAL	INT UNSIGNED	NO	0	4294967295
+MOOSEDB_WAL_SYNC_MODE	GLOBAL	ENUM	NO	NULL	NULL
+# ---- Effects on a running table ----
+CREATE TABLE s (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts))
+ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+# 60 chunks, queried with a 1-descriptor cache and no block cache
+INSERT INTO s SELECT '2026-05-01' + INTERVAL seq * 30 MINUTE, CONCAT('h', seq MOD 4), seq FROM seq_0_to_119;
+FLUSH TABLES s;
+SET GLOBAL moosedb_max_open_chunks = 1;
+SET GLOBAL moosedb_chunk_cache_size = 0;
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM s;
+COUNT(*)	SUM(v)	COUNT(DISTINCT host)
+120	7140	4
+SELECT host, COUNT(*) FROM s WHERE ts BETWEEN '2026-05-01 10:00:00' AND '2026-05-02 02:00:00' GROUP BY host ORDER BY host;
+host	COUNT(*)
+h0	9
+h1	8
+h2	8
+h3	8
+SELECT ts FROM s ORDER BY ts DESC LIMIT 3;
+ts
+2026-05-03 11:30:00
+2026-05-03 11:00:00
+2026-05-03 10:30:00
+SELECT v FROM s WHERE v BETWEEN 50 AND 52 ORDER BY v DESC;
+v
+52
+51
+50
+CHECK TABLE s;
+Table	Op	Msg_type	Msg_text
+test.s	check	status	OK
+SET GLOBAL moosedb_chunk_cache_size = 4096;
+SELECT COUNT(*), SUM(v) FROM s;
+COUNT(*)	SUM(v)
+120	7140
+SET GLOBAL moosedb_max_open_chunks = DEFAULT;
+SET GLOBAL moosedb_chunk_cache_size = DEFAULT;
+SELECT COUNT(*), SUM(v) FROM s;
+COUNT(*)	SUM(v)
+120	7140
+# MemTable threshold applies to tables opened afterwards
+SET GLOBAL moosedb_memtable_flush_threshold = 4096;
+CREATE TABLE small (ts DATETIME NOT NULL, v BIGINT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 MONTH';
+FLUSH TABLES;
+INSERT INTO small SELECT '2026-05-01' + INTERVAL seq SECOND, seq FROM seq_0_to_19999;
+SELECT SUM(PENDING_ROWS) < 20000 AS flushed_by_threshold, COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'small';
+flushed_by_threshold	COUNT(*)
+1	1
+SELECT COUNT(*), SUM(v) FROM small;
+COUNT(*)	SUM(v)
+20000	199990000
+SET GLOBAL moosedb_memtable_flush_threshold = DEFAULT;
+# An explicit MEMTABLE_SIZE wins over the variable
+# MEMTABLE_SIZE above 96 MiB is refused (a flushed block must stay below 256 MiB)
+CREATE TABLE big (ts DATETIME NOT NULL, v BIGINT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 MONTH' MEMTABLE_SIZE=1073741824;
+ERROR HY000: MooseDB: invalid argument: MEMTABLE_SIZE must be at most 100663296 bytes
+CREATE TABLE big (ts DATETIME NOT NULL, v BIGINT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 MONTH' MEMTABLE_SIZE=50331648;
+SET GLOBAL moosedb_memtable_flush_threshold = 4096;
+FLUSH TABLES;
+INSERT INTO big SELECT '2026-05-01' + INTERVAL seq SECOND, seq FROM seq_0_to_19999;
+SELECT PENDING_ROWS, CHUNKS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'big';
+PENDING_ROWS	CHUNKS
+20000	0
+SET GLOBAL moosedb_memtable_flush_threshold = DEFAULT;
+# WAL sync mode 'write': rows are still visible, durable across a mysqld crash
+SET GLOBAL moosedb_wal_sync_mode = 'write';
+CREATE TABLE w (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO w SELECT '2026-05-01' + INTERVAL seq SECOND, seq FROM seq_1_to_500;
+LOCK TABLES w WRITE;
+INSERT INTO w VALUES ('2026-06-01', 0);
+UNLOCK TABLES;
+SELECT COUNT(*), SUM(v) FROM w;
+COUNT(*)	SUM(v)
+501	125250
+# Kill the server
+# restart
+SELECT @@GLOBAL.moosedb_wal_sync_mode;
+@@GLOBAL.moosedb_wal_sync_mode
+fsync
+SELECT COUNT(*), SUM(v) FROM w;
+COUNT(*)	SUM(v)
+501	125250
+SELECT COUNT(*) FROM s;
+COUNT(*)
+120
+CHECK TABLE w;
+Table	Op	Msg_type	Msg_text
+test.w	check	status	OK
+# retention_check_interval = 0 disables background sweeps
+CREATE TABLE r (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB RETENTION_PERIOD='30 DAYS';
+INSERT INTO r VALUES (NOW() - INTERVAL 200 DAY, 1), (NOW(), 2);
+FLUSH TABLES r;
+SET GLOBAL moosedb_retention_check_interval = 0;
+SELECT COUNT(*) FROM r;
+COUNT(*)
+2
+SELECT COUNT(*) FROM r;
+COUNT(*)
+2
+SET GLOBAL moosedb_retention_check_interval = DEFAULT;
+OPTIMIZE TABLE r;
+Table	Op	Msg_type	Msg_text
+test.r	optimize	status	OK
+SELECT COUNT(*) FROM r;
+COUNT(*)
+1
+# Variables survive in SHOW VARIABLES with their current values
+SET GLOBAL moosedb_max_open_chunks = 77;
+SHOW GLOBAL VARIABLES LIKE 'moosedb_max_open_chunks';
+Variable_name	Value
+moosedb_max_open_chunks	77
+SHOW SESSION VARIABLES LIKE 'moosedb_max_open_chunks';
+Variable_name	Value
+moosedb_max_open_chunks	77
+SET GLOBAL moosedb_max_open_chunks = DEFAULT;
+DROP TABLE s, small, big, w, r;
+SET GLOBAL moosedb_wal_sync_mode = DEFAULT;
+SET GLOBAL moosedb_memtable_flush_threshold = DEFAULT;
+SET GLOBAL moosedb_compaction_trigger_chunks = DEFAULT;
+SET GLOBAL moosedb_retention_check_interval = DEFAULT;
+SET GLOBAL moosedb_bloom_filter_false_positive_rate = DEFAULT;
+SET GLOBAL moosedb_chunk_cache_size = DEFAULT;
+SET GLOBAL moosedb_max_open_chunks = DEFAULT;

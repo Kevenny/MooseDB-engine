@@ -1,0 +1,18 @@
+[package]
+name = "moosedb-ffi"
+description = "C ABI of the MooseDB storage core (linked into ha_moosedb.so)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "moosedb"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+moosedb-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

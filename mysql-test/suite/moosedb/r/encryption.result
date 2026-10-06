@@ -1,0 +1,52 @@
+CREATE TABLE s (ts DATETIME(6) NOT NULL, host VARCHAR(32) NOT NULL COMMENT 'TAG', note VARCHAR(64), INDEX(ts))
+ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=2;
+SHOW CREATE TABLE s;
+Table	Create Table
+s	CREATE TABLE `s` (
+  `ts` datetime(6) NOT NULL,
+  `host` varchar(32) NOT NULL COMMENT 'TAG',
+  `note` varchar(64) DEFAULT NULL,
+  KEY `ts` (`ts`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `ENCRYPTION`='YES' `ENCRYPTION_KEY_ID`='2'
+INSERT INTO s SELECT '2026-01-01' + INTERVAL seq SECOND, 'SECRET-HOST-NAME', CONCAT('CONFIDENTIAL-', seq)
+FROM seq_1_to_500;
+# Control: an unencrypted table does show plaintext
+CREATE TABLE plain (ts DATETIME NOT NULL, note VARCHAR(32), INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO plain VALUES ('2026-01-01', 'CONFIDENTIAL-0');
+FLUSH TABLES plain;
+plaintext found in 1 file(s)
+DROP TABLE plain;
+# Neither the WAL nor sealed chunks contain plaintext
+plaintext found in 0 file(s)
+FLUSH TABLES s;
+plaintext found in 0 file(s)
+SELECT COUNT(*), MIN(note), MAX(note), COUNT(DISTINCT host) FROM s;
+COUNT(*)	MIN(note)	MAX(note)	COUNT(DISTINCT host)
+500	CONFIDENTIAL-1	CONFIDENTIAL-99	1
+SELECT ENCRYPTED, COMPRESSION FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 's';
+ENCRYPTED	COMPRESSION
+YES	ZSTD
+SELECT DISTINCT ENCRYPTED FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_NAME = 's';
+ENCRYPTED
+YES
+CHECK TABLE s;
+Table	Op	Msg_type	Msg_text
+test.s	check	status	OK
+# Data survives a restart (keys fetched again from the key plugin)
+# restart
+SELECT COUNT(*), MAX(note) FROM s WHERE host = 'SECRET-HOST-NAME';
+COUNT(*)	MAX(note)
+500	CONFIDENTIAL-99
+OPTIMIZE TABLE s;
+Table	Op	Msg_type	Msg_text
+test.s	optimize	status	OK
+SELECT COUNT(*) FROM s;
+COUNT(*)
+500
+plaintext found in 0 file(s)
+# Keys must exist and be 256 bits
+CREATE TABLE bad (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=99;
+ERROR HY000: MooseDB: invalid argument: encryption key 99 is not available: not found: encryption key 99 (version latest) is not available
+CREATE TABLE bad (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=3;
+ERROR HY000: MooseDB: invalid argument: encryption key 3 is not available: invalid argument: encryption key 3 is not a 256-bit key
+DROP TABLE s;

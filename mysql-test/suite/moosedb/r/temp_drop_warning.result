@@ -1,0 +1,16 @@
+CREATE TEMPORARY TABLE tt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO tt VALUES ('2026-01-01', 1);
+DROP TEMPORARY TABLE tt;
+# Same, with the temporary table left to die with its session
+connect  con2,localhost,root,,test;
+CREATE TEMPORARY TABLE tt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO tt VALUES ('2026-01-01', 1);
+disconnect con2;
+connection default;
+# ... and a base table with pending rows
+CREATE TABLE bt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO bt VALUES ('2026-01-01', 1);
+DROP TABLE bt;
+SELECT 'done' AS status;
+status
+done

@@ -1,0 +1,49 @@
+#
+# RETENTION_PERIOD: background sweeps, CALL moosedb_apply_retention, OPTIMIZE.
+#
+--source suite/moosedb/include/have_moosedb.inc
+
+--exec $MYSQL test < $MOOSEDB_INSTALL_SQL
+
+CREATE TABLE r (ts DATETIME NOT NULL, v INT, INDEX(ts))
+  ENGINE=MooseDB CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+INSERT INTO r VALUES
+  (NOW() - INTERVAL 400 DAY, 1),
+  (NOW() - INTERVAL 100 DAY, 2),
+  (NOW() - INTERVAL 1 DAY, 3),
+  (NOW(), 4);
+FLUSH TABLES r;
+
+--echo # Expired chunks are visible before the sweep
+SELECT STATUS, COUNT(*) FROM information_schema.MOOSEDB_CHUNKS
+  WHERE TABLE_NAME = 'r' GROUP BY STATUS ORDER BY STATUS;
+SELECT EXPIRED_CHUNKS, RETENTION FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'r';
+
+--echo # CALL moosedb_apply_retention
+CALL moosedb_apply_retention('test.r');
+SELECT v FROM r ORDER BY v;
+
+--echo # Background sweep
+INSERT INTO r VALUES (NOW() - INTERVAL 200 DAY, 5);
+FLUSH TABLES r;
+SELECT v FROM r ORDER BY v;
+SET @old = @@GLOBAL.moosedb_retention_check_interval;
+SET GLOBAL moosedb_retention_check_interval = 1;
+--echo # the table must be open for the background threads to see it
+SELECT COUNT(*) FROM r;
+let $wait_condition= SELECT COUNT(*) = 2 FROM r;
+--source include/wait_condition.inc
+SELECT v FROM r ORDER BY v;
+SET GLOBAL moosedb_retention_check_interval = @old;
+
+--echo # FOREVER never expires
+CREATE TABLE f (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB RETENTION_PERIOD='FOREVER';
+INSERT INTO f VALUES ('1990-01-01');
+OPTIMIZE TABLE f;
+SELECT COUNT(*) FROM f;
+
+DROP TABLE r, f;
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;

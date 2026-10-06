@@ -1,0 +1,425 @@
+//! Compaction: merges the chunks of one time bucket into a single chunk and
+//! re-encodes chunks that turned cold with the table's cold codec (ZSTD).
+//!
+//! Every flush adds one chunk per touched bucket, so a busy bucket
+//! accumulates many small chunks; merging them makes series contiguous
+//! (better compression, fewer blocks to read per query).
+//!
+//! Protocol (crash-safe, concurrent with reads and writes):
+//! 1. under `maint`: pick the inputs and reserve an id (short `inner` lock);
+//! 2. build the output chunk(s) *without* holding `inner`, one series at a
+//!    time (a series too big for one column block is split across several
+//!    output chunks of the same bucket, like flushes already produce);
+//! 3. take `inner`, check the inputs are all still live (retention or
+//!    TRUNCATE may have removed some meanwhile — then the output is
+//!    discarded), switch the MANIFEST, mark the inputs obsolete.
+//!
+//! A crash before step 3 leaves unlisted output files, deleted by recovery.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use crate::chunk::ChunkMeta;
+use crate::chunk_reader::decode_series;
+use crate::chunk_writer::ChunkBuilder;
+use crate::crypto::CipherParams;
+use crate::error::{Error, Result};
+use crate::fsutil::sync_dir;
+use crate::log::warn;
+use crate::schema::Row;
+use crate::table::Table;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompactionReport {
+    /// Buckets rewritten.
+    pub groups: usize,
+    pub chunks_in: usize,
+    pub chunks_out: usize,
+}
+
+/// A series is cut into parts of at most this many estimated bytes (a
+/// generous over-estimate of its largest encoded column block) and rows.
+const SPLIT_BYTES: usize = crate::compression::MAX_BLOCK_RAW / 2;
+const SPLIT_ROWS: usize = crate::compression::MAX_SERIES_ROWS as usize;
+
+#[cfg(test)]
+thread_local! {
+    static SPLIT_ROWS_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: lowers the rows-per-part limit of the current thread.
+#[cfg(test)]
+pub(crate) fn set_split_rows(n: Option<usize>) {
+    SPLIT_ROWS_OVERRIDE.with(|o| o.set(n));
+}
+
+fn split_rows() -> usize {
+    #[cfg(test)]
+    if let Some(n) = SPLIT_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return n;
+    }
+    SPLIT_ROWS
+}
+
+/// Cuts sorted rows into consecutive parts that each fit one column block.
+fn split_series(rows: &[Row]) -> Vec<&[Row]> {
+    let max_rows = split_rows().max(1);
+    let mut parts = Vec::new();
+    let (mut start, mut bytes) = (0usize, 0usize);
+    for (i, r) in rows.iter().enumerate() {
+        let sz: usize = r.iter().map(crate::schema::Value::mem_size).sum();
+        if i > start && (i - start >= max_rows || bytes + sz > SPLIT_BYTES) {
+            parts.push(&rows[start..i]);
+            start = i;
+            bytes = 0;
+        }
+        bytes += sz;
+    }
+    if start < rows.len() {
+        parts.push(&rows[start..]);
+    }
+    parts
+}
+
+impl Table {
+    /// Explicit compaction (OPTIMIZE TABLE, `CALL moosedb_compact`): every
+    /// bucket overlapping `[lo, hi]` that holds more than one chunk, or a
+    /// chunk not yet in the cold codec, is rewritten.
+    pub fn compact(&self, lo: i64, hi: i64, now: i64) -> Result<CompactionReport> {
+        self.run_compaction(now, |bucket| bucket.0 <= hi && bucket.1 > lo, true)
+    }
+
+    /// Background compaction: buckets with at least
+    /// `moosedb_compaction_trigger_chunks` chunks, and cold re-encoding.
+    pub fn compact_auto(&self, now: i64) -> Result<CompactionReport> {
+        self.run_compaction(now, |_| true, false)
+    }
+
+    /// Whether `compact_auto` would do anything (cheap; scheduler use).
+    pub(crate) fn compaction_pending(&self, now: i64) -> bool {
+        self.lock()
+            .map(|inner| !self.plan(&inner.chunks, now, &|_| true, false, &inner.no_gain).is_empty())
+            .unwrap_or(false)
+    }
+
+    fn plan(
+        &self,
+        chunks: &[Arc<ChunkMeta>],
+        now: i64,
+        in_scope: &dyn Fn((i64, i64)) -> bool,
+        force: bool,
+        no_gain: &HashSet<Vec<u64>>,
+    ) -> Vec<Vec<Arc<ChunkMeta>>> {
+        let opts = &self.config.opts;
+        let trigger = crate::settings::get().compaction_trigger_chunks() as usize;
+        let mut by_bucket: BTreeMap<(i64, i64), Vec<Arc<ChunkMeta>>> = BTreeMap::new();
+        for c in chunks.iter().filter(|c| in_scope(c.bucket)) {
+            by_bucket.entry(c.bucket).or_default().push(c.clone());
+        }
+        by_bucket
+            .into_iter()
+            .filter(|(bucket, group)| {
+                // A group whose last compaction gained nothing (or failed) is
+                // left alone until its set of chunks changes; only an explicit
+                // OPTIMIZE retries it.
+                if !force && no_gain.contains(&group.iter().map(|c| c.id).collect::<Vec<_>>()) {
+                    return false;
+                }
+                let cold = !opts.is_hot(bucket.1, now);
+                let recode = cold && group.iter().any(|c| c.header.codec_id() != opts.cold_codec().id());
+                group.len() >= trigger || (force && group.len() > 1) || recode
+            })
+            .map(|(_, g)| g)
+            .collect()
+    }
+
+    fn run_compaction(&self, now: i64, in_scope: impl Fn((i64, i64)) -> bool, force: bool) -> Result<CompactionReport> {
+        let _maint = self.maint.lock().map_err(|_| Error::ReadOnly("maintenance lock poisoned".into()))?;
+        if self.defunct.load(Ordering::Acquire) {
+            return Ok(CompactionReport::default());
+        }
+        let groups = {
+            let inner = self.lock()?;
+            inner.check_writable()?;
+            self.plan(&inner.chunks, now, &in_scope, force, &inner.no_gain)
+        };
+        let mut report = CompactionReport::default();
+        let mut first_error = None;
+        for group in groups {
+            let n = group.len();
+            let mut key: Vec<u64> = group.iter().map(|c| c.id).collect();
+            key.sort_unstable();
+            match self.compact_group(group, now) {
+                Ok(Some(out)) => {
+                    report.groups += 1;
+                    report.chunks_in += n;
+                    report.chunks_out += out.len();
+                    if out.len() > 1 {
+                        // The output was split (a series too big for one block):
+                        // merging it again would only split it again, so leave
+                        // it alone until its set of chunks changes.
+                        self.remember_no_gain(out);
+                    }
+                }
+                Ok(None) => {}
+                // The table is unusable: stop.
+                Err(e @ Error::ReadOnly(_)) => return Err(e),
+                // One bad bucket must not starve the others, nor be retried every tick.
+                Err(e) => {
+                    warn(&format!("compaction of chunks {key:?} failed, skipping them until they change: {e}"));
+                    self.remember_no_gain(key);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) if report.groups == 0 => Err(e),
+            _ => Ok(report),
+        }
+    }
+
+    fn remember_no_gain(&self, mut ids: Vec<u64>) {
+        ids.sort_unstable();
+        if let Ok(mut inner) = self.lock() {
+            if inner.no_gain.len() >= 1024 {
+                inner.no_gain.clear();
+            }
+            inner.no_gain.insert(ids);
+        }
+    }
+
+    /// Returns the ids of the chunks written, or `None` when the inputs
+    /// changed concurrently and nothing was done.
+    fn compact_group(&self, group: Vec<Arc<ChunkMeta>>, now: i64) -> Result<Option<Vec<u64>>> {
+        let ids: Vec<u64> = group.iter().map(|c| c.id).collect();
+        let id = {
+            let mut inner = self.lock()?;
+            inner.check_writable()?;
+            if !ids.iter().all(|i| inner.chunks.iter().any(|c| c.id == *i)) {
+                return Ok(None);
+            }
+            let id = inner.manifest.next_chunk_id;
+            inner.manifest.next_chunk_id += 1;
+            inner.compacting.extend(ids.iter().copied());
+            id
+        };
+
+        let built = self.build_merged(&group, id, now);
+
+        let mut inner = self.lock()?;
+        for i in &ids {
+            inner.compacting.remove(i);
+        }
+        let metas = match built {
+            Ok(m) => m,
+            Err(e) => {
+                if crate::fsutil::is_fsync_error(&e) {
+                    inner.poison(format!("fsync of a compacted chunk failed: {e}"));
+                }
+                return Err(e);
+            }
+        };
+        let still_live = ids.iter().all(|i| inner.chunks.iter().any(|c| c.id == *i));
+        if !still_live || self.defunct.load(Ordering::Acquire) {
+            for m in &metas {
+                m.file.mark_obsolete();
+            }
+            return Ok(None);
+        }
+        let out_ids: Vec<u64> = metas.iter().map(|m| m.id).collect();
+        let mut chunks: Vec<Arc<ChunkMeta>> = inner.chunks.iter().filter(|c| !ids.contains(&c.id)).cloned().collect();
+        let mut manifest = inner.manifest.clone();
+        manifest.chunks = chunks.iter().map(|c| c.id).chain(out_ids.iter().copied()).collect();
+        manifest.chunks.sort_unstable();
+        inner.commit_manifest(&self.config.dir, manifest)?;
+        chunks.extend(metas.into_iter().map(Arc::new));
+        inner.replace_chunks(chunks);
+        Ok(Some(out_ids))
+    }
+
+    /// Merges `group` into one chunk, or into several (all of the same
+    /// bucket) when a series is too large for a single column block. `id` is
+    /// the first output id; more are reserved on demand.
+    fn build_merged(&self, group: &[Arc<ChunkMeta>], id: u64, now: i64) -> Result<Vec<ChunkMeta>> {
+        let opts = &self.config.opts;
+        let bucket = group[0].bucket;
+        let codec = opts.codec_for(bucket.1, now);
+        let new_builder = || -> Result<ChunkBuilder<'_>> {
+            let cipher = opts.encryption_key_id.map(CipherParams::for_new_file).transpose()?;
+            Ok(ChunkBuilder::new(&self.schema, codec, cipher))
+        };
+        let mut builders = vec![new_builder()?];
+
+        let positions: Vec<HashMap<u64, usize>> =
+            group.iter().map(|c| c.series.iter().enumerate().map(|(i, e)| (e.series_id, i)).collect()).collect();
+        let series_ids: BTreeSet<u64> = positions.iter().flat_map(|m| m.keys().copied()).collect();
+        let ts = self.schema.ts_index();
+        for sid in series_ids {
+            let mut rows: Vec<Row> = Vec::new();
+            let mut tags = Vec::new();
+            for (c, pos) in group.iter().zip(&positions) {
+                if let Some(&idx) = pos.get(&sid) {
+                    rows.extend(decode_series(&self.schema, c, idx)?);
+                    tags.clone_from(&c.series[idx].tags);
+                }
+            }
+            // Inputs are in id (= write) order and each is sorted, so a stable
+            // sort keeps arrival order among equal timestamps.
+            rows.sort_by_key(|r| match r.get(ts) {
+                Some(crate::schema::Value::Timestamp(t)) => *t,
+                _ => i64::MIN,
+            });
+            // Part k of every series goes to output chunk k, so a series never
+            // appears twice in one chunk.
+            for (k, part) in split_series(&rows).into_iter().enumerate() {
+                if k == builders.len() {
+                    builders.push(new_builder()?);
+                }
+                let refs: Vec<&Row> = part.iter().collect();
+                builders[k].add_series(sid, &tags, &refs)?;
+            }
+        }
+        let wal_seq = group.iter().map(|c| c.header.wal_seq).max().unwrap_or(0);
+
+        // Extra ids (rare) come from the shared counter; the first was reserved up front.
+        let extra = builders.len() - 1;
+        let first_extra = if extra > 0 {
+            let mut inner = self.lock()?;
+            let n = inner.manifest.next_chunk_id;
+            inner.manifest.next_chunk_id += extra as u64;
+            n
+        } else {
+            0
+        };
+        let mut metas: Vec<ChunkMeta> = Vec::with_capacity(builders.len());
+        for (k, b) in builders.into_iter().enumerate() {
+            let cid = if k == 0 { id } else { first_extra + (k as u64 - 1) };
+            let done =
+                b.finish(&self.config.dir, cid, wal_seq, bucket).and_then(|m| match sync_dir(&self.config.dir) {
+                    Ok(()) => Ok(m),
+                    Err(e) => {
+                        m.file.mark_obsolete();
+                        Err(e)
+                    }
+                });
+            match done {
+                Ok(m) => metas.push(m),
+                Err(e) => {
+                    for m in &metas {
+                        m.file.mark_obsolete();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(metas)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::{RawOptions, TableConfig};
+    use crate::scan::ScanFilter;
+    use crate::schema::{Column, ColumnType, Schema, Value};
+
+    fn config(dir: &std::path::Path) -> TableConfig {
+        let schema = Schema::new(
+            vec![
+                Column { name: "ts".into(), ty: ColumnType::Timestamp },
+                Column { name: "host".into(), ty: ColumnType::Tag },
+                Column { name: "v".into(), ty: ColumnType::Float64 },
+            ],
+            0,
+        )
+        .unwrap();
+        TableConfig::new(dir, schema, &RawOptions::default()).unwrap()
+    }
+
+    fn row(i: i64, host: &str) -> Row {
+        vec![
+            Value::Timestamp(1_700_000_000_000_000 + i),
+            Value::Bytes(host.as_bytes().to_vec()),
+            Value::Float64(i as f64),
+        ]
+    }
+
+    fn scan_all(t: &Table) -> Vec<Row> {
+        let mut s = t.scan(&ScanFilter::default(), true).unwrap();
+        let mut out = Vec::new();
+        while let Some((_, r)) = s.next_row().unwrap() {
+            out.push(r);
+        }
+        out
+    }
+
+    #[test]
+    fn oversized_series_is_split_into_several_chunks_and_stays_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let cfg = config(&path);
+        Table::create(&cfg).unwrap();
+        let t = Table::open(cfg.clone()).unwrap();
+        let expected: Vec<Row> = (0..100).map(|i| row(i, if i % 10 == 0 { "b" } else { "a" })).collect();
+        for chunk in expected.chunks(25) {
+            for r in chunk {
+                t.write(r.clone()).unwrap();
+            }
+            t.flush().unwrap();
+        }
+        assert_eq!(t.chunks().unwrap().len(), 4);
+
+        set_split_rows(Some(30)); // series "a" (90 rows) needs 3 parts, "b" (10) one
+        let report = t.compact(i64::MIN, i64::MAX, 1_700_000_000_000_000);
+        set_split_rows(None);
+        let report = report.unwrap();
+        assert_eq!((report.groups, report.chunks_in, report.chunks_out), (1, 4, 3));
+        assert_eq!(t.chunks().unwrap().len(), 3);
+        assert_eq!(scan_all(&t), expected);
+
+        // The background pass must not pick the split output again and again.
+        assert!(!t.compaction_pending(1_700_000_000_000_000 + 1));
+        drop(t);
+        let t = Table::open(cfg).unwrap();
+        assert_eq!(scan_all(&t), expected, "survives a restart");
+    }
+
+    #[test]
+    fn failing_group_is_skipped_not_retried_and_does_not_block_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let cfg = config(&path);
+        Table::create(&cfg).unwrap();
+        let t = Table::open(cfg).unwrap();
+        let day = crate::time::MICROS_PER_DAY;
+        let base = (1_700_000_000_000_000 / day) * day;
+        // Two buckets (days) with two chunks each.
+        for d in 0..2 {
+            for round in 0..2 {
+                t.write(vec![
+                    Value::Timestamp(base + d * day + round),
+                    Value::Bytes(b"a".to_vec()),
+                    Value::Float64(1.0),
+                ])
+                .unwrap();
+                t.flush().unwrap();
+            }
+        }
+        // Damage the chunks of the first bucket so merging them fails.
+        let chunks = t.chunks().unwrap();
+        let first = chunks.iter().filter(|c| c.bucket.0 == base).collect::<Vec<_>>();
+        assert_eq!(first.len(), 2);
+        for c in &first {
+            let mut data = std::fs::read(c.path()).unwrap();
+            data[crate::chunk::HEADER_LEN + 12] ^= 0xFF; // inside a data block
+            std::fs::write(c.path(), data).unwrap();
+        }
+        let report = t.compact(i64::MIN, i64::MAX, base + 10 * day).unwrap();
+        assert_eq!(report.groups, 1, "the healthy bucket was still compacted");
+        let still_two = t.chunks().unwrap().iter().filter(|c| c.bucket.0 == base).count();
+        assert_eq!(still_two, 2);
+        // Background passes leave the broken group alone.
+        assert!(!t.compaction_pending(base + 10 * day));
+    }
+}

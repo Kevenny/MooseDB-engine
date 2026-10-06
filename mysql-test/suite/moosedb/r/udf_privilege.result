@@ -1,0 +1,87 @@
+CREATE TABLE secret (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB RETENTION_PERIOD='30 DAYS';
+INSERT INTO secret VALUES ('2001-01-01', 1), (NOW(), 2);
+FLUSH TABLES secret;
+CREATE USER 'nobody'@'localhost';
+CREATE USER 'reader'@'localhost';
+CREATE USER 'deleter'@'localhost';
+CREATE USER 'altering'@'localhost';
+GRANT SELECT ON test.secret TO 'reader'@'localhost';
+GRANT SELECT, DELETE ON test.secret TO 'deleter'@'localhost';
+GRANT SELECT, ALTER ON test.secret TO 'altering'@'localhost';
+GRANT EXECUTE ON test.* TO 'reader'@'localhost';
+GRANT EXECUTE ON test.* TO 'deleter'@'localhost';
+GRANT EXECUTE ON test.* TO 'altering'@'localhost';
+# Another session holds the table open
+SELECT COUNT(*) FROM secret;
+COUNT(*)
+2
+# ---- no privilege at all ----
+connect  nobody,localhost,nobody,,;
+SELECT moosedb_retention_impl('test', 'secret');
+ERROR 42000: DELETE command denied to user 'nobody'@'localhost' for table `test`.`secret`
+SELECT moosedb_compact_impl('test', 'secret', '', '');
+ERROR 42000: ALTER command denied to user 'nobody'@'localhost' for table `test`.`secret`
+# A table that does not exist answers the same way: no existence/open-state oracle
+SELECT moosedb_retention_impl('test', 'no_such_table');
+ERROR 42000: DELETE command denied to user 'nobody'@'localhost' for table `test`.`no_such_table`
+SELECT moosedb_retention_impl('mysql', 'user');
+ERROR 42000: DELETE command denied to user 'nobody'@'localhost' for table `mysql`.`user`
+# Bad bounds do not get ahead of the privilege check either
+SELECT moosedb_compact_impl('test', 'secret', 'garbage', '');
+ERROR 42000: ALTER command denied to user 'nobody'@'localhost' for table `test`.`secret`
+disconnect nobody;
+# ---- SELECT only: neither retention nor compaction ----
+connect  reader,localhost,reader,,;
+SELECT moosedb_retention_impl('test', 'secret');
+ERROR 42000: DELETE command denied to user 'reader'@'localhost' for table `test`.`secret`
+SELECT moosedb_compact_impl('test', 'secret', '', '');
+ERROR 42000: ALTER command denied to user 'reader'@'localhost' for table `test`.`secret`
+CALL test.moosedb_apply_retention('test.secret');
+ERROR 42000: DELETE command denied to user 'reader'@'localhost' for table `test`.`secret`
+CALL test.moosedb_compact('test.secret', NULL, NULL);
+ERROR 42000: ALTER command denied to user 'reader'@'localhost' for table `test`.`secret`
+disconnect reader;
+connection default;
+# The expired row must still be there: nobody had the right to expire it
+SELECT COUNT(*) FROM secret;
+COUNT(*)
+2
+# ---- DELETE: retention only ----
+connect  deleter,localhost,deleter,,;
+CALL test.moosedb_compact('test.secret', NULL, NULL);
+ERROR 42000: ALTER command denied to user 'deleter'@'localhost' for table `test`.`secret`
+SELECT moosedb_compact_impl('test', 'secret', '', '');
+ERROR 42000: ALTER command denied to user 'deleter'@'localhost' for table `test`.`secret`
+CALL test.moosedb_apply_retention('test.secret');
+disconnect deleter;
+connection default;
+SELECT COUNT(*) FROM secret;
+COUNT(*)
+1
+# ---- ALTER: compaction only ----
+connect  altering,localhost,altering,,;
+CALL test.moosedb_apply_retention('test.secret');
+ERROR 42000: DELETE command denied to user 'altering'@'localhost' for table `test`.`secret`
+SELECT moosedb_retention_impl('test', 'secret');
+ERROR 42000: DELETE command denied to user 'altering'@'localhost' for table `test`.`secret`
+CALL test.moosedb_compact('test.secret', NULL, NULL);
+disconnect altering;
+connection default;
+SELECT COUNT(*) FROM secret;
+COUNT(*)
+1
+# ---- the owner (all privileges) still can ----
+CALL moosedb_apply_retention('test.secret');
+CALL moosedb_compact('test.secret', NULL, NULL);
+SELECT COUNT(*) FROM secret;
+COUNT(*)
+1
+DROP USER 'nobody'@'localhost';
+DROP USER 'reader'@'localhost';
+DROP USER 'deleter'@'localhost';
+DROP USER 'altering'@'localhost';
+DROP TABLE secret;
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;

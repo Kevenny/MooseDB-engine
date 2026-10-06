@@ -1,0 +1,73 @@
+# ---- CREATE TABLE ... PARTITION BY is refused ----
+CREATE TABLE pt (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts))
+ENGINE=MooseDB PARTITION BY HASH(v) PARTITIONS 3;
+ERROR HY000: Engine cannot be used in partitioned tables
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+PARTITION BY KEY(v) PARTITIONS 2;
+ERROR HY000: Engine cannot be used in partitioned tables
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+PARTITION BY RANGE (TO_DAYS(ts)) (
+PARTITION p2026_01 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+PARTITION pmax VALUES LESS THAN MAXVALUE);
+ERROR HY000: Engine cannot be used in partitioned tables
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+PARTITION BY RANGE (TO_DAYS(ts)) SUBPARTITION BY HASH(v) SUBPARTITIONS 2 (
+PARTITION p0 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+PARTITION pmax VALUES LESS THAN MAXVALUE);
+ERROR HY000: Engine cannot be used in partitioned tables
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts))
+PARTITION BY HASH(v) (PARTITION p0 ENGINE=MooseDB, PARTITION p1 ENGINE=MooseDB);
+ERROR HY000: Engine cannot be used in partitioned tables
+CREATE TEMPORARY TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+PARTITION BY HASH(v) PARTITIONS 2;
+ERROR HY000: Partitioned tables do not support CREATE TEMPORARY TABLE
+SHOW TABLES LIKE 'pt';
+Tables_in_test (pt)
+# ---- Partitioning an existing MooseDB table is refused, data untouched ----
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO t SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_0_to_29;
+ALTER TABLE t PARTITION BY HASH(v) PARTITIONS 3;
+ERROR HY000: Engine cannot be used in partitioned tables
+ALTER TABLE t PARTITION BY RANGE (TO_DAYS(ts)) (PARTITION a VALUES LESS THAN MAXVALUE);
+ERROR HY000: Engine cannot be used in partitioned tables
+SELECT COUNT(*), SUM(v) FROM t;
+COUNT(*)	SUM(v)
+30	435
+SHOW CREATE TABLE t;
+Table	Create Table
+t	CREATE TABLE `t` (
+  `ts` datetime NOT NULL,
+  `v` int(11) DEFAULT NULL,
+  KEY `ts` (`ts`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+# ---- Converting a partitioned table of another engine is refused too ----
+CREATE TABLE m (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MyISAM PARTITION BY HASH(v) PARTITIONS 3;
+INSERT INTO m SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_0_to_29;
+ALTER TABLE m ENGINE=MooseDB;
+ERROR HY000: Engine cannot be used in partitioned tables
+SELECT COUNT(*), SUM(v) FROM m;
+COUNT(*)	SUM(v)
+30	435
+# ... and the other way round: MooseDB -> partitioned MyISAM works (copy)
+ALTER TABLE t ENGINE=MyISAM PARTITION BY HASH(v) PARTITIONS 3;
+SELECT COUNT(*), SUM(v) FROM t;
+COUNT(*)	SUM(v)
+30	435
+ALTER TABLE t ENGINE=MooseDB;
+ERROR HY000: Engine cannot be used in partitioned tables
+SELECT COUNT(*), SUM(v) FROM t;
+COUNT(*)	SUM(v)
+30	435
+ALTER TABLE t REMOVE PARTITIONING;
+ALTER TABLE t ENGINE=MooseDB;
+SELECT COUNT(*), SUM(v) FROM t;
+COUNT(*)	SUM(v)
+30	435
+SHOW CREATE TABLE t;
+Table	Create Table
+t	CREATE TABLE `t` (
+  `ts` datetime NOT NULL,
+  `v` int(11) DEFAULT NULL,
+  KEY `ts` (`ts`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+DROP TABLE t, m;

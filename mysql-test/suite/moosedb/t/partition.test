@@ -1,0 +1,69 @@
+#
+# MooseDB is append-only (delete_row() is not supported), so it cannot take
+# part in partitioning: ha_partition rebalances rows with copy + delete_row(),
+# which duplicated rows on ADD PARTITION and lost rows on COALESCE PARTITION.
+# The engine sets HTON_NO_PARTITION: every attempt to create or convert a
+# partitioned MooseDB table fails cleanly and leaves no table (or data) behind.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+--source include/have_partition.inc
+let MYSQLD_DATADIR= `SELECT @@datadir`;
+
+--echo # ---- CREATE TABLE ... PARTITION BY is refused ----
+--error ER_PARTITION_MERGE_ERROR
+CREATE TABLE pt (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts))
+  ENGINE=MooseDB PARTITION BY HASH(v) PARTITIONS 3;
+--error ER_PARTITION_MERGE_ERROR
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+  PARTITION BY KEY(v) PARTITIONS 2;
+--error ER_PARTITION_MERGE_ERROR
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+  PARTITION BY RANGE (TO_DAYS(ts)) (
+    PARTITION p2026_01 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+    PARTITION pmax VALUES LESS THAN MAXVALUE);
+--error ER_PARTITION_MERGE_ERROR
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+  PARTITION BY RANGE (TO_DAYS(ts)) SUBPARTITION BY HASH(v) SUBPARTITIONS 2 (
+    PARTITION p0 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+    PARTITION pmax VALUES LESS THAN MAXVALUE);
+--error ER_PARTITION_MERGE_ERROR
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts))
+  PARTITION BY HASH(v) (PARTITION p0 ENGINE=MooseDB, PARTITION p1 ENGINE=MooseDB);
+--error ER_FEATURE_NOT_SUPPORTED_WITH_PARTITIONING
+CREATE TEMPORARY TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB
+  PARTITION BY HASH(v) PARTITIONS 2;
+SHOW TABLES LIKE 'pt';
+--list_files $MYSQLD_DATADIR/test pt*
+
+--echo # ---- Partitioning an existing MooseDB table is refused, data untouched ----
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO t SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_0_to_29;
+--error ER_PARTITION_MERGE_ERROR
+ALTER TABLE t PARTITION BY HASH(v) PARTITIONS 3;
+--error ER_PARTITION_MERGE_ERROR
+ALTER TABLE t PARTITION BY RANGE (TO_DAYS(ts)) (PARTITION a VALUES LESS THAN MAXVALUE);
+SELECT COUNT(*), SUM(v) FROM t;
+SHOW CREATE TABLE t;
+
+--echo # ---- Converting a partitioned table of another engine is refused too ----
+CREATE TABLE m (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MyISAM PARTITION BY HASH(v) PARTITIONS 3;
+INSERT INTO m SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_0_to_29;
+--error ER_PARTITION_MERGE_ERROR
+ALTER TABLE m ENGINE=MooseDB;
+SELECT COUNT(*), SUM(v) FROM m;
+--echo # ... and the other way round: MooseDB -> partitioned MyISAM works (copy)
+ALTER TABLE t ENGINE=MyISAM PARTITION BY HASH(v) PARTITIONS 3;
+SELECT COUNT(*), SUM(v) FROM t;
+--error ER_PARTITION_MERGE_ERROR
+ALTER TABLE t ENGINE=MooseDB;
+SELECT COUNT(*), SUM(v) FROM t;
+ALTER TABLE t REMOVE PARTITIONING;
+ALTER TABLE t ENGINE=MooseDB;
+SELECT COUNT(*), SUM(v) FROM t;
+SHOW CREATE TABLE t;
+
+DROP TABLE t, m;
+--list_files $MYSQLD_DATADIR/test t*
+--list_files $MYSQLD_DATADIR/test m*

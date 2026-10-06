@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Builds ha_tideflow.so inside the tideflow-dev image.
+# Builds ha_moosedb.so inside the moosedb-dev image.
 #
-#   docker run --rm -v "$PWD:/work" -v tideflow-build:/build \
-#     -v tideflow-cargo:/usr/local/cargo/registry tideflow-dev docker/build-plugin.sh
+#   docker run --rm -v "$PWD:/work" -v moosedb-build:/build \
+#     -v moosedb-cargo:/usr/local/cargo/registry moosedb-dev docker/build-plugin.sh
 #
-# The MariaDB build directory lives in the tideflow-build volume, so only the
+# The MariaDB build directory lives in the moosedb-build volume, so only the
 # first run pays for configuring the server tree.
 set -euo pipefail
 
@@ -13,7 +13,7 @@ set -euo pipefail
 OUT_DIR=/work/build
 
 # Make the engine part of the server source tree.
-ln -sfn /work/storage/tideflow "$MARIADB_SRC/storage/tideflow"
+ln -sfn /work/storage/moosedb "$MARIADB_SRC/storage/moosedb"
 
 if [ ! -f "$MARIADB_BUILD/build.ninja" ]; then
   # Mirror the official release configuration so the plugin ABI matches the
@@ -27,8 +27,8 @@ if [ ! -f "$MARIADB_BUILD/build.ninja" ]; then
     -DWITH_UNIT_TESTS=OFF -DWITH_EMBEDDED_SERVER=OFF
 fi
 
-cmake --build "$MARIADB_BUILD" --target tideflow
+cmake --build "$MARIADB_BUILD" --target moosedb
 
 mkdir -p "$OUT_DIR"
-cp "$MARIADB_BUILD/storage/tideflow/ha_tideflow.so" "$OUT_DIR/"
-echo "Built $OUT_DIR/ha_tideflow.so"
+cp "$MARIADB_BUILD/storage/moosedb/ha_moosedb.so" "$OUT_DIR/"
+echo "Built $OUT_DIR/ha_moosedb.so"

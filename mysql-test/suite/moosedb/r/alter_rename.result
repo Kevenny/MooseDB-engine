@@ -1,0 +1,343 @@
+SET time_zone = '+00:00';
+# ---- Engine conversion ----
+CREATE TABLE m (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, d DOUBLE, INDEX(ts))
+ENGINE=MyISAM;
+INSERT INTO m SELECT '2026-01-01' + INTERVAL seq * 10 MINUTE, CONCAT('h', seq MOD 3), seq, seq / 2 FROM seq_0_to_29;
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+30	435	217.5	2026-01-01 00:00:00.000	2026-01-01 04:50:00.000	3
+ALTER TABLE m ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+SHOW CREATE TABLE m;
+Table	Create Table
+m	CREATE TABLE `m` (
+  `ts` datetime(3) NOT NULL,
+  `host` varchar(8) NOT NULL COMMENT 'TAG',
+  `v` int(11) DEFAULT NULL,
+  `d` double DEFAULT NULL,
+  KEY `ts` (`ts`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `CHUNK_INTERVAL`='1 HOUR'
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+30	435	217.5	2026-01-01 00:00:00.000	2026-01-01 04:50:00.000	3
+SELECT CHUNKS, PENDING_ROWS, SERIES FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';
+CHUNKS	PENDING_ROWS	SERIES
+5	0	3
+# Data now lives in chunks and in the MemTable
+INSERT INTO m VALUES ('2026-02-01', 'h9', 100, 1.5);
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+ALTER TABLE m ENGINE=Aria;
+SHOW CREATE TABLE m;
+Table	Create Table
+m	CREATE TABLE `m` (
+  `ts` datetime(3) NOT NULL,
+  `host` varchar(8) NOT NULL COMMENT 'TAG',
+  `v` int(11) DEFAULT NULL,
+  `d` double DEFAULT NULL,
+  KEY `ts` (`ts`)
+) ENGINE=Aria DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci PAGE_CHECKSUM=1 /* `CHUNK_INTERVAL`='1 HOUR' */
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+ALTER TABLE m ENGINE=MooseDB;
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+ALTER TABLE m ENGINE=MyISAM;
+ALTER TABLE m ENGINE=MooseDB;
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+# ---- Table options ----
+ALTER TABLE m CHUNK_INTERVAL='1 WEEK';
+SELECT CHUNK_INTERVAL, RETENTION, COMPRESSION, CHUNKS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';
+CHUNK_INTERVAL	RETENTION	COMPRESSION	CHUNKS
+1 WEEK	FOREVER	ZSTD	2
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+ALTER TABLE m RETENTION_PERIOD='10 YEARS', COMPRESSION='LZ4', HOT_THRESHOLD='2 DAYS', MEMTABLE_SIZE=8192;
+SELECT CHUNK_INTERVAL, RETENTION, COMPRESSION FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';
+CHUNK_INTERVAL	RETENTION	COMPRESSION
+1 WEEK	10 YEARS	LZ4
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+# Invalid values leave the table untouched
+ALTER TABLE m CHUNK_INTERVAL='3 DAY';
+ERROR HY000: MooseDB: invalid argument: CHUNK_INTERVAL '3 DAY' not supported; use 1 HOUR, 6 HOUR, 12 HOUR, 1 DAY, 1 WEEK or 1 MONTH
+ALTER TABLE m COMPRESSION='RAR';
+ERROR HY000: MooseDB: invalid argument: COMPRESSION 'RAR' not supported; use ZSTD, LZ4 or NONE
+ALTER TABLE m TIMESTAMP_COLUMN='host';
+ERROR HY000: MooseDB: timestamp column 'host' must be a stored DATETIME or TIMESTAMP column
+ALTER TABLE m ENCRYPTION='YES' ENCRYPTION_KEY_ID=77;
+ERROR HY000: MooseDB: invalid argument: encryption key 77 is not available: not found: encryption key 77 (version latest) is not available
+SELECT CHUNK_INTERVAL, RETENTION, COMPRESSION, ENCRYPTED FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';
+CHUNK_INTERVAL	RETENTION	COMPRESSION	ENCRYPTED
+1 WEEK	10 YEARS	LZ4	NO
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+# In-place algorithms are refused, COPY works
+ALTER TABLE m CHUNK_INTERVAL='1 DAY', ALGORITHM=INPLACE;
+ERROR 0A000: ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY
+ALTER TABLE m ADD COLUMN zz INT, ALGORITHM=INSTANT;
+ERROR 0A000: ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=COPY
+ALTER TABLE m CHUNK_INTERVAL='1 DAY', ALGORITHM=COPY;
+ALTER TABLE m COMMENT='metrics';
+ALTER TABLE m FORCE;
+SELECT COUNT(*), SUM(v), SUM(d), MIN(ts), MAX(ts), COUNT(DISTINCT host) FROM m;
+COUNT(*)	SUM(v)	SUM(d)	MIN(ts)	MAX(ts)	COUNT(DISTINCT host)
+31	535	219	2026-01-01 00:00:00.000	2026-02-01 00:00:00.000	4
+# ---- Column changes keep every row ----
+ALTER TABLE m ADD COLUMN w INT DEFAULT 5;
+SELECT COUNT(*), SUM(v), SUM(w), SUM(d) FROM m;
+COUNT(*)	SUM(v)	SUM(w)	SUM(d)
+31	535	155	219
+ALTER TABLE m ADD COLUMN note VARCHAR(10) AFTER host;
+SELECT COUNT(*), COUNT(note) FROM m;
+COUNT(*)	COUNT(note)
+31	0
+ALTER TABLE m MODIFY v VARCHAR(10);
+SELECT v FROM m ORDER BY ts LIMIT 3;
+v
+0
+1
+2
+SELECT SUM(v) FROM m;
+SUM(v)
+535
+ALTER TABLE m MODIFY v BIGINT;
+SELECT SUM(v) FROM m;
+SUM(v)
+535
+ALTER TABLE m CHANGE d dd DOUBLE;
+SELECT SUM(dd) FROM m;
+SUM(dd)
+219
+ALTER TABLE m DROP COLUMN note, DROP COLUMN w;
+ALTER TABLE m DROP COLUMN dd;
+SHOW CREATE TABLE m;
+Table	Create Table
+m	CREATE TABLE `m` (
+  `ts` datetime(3) NOT NULL,
+  `host` varchar(8) NOT NULL COMMENT 'TAG',
+  `v` bigint(20) DEFAULT NULL,
+  KEY `ts` (`ts`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci COMMENT='metrics' `RETENTION_PERIOD`='10 YEARS' `COMPRESSION`='LZ4' `HOT_THRESHOLD`='2 DAYS' `MEMTABLE_SIZE`='8192' `CHUNK_INTERVAL`='1 DAY'
+SELECT COUNT(*), SUM(v) FROM m;
+COUNT(*)	SUM(v)
+31	535
+# A TAG can be turned into an ordinary column and back
+SELECT host, COUNT(*) FROM m WHERE host = 'h1' GROUP BY host;
+host	COUNT(*)
+h1	10
+ALTER TABLE m MODIFY host VARCHAR(8) NOT NULL;
+SELECT host, COUNT(*) FROM m WHERE host = 'h1' GROUP BY host;
+host	COUNT(*)
+h1	10
+ALTER TABLE m MODIFY host VARCHAR(8) NOT NULL COMMENT 'TAG';
+SELECT SERIES FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';
+SERIES
+4
+FLUSH STATUS;
+SELECT COUNT(*) FROM m WHERE host = 'h1';
+COUNT(*)
+10
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	11
+ALTER TABLE m DROP COLUMN host;
+SELECT COUNT(*), SUM(v) FROM m;
+COUNT(*)	SUM(v)
+31	535
+SELECT SERIES FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';
+SERIES
+1
+ALTER TABLE m ADD COLUMN host VARCHAR(8) NOT NULL DEFAULT 'none' COMMENT 'TAG';
+SELECT host, COUNT(*) FROM m GROUP BY host;
+host	COUNT(*)
+none	31
+# The time axis can be renamed and widened
+ALTER TABLE m CHANGE ts t2 DATETIME(6) NOT NULL;
+SHOW CREATE TABLE m;
+Table	Create Table
+m	CREATE TABLE `m` (
+  `t2` datetime(6) NOT NULL,
+  `v` bigint(20) DEFAULT NULL,
+  `host` varchar(8) NOT NULL DEFAULT 'none' COMMENT 'TAG',
+  KEY `ts` (`t2`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci COMMENT='metrics' `RETENTION_PERIOD`='10 YEARS' `COMPRESSION`='LZ4' `HOT_THRESHOLD`='2 DAYS' `MEMTABLE_SIZE`='8192' `CHUNK_INTERVAL`='1 DAY'
+SELECT COUNT(*) FROM m WHERE t2 > '2026-01-01 01:00:00';
+COUNT(*)
+24
+SELECT t2 FROM m ORDER BY t2 DESC LIMIT 1;
+t2
+2026-02-01 00:00:00.000000
+# DATETIME to TIMESTAMP (time_zone = +00:00, so the instants are preserved)
+ALTER TABLE m MODIFY t2 TIMESTAMP(6) NOT NULL;
+SELECT t2, v FROM m ORDER BY t2 LIMIT 2;
+t2	v
+2026-01-01 00:00:00.000000	0
+2026-01-01 00:10:00.000000	1
+SELECT COUNT(*) FROM m WHERE t2 BETWEEN '2026-01-01 01:00:00' AND '2026-01-01 02:00:00';
+COUNT(*)
+7
+ALTER TABLE m MODIFY t2 DATETIME(6) NOT NULL;
+# Changes the engine must refuse
+ALTER TABLE m DROP COLUMN t2;
+ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'
+ALTER TABLE m DROP INDEX ts;
+ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'
+ALTER TABLE m MODIFY t2 DATETIME(6) NULL;
+ERROR 42000: Table handler doesn't support NULL in given index. Please change column 't2' to be NOT NULL or use another handler
+ALTER TABLE m ADD PRIMARY KEY (t2);
+ERROR HY000: MooseDB: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+ALTER TABLE m ADD UNIQUE (v);
+ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'v' to be NOT NULL or use another handler
+ALTER TABLE m ADD INDEX (host);
+ERROR HY000: MooseDB: index 'host' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+ALTER TABLE m ADD COLUMN g GEOMETRY;
+ERROR 42000: The storage engine for the table doesn't support GEOMETRY
+ALTER TABLE m ADD COLUMN id INT NOT NULL AUTO_INCREMENT, ADD KEY (id);
+ERROR 42000: Storage engine MooseDB doesn't support AUTO_INCREMENT columns
+SELECT COUNT(*), SUM(v) FROM m;
+COUNT(*)	SUM(v)
+31	535
+CHECK TABLE m;
+Table	Op	Msg_type	Msg_text
+test.m	check	status	OK
+# CONVERT TO CHARACTER SET rewrites tag values
+ALTER TABLE m CONVERT TO CHARACTER SET utf8mb4;
+SELECT COUNT(*), SUM(v) FROM m WHERE host = 'none';
+COUNT(*)	SUM(v)
+31	535
+# ---- RENAME ----
+RENAME TABLE m TO m2;
+SELECT COUNT(*), SUM(v) FROM m2;
+COUNT(*)	SUM(v)
+31	535
+ALTER TABLE m2 RENAME TO m3;
+SELECT COUNT(*), SUM(v) FROM m3;
+COUNT(*)	SUM(v)
+31	535
+CREATE DATABASE d2;
+RENAME TABLE m3 TO d2.m3;
+SELECT COUNT(*) FROM m3;
+ERROR 42S02: Table 'test.m3' doesn't exist
+SELECT COUNT(*), SUM(v) FROM d2.m3;
+COUNT(*)	SUM(v)
+31	535
+SELECT TABLE_SCHEMA, TABLE_NAME, ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME LIKE 'm%';
+TABLE_SCHEMA	TABLE_NAME	ROW_COUNT
+d2	m3	31
+INSERT INTO d2.m3 VALUES ('2030-01-01', 5, 'none');
+ALTER TABLE d2.m3 RENAME test.back;
+SELECT COUNT(*), SUM(v) FROM back;
+COUNT(*)	SUM(v)
+32	540
+# Rename over an existing table fails and changes nothing
+CREATE TABLE x (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO x VALUES ('2026-06-01', -1);
+RENAME TABLE back TO x;
+ERROR 42S01: Table 'x' already exists
+SELECT COUNT(*) FROM x;
+COUNT(*)
+1
+SELECT COUNT(*) FROM back;
+COUNT(*)
+32
+# Three-way swap in one statement
+RENAME TABLE back TO tmp_swap, x TO back, tmp_swap TO x;
+SELECT COUNT(*) FROM x;
+COUNT(*)
+32
+SELECT COUNT(*) FROM back;
+COUNT(*)
+1
+RENAME TABLE nope TO nope2;
+ERROR 42S02: Table 'test.nope' doesn't exist
+# Renamed tables keep working: inserts, flush, optimize
+INSERT INTO back VALUES ('2031-01-01', 1);
+FLUSH TABLES back;
+OPTIMIZE TABLE back;
+Table	Op	Msg_type	Msg_text
+test.back	optimize	status	OK
+SELECT COUNT(*), MAX(ts) FROM back;
+COUNT(*)	MAX(ts)
+2	2031-01-01 00:00:00
+# ---- CREATE TABLE LIKE / AS SELECT ----
+CREATE TABLE lk LIKE back;
+SHOW CREATE TABLE lk;
+Table	Create Table
+lk	CREATE TABLE `lk` (
+  `ts` datetime NOT NULL,
+  `v` int(11) DEFAULT NULL,
+  KEY `ts` (`ts`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+SELECT COUNT(*) FROM lk;
+COUNT(*)
+0
+CREATE TABLE cs (ts DATETIME NOT NULL, v BIGINT, host VARCHAR(8) NOT NULL DEFAULT '', INDEX(ts)) ENGINE=MooseDB
+SELECT ts, v FROM back;
+SELECT ts, v, host FROM cs ORDER BY ts;
+ts	v	host
+2026-06-01 00:00:00	-1	
+2031-01-01 00:00:00	1	
+INSERT INTO cs SELECT * FROM cs;
+SELECT COUNT(*) FROM cs;
+COUNT(*)
+4
+CREATE TABLE bad ENGINE=MooseDB AS SELECT ts, nonexistent FROM back;
+ERROR 42S22: Unknown column 'nonexistent' in 'SELECT'
+CREATE TABLE bad (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB SELECT 1 AS other;
+ERROR HY000: Field 'ts' doesn't have a default value
+SELECT * FROM bad;
+ERROR 42S02: Table 'test.bad' doesn't exist
+DROP TABLE lk, cs;
+# ---- DROP DATABASE removes every table directory ----
+CREATE DATABASE d3;
+CREATE TABLE d3.a (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+CREATE TABLE d3.b (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='NO';
+CREATE TABLE d3.c (ts DATETIME NOT NULL, v INT) ENGINE=MyISAM;
+INSERT INTO d3.a SELECT '2026-01-01' + INTERVAL seq HOUR, seq FROM seq_1_to_100;
+INSERT INTO d3.b SELECT '2026-01-01' + INTERVAL seq HOUR, seq FROM seq_1_to_100;
+FLUSH TABLES d3.a;
+INSERT INTO d3.a VALUES ('2030-01-01', 0);
+a
+a.frm
+b
+b.frm
+c.MYD
+c.MYI
+c.frm
+db.opt
+SELECT TABLE_NAME, ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_SCHEMA = 'd3' ORDER BY TABLE_NAME;
+TABLE_NAME	ROW_COUNT
+a	101
+b	100
+DROP DATABASE d3;
+SELECT COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_SCHEMA = 'd3';
+COUNT(*)
+0
+# A recreated database starts empty
+CREATE DATABASE d3;
+CREATE TABLE d3.a (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+SELECT COUNT(*) FROM d3.a;
+COUNT(*)
+0
+DROP DATABASE d3;
+# DROP TABLE IF EXISTS / DROP of an open table with MemTable rows
+DROP TABLE IF EXISTS nonexistent_tf;
+Warnings:
+Note	1051	Unknown table 'test.nonexistent_tf'
+INSERT INTO x VALUES ('2032-01-01', 7, 'pending');
+DROP TABLE x;
+CREATE TABLE x (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+SELECT COUNT(*) FROM x;
+COUNT(*)
+0
+DROP DATABASE d2;
+DROP TABLE x;
+DROP TABLE back;

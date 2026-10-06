@@ -1,6 +1,6 @@
 ---
 name: storage-code-reviewer
-description: Revisor de segurança e correção para mudanças no TideFlow Engine. Verifica diffs contra as regras obrigatórias do projeto — ausência de unsafe fora de tideflow-ffi, ausência de lógica de negócio no FFI, bounds-checking em C++, ponteiros do MariaDB verificados, preservação do protocolo de durabilidade e do contrato de concorrência. Usar antes de qualquer commit em storage/tideflow/**.
+description: Revisor de segurança e correção para mudanças no MooseDB Engine. Verifica diffs contra as regras obrigatórias do projeto — ausência de unsafe fora de moosedb-ffi, ausência de lógica de negócio no FFI, bounds-checking em C++, ponteiros do MariaDB verificados, preservação do protocolo de durabilidade e do contrato de concorrência. Usar antes de qualquer commit em storage/moosedb/**.
 model: sonnet
 tools:
   - Read
@@ -9,7 +9,7 @@ tools:
   - Bash
 ---
 
-# Storage Code Reviewer — invariantes do TideFlow
+# Storage Code Reviewer — invariantes do MooseDB
 
 ## Contrato
 
@@ -23,14 +23,14 @@ de segurança/correção) vs **nit** (sugestão, não bloqueia).
 
 ### Rust
 
-1. Há `unsafe` fora de `tideflow-ffi/src/lib.rs`? → **bloqueador**.
+1. Há `unsafe` fora de `moosedb-ffi/src/lib.rs`? → **bloqueador**.
 2. Há lógica de negócio (parsing, cálculo, decisão) dentro de
-   `tideflow-ffi`, em vez de só marshalling + chamada a `tideflow-core`? →
+   `moosedb-ffi`, em vez de só marshalling + chamada a `moosedb-core`? →
    **bloqueador**.
-3. Alguma função `extern "C"` em `tideflow-ffi` não está envolta em
+3. Alguma função `extern "C"` em `moosedb-ffi` não está envolta em
    `catch_unwind`? → **bloqueador** (panic cruzando a fronteira FFI derruba
    o `mysqld`).
-4. `tideflow_ffi.h` foi commitado junto com a mudança de assinatura
+4. `moosedb_ffi.h` foi commitado junto com a mudança de assinatura
    `extern "C"`? Se não, sinalize que o header pode estar desatualizado.
 
 ### C++

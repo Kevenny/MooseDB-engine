@@ -1,9 +1,9 @@
-# TideFlow Engine
+# MooseDB Engine
 
 Storage engine time-series para MariaDB 11.4+ — handler em C++20, núcleo de
 storage em Rust (`#![forbid(unsafe_code)]`) exposto via C ABI.
 
-* Especificação de produto: [tideflow_engine_spec.md](tideflow_engine_spec.md)
+* Especificação de produto: [moosedb_engine_spec.md](moosedb_engine_spec.md)
 * Guia do usuário: [docs/user-guide.md](docs/user-guide.md)
 * Arquitetura implementada e divergências da spec: [docs/architecture.md](docs/architecture.md)
 
@@ -17,9 +17,9 @@ Todas as fases da spec (§18) estão implementadas:
   / ZSTD (frio);
 * scans em streaming, *k-way merge* ordenado para o índice de timestamp,
   pushdown de filtros por TAG respeitando a collation, Bloom filter por chunk;
-* compactação e retenção (OPTIMIZE, `CALL tideflow_*`, threads de fundo);
+* compactação e retenção (OPTIMIZE, `CALL moosedb_*`, threads de fundo);
 * INSERT concorrente com SELECT (snapshots imutáveis);
-* `INFORMATION_SCHEMA.TIDEFLOW_TABLES` e `TIDEFLOW_CHUNKS`;
+* `INFORMATION_SCHEMA.MOOSEDB_TABLES` e `MOOSEDB_CHUNKS`;
 * criptografia AES-256-CTR com chaves do key management do MariaDB;
 * replicação row-based.
 
@@ -30,20 +30,20 @@ exato do servidor da imagem `mariadb:11.4` (11.4.13).
 
 ```bash
 # Imagens
-docker build -f docker/dev.Dockerfile  -t tideflow-dev  docker/
-docker build -f docker/test.Dockerfile -t tideflow-test docker/
+docker build -f docker/dev.Dockerfile  -t moosedb-dev  docker/
+docker build -f docker/test.Dockerfile -t moosedb-test docker/
 
 # Rust: testes, clippy
-docker run --rm -v "$PWD:/work" -v tideflow-cargo:/usr/local/cargo/registry \
-  -v tideflow-build:/build -w /work/storage/tideflow/rust tideflow-dev \
+docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
+  -v moosedb-build:/build -w /work/storage/moosedb/rust moosedb-dev \
   bash -c 'cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings'
 
-# Plugin ha_tideflow.so → build/
-docker run --rm -v "$PWD:/work" -v tideflow-cargo:/usr/local/cargo/registry \
-  -v tideflow-build:/build tideflow-dev bash /work/docker/build-plugin.sh
+# Plugin ha_moosedb.so → build/
+docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
+  -v moosedb-build:/build moosedb-dev bash /work/docker/build-plugin.sh
 
-# Suíte MTR (14 testes) contra o servidor oficial
-docker run --rm -v "$PWD:/work" tideflow-test bash /work/docker/run-mtr.sh
+# Suíte MTR contra o servidor oficial
+docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh
 ```
 
 ## Instalação
@@ -51,7 +51,7 @@ docker run --rm -v "$PWD:/work" tideflow-test bash /work/docker/run-mtr.sh
 ```ini
 [mariadb]
 plugin_maturity = experimental   # a engine se declara EXPERIMENTAL em v0.x
-plugin_load_add = ha_tideflow
+plugin_load_add = ha_moosedb
 ```
 
-Procedures de manutenção (por banco): `SOURCE storage/tideflow/sql/tideflow_install.sql`.
+Procedures de manutenção (por banco): `SOURCE storage/moosedb/sql/moosedb_install.sql`.

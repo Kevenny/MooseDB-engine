@@ -1,0 +1,53 @@
+#
+# CHECK TABLE, OPTIMIZE TABLE and RETENTION_PERIOD.
+#
+--source suite/moosedb/include/have_moosedb.inc
+
+call mtr.add_suppression("MooseDB");
+call mtr.add_suppression("marked as crashed");
+call mtr.add_suppression("Checking table");
+
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts))
+  ENGINE=MooseDB CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+
+--echo # Two days far in the past, two days relative to now
+INSERT INTO t VALUES
+  ('2001-01-01 00:00:00', 1),
+  ('2001-01-02 00:00:00', 2),
+  (NOW() - INTERVAL 1 DAY, 3),
+  (NOW(), 4);
+
+--replace_regex /chunk_[0-9T_]+.tfl/chunk_X.tfl/
+CHECK TABLE t;
+--echo # OPTIMIZE seals the MemTable and applies retention
+OPTIMIZE TABLE t;
+SELECT v FROM t ORDER BY v;
+CHECK TABLE t;
+
+--echo # Corrupt the OLDEST chunk on disk while the table is closed. Recovery
+--echo # only fully verifies the newest chunk, so CHECK TABLE must catch it.
+let MYSQLD_DATADIR= `SELECT @@datadir`;
+FLUSH TABLES t;
+--let CORRUPT_WHICH= 0
+--source suite/moosedb/include/corrupt_chunk.inc
+--replace_regex /chunk_[0-9T_]+.tfl/chunk_X.tfl/
+CHECK TABLE t;
+--error ER_CRASHED_ON_USAGE
+SELECT SUM(v) FROM t;
+DROP TABLE t;
+
+--echo # A corrupt NEWEST chunk is quarantined (.tfl.corrupt) when the table
+--echo # is opened, and the table stays usable (spec §12.f).
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO t VALUES ('2026-01-01', 1);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-02', 2);
+FLUSH TABLES t;
+--let CORRUPT_WHICH= -1
+--source suite/moosedb/include/corrupt_chunk.inc
+--disable_warnings
+SELECT v FROM t;
+--enable_warnings
+CHECK TABLE t;
+--list_files $MYSQLD_DATADIR/test/t *.corrupt
+DROP TABLE t;
