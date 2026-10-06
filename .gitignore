@@ -1,0 +1,8 @@
+# Build outputs
+/build/
+target/
+*.so
+
+# MTR
+*.reject
+*.log

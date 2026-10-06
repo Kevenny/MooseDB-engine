@@ -1,0 +1,87 @@
+SELECT ENGINE, SUPPORT, TRANSACTIONS, XA, SAVEPOINTS
+FROM information_schema.ENGINES WHERE ENGINE = 'TideFlow';
+ENGINE	SUPPORT	TRANSACTIONS	XA	SAVEPOINTS
+TideFlow	YES	NO	NO	NO
+SHOW VARIABLES LIKE 'tideflow%';
+Variable_name	Value
+tideflow_bloom_filter_false_positive_rate	0.010000
+tideflow_chunk_cache_size	134217728
+tideflow_compaction_threads	2
+tideflow_compaction_trigger_chunks	10
+tideflow_max_open_chunks	100
+tideflow_memtable_flush_threshold	67108864
+tideflow_retention_check_interval	3600
+tideflow_wal_sync_mode	fsync
+# Full option syntax (spec §7)
+CREATE TABLE metricas (
+ts          DATETIME(6)  NOT NULL,
+host        VARCHAR(64)  NOT NULL  COMMENT 'TAG',
+metric      VARCHAR(64)  NOT NULL  COMMENT 'TAG',
+value       DOUBLE,
+value_int   BIGINT,
+status      TINYINT(1),
+INDEX ts_idx (ts)
+) ENGINE=TideFlow
+CHUNK_INTERVAL    = '1 DAY'
+  RETENTION_PERIOD  = '90 DAYS'
+  COMPRESSION       = 'ZSTD'
+  COMPRESSION_LEVEL = 3
+HOT_THRESHOLD     = '7 DAYS'
+  MEMTABLE_SIZE     = 67108864
+TIMESTAMP_COLUMN  = 'ts';
+SHOW CREATE TABLE metricas;
+Table	Create Table
+metricas	CREATE TABLE `metricas` (
+  `ts` datetime(6) NOT NULL,
+  `host` varchar(64) NOT NULL COMMENT 'TAG',
+  `metric` varchar(64) NOT NULL COMMENT 'TAG',
+  `value` double DEFAULT NULL,
+  `value_int` bigint(20) DEFAULT NULL,
+  `status` tinyint(1) DEFAULT NULL,
+  KEY `ts_idx` (`ts`)
+) ENGINE=TideFlow DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `CHUNK_INTERVAL`='1 DAY' `RETENTION_PERIOD`='90 DAYS' `COMPRESSION`='ZSTD' `COMPRESSION_LEVEL`='3' `HOT_THRESHOLD`='7 DAYS' `MEMTABLE_SIZE`='67108864' `TIMESTAMP_COLUMN`='ts'
+SHOW INDEX FROM metricas;
+Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+metricas	1	ts_idx	1	ts	A	NULL	NULL	NULL		TSIDX			NO
+DROP TABLE metricas;
+# Invalid option values are rejected by the engine
+CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow CHUNK_INTERVAL='2 DAY';
+ERROR HY000: TideFlow: invalid argument: CHUNK_INTERVAL '2 DAY' not supported; use 1 HOUR, 6 HOUR, 12 HOUR, 1 DAY, 1 WEEK or 1 MONTH
+CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow RETENTION_PERIOD='soon';
+ERROR HY000: TideFlow: invalid argument: expected '<N> <UNIT>', got 'soon'
+CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow COMPRESSION='GZIP';
+ERROR HY000: TideFlow: invalid argument: COMPRESSION 'GZIP' not supported; use ZSTD, LZ4 or NONE
+CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow COMPRESSION_LEVEL=25;
+ERROR HY000: Incorrect value '25' for option 'COMPRESSION_LEVEL'
+CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow MEMTABLE_SIZE=100;
+ERROR HY000: TideFlow: invalid argument: MEMTABLE_SIZE must be at least 4096 bytes
+# Table definition rules
+CREATE TABLE t1 (ts DATETIME NOT NULL, v INT) ENGINE=TideFlow;
+ERROR HY000: TideFlow: a TideFlow table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'
+CREATE TABLE t1 (ts DATETIME NULL, INDEX(ts)) ENGINE=TideFlow;
+ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'ts' to be NOT NULL or use another handler
+CREATE TABLE t1 (ts DATETIME NOT NULL, PRIMARY KEY(ts)) ENGINE=TideFlow;
+ERROR HY000: TideFlow: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+CREATE TABLE t1 (ts DATETIME NOT NULL, v INT NOT NULL, INDEX(ts), INDEX(v)) ENGINE=TideFlow;
+ERROR HY000: TideFlow: index 'v' is not supported: TideFlow only indexes the timestamp column (TAG columns are indexed implicitly)
+CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow TIMESTAMP_COLUMN='nope';
+ERROR HY000: TideFlow: TIMESTAMP_COLUMN 'nope' does not exist
+CREATE TABLE t1 (ts DATETIME NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=TideFlow TIMESTAMP_COLUMN='v';
+ERROR HY000: TideFlow: timestamp column 'v' must be a stored DATETIME or TIMESTAMP column
+CREATE TABLE t1 (id INT NOT NULL AUTO_INCREMENT, ts DATETIME NOT NULL, INDEX(id), INDEX(ts)) ENGINE=TideFlow;
+ERROR 42000: Storage engine TideFlow doesn't support AUTO_INCREMENT columns
+# TIMESTAMP columns work as the time axis too
+CREATE TABLE t1 (ts TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), v INT, INDEX(ts)) ENGINE=TideFlow;
+SET time_zone = '+00:00';
+INSERT INTO t1 VALUES ('2026-10-01 12:00:00.123', 1);
+SET time_zone = '-03:00';
+SELECT * FROM t1;
+ts	v
+2026-10-01 09:00:00.123	1
+SET time_zone = DEFAULT;
+DROP TABLE t1;
+# DROP DATABASE removes TideFlow table directories
+CREATE DATABASE tfdb;
+CREATE TABLE tfdb.t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO tfdb.t1 VALUES ('2026-01-01');
+DROP DATABASE tfdb;

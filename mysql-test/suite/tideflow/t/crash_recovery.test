@@ -1,0 +1,41 @@
+#
+# Crash recovery: rows acknowledged before a kill -9 must survive (spec §12).
+#
+--source include/not_embedded.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE TABLE t (ts DATETIME(6) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts))
+  ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+
+--echo # Part of the rows sealed in chunks, the rest only in the WAL
+--disable_query_log
+let $i= 0;
+while ($i < 100)
+{
+  eval INSERT INTO t VALUES ('2026-10-01 00:00:00' + INTERVAL $i MINUTE, CONCAT('h', $i % 4), $i);
+  if ($i == 59)
+  {
+    FLUSH TABLES t;
+  }
+  inc $i;
+}
+--enable_query_log
+INSERT INTO t SELECT ts + INTERVAL 1 DAY, host, v + 1000 FROM t;
+SELECT COUNT(*), SUM(v) FROM t;
+
+--echo # kill -9 the server
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+
+SELECT COUNT(*), SUM(v) FROM t;
+SELECT host, COUNT(*) FROM t GROUP BY host ORDER BY host;
+SELECT COUNT(*) FROM t WHERE ts >= '2026-10-02';
+
+--echo # Writes continue after recovery and survive another crash
+INSERT INTO t VALUES ('2026-10-03 00:00:00', 'h9', 1);
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v) FROM t;
+CHECK TABLE t;
+
+DROP TABLE t;
