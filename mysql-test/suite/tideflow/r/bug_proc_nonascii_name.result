@@ -1,0 +1,11 @@
+SET NAMES utf8mb4;
+CREATE DATABASE sec CHARACTER SET utf8mb4;
+USE sec;
+CREATE TABLE `ünï` (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO `ünï` VALUES ('2026-01-01', 1);
+CALL tideflow_apply_retention('ünï');
+CALL tideflow_compact('ünï', NULL, NULL);
+USE test;
+DROP DATABASE sec;
+DROP FUNCTION tideflow_compact_impl;
+DROP FUNCTION tideflow_retention_impl;

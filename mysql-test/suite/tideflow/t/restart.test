@@ -1,0 +1,79 @@
+#
+# Clean server restart with data in the MemTable (WAL only) and in sealed
+# chunks: rows, options, series, DDL state and further writes survive.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE TABLE r (
+    ts    DATETIME(6) NOT NULL,
+    host  VARCHAR(16) NOT NULL COMMENT 'TAG',
+    v     DOUBLE,
+    s     VARCHAR(40),
+    INDEX(ts)
+) ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR' RETENTION_PERIOD='FOREVER' COMPRESSION='LZ4' HOT_THRESHOLD='1 DAY';
+
+--echo # 600 rows in 4 chunks + 300 rows only in the WAL
+INSERT INTO r SELECT '2026-02-01 00:00:00' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 5), seq / 4, CONCAT('row-', seq)
+  FROM seq_0_to_599;
+FLUSH TABLES r;
+INSERT INTO r SELECT '2026-02-01 04:00:00' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 5), seq / 4, CONCAT('row-', 600 + seq)
+  FROM seq_0_to_299;
+SELECT PENDING_ROWS, CHUNKS FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'r';
+
+let $check= SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts), COUNT(DISTINCT host), MD5(GROUP_CONCAT(s ORDER BY ts, host)) FROM r;
+eval $check;
+SELECT host, COUNT(*) FROM r GROUP BY host ORDER BY host;
+
+--echo # restart 1
+--source include/restart_mysqld.inc
+eval $check;
+SELECT host, COUNT(*) FROM r GROUP BY host ORDER BY host;
+SELECT ROW_COUNT, SERIES, CHUNK_INTERVAL, RETENTION, COMPRESSION FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'r';
+SHOW CREATE TABLE r;
+SELECT COUNT(*) FROM r WHERE host = 'h3' AND ts >= '2026-02-01 04:00:00';
+SELECT ts, host FROM r ORDER BY ts DESC LIMIT 2;
+CHECK TABLE r;
+
+--echo # Writes after the restart, then another restart without any flush
+INSERT INTO r VALUES ('2026-02-02 00:00:00', 'late', 1.5, 'after-1');
+INSERT INTO r VALUES ('2026-01-31 23:59:59.999999', 'early', -1.5, 'before-first');
+--source include/restart_mysqld.inc
+eval $check;
+SELECT host, v, s FROM r WHERE host IN ('late', 'early') ORDER BY ts;
+SELECT ts, host FROM r ORDER BY ts LIMIT 2;
+
+--echo # TRUNCATE survives a restart (no rows resurrected from old WAL/chunks)
+TRUNCATE TABLE r;
+INSERT INTO r VALUES ('2026-03-01', 'only', 1, 'one');
+--source include/restart_mysqld.inc
+SELECT COUNT(*), MIN(s) FROM r;
+SELECT CHUNKS FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'r';
+
+--echo # RENAME survives a restart
+RENAME TABLE r TO r2;
+INSERT INTO r2 VALUES ('2026-03-02', 'only', 2, 'two');
+--source include/restart_mysqld.inc
+SELECT * FROM r2 ORDER BY ts;
+--error ER_NO_SUCH_TABLE
+SELECT * FROM r;
+
+--echo # Several restarts in a row with an empty and a never-written table
+CREATE TABLE e (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow;
+--source include/restart_mysqld.inc
+--source include/restart_mysqld.inc
+SELECT COUNT(*) FROM e;
+INSERT INTO e VALUES ('2026-01-01');
+--source include/restart_mysqld.inc
+SELECT COUNT(*) FROM e;
+
+--echo # An INSERT ... SELECT that straddles chunk boundaries followed by restart
+INSERT INTO e SELECT '2026-01-01' + INTERVAL seq HOUR FROM seq_1_to_100;
+FLUSH TABLES e;
+INSERT INTO e SELECT '2026-01-01' + INTERVAL seq HOUR + INTERVAL 30 MINUTE FROM seq_1_to_100;
+--source include/restart_mysqld.inc
+SELECT COUNT(*), MIN(ts), MAX(ts) FROM e;
+CHECK TABLE e;
+
+DROP TABLE r2, e;

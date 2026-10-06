@@ -1,0 +1,158 @@
+CREATE TABLE ms (
+ts    DATETIME(3) NOT NULL,
+host  VARCHAR(16) NOT NULL COMMENT 'TAG',
+dc    VARCHAR(8)  NOT NULL COMMENT 'TAG',
+v     INT,
+INDEX(ts)
+) ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+# 5000 hosts x 4 samples spread over ~11 hours; half of the rows sealed in chunks
+INSERT INTO ms
+SELECT '2026-03-01 00:00:00' + INTERVAL (a.seq * 7 + b.seq * 1800) SECOND + INTERVAL 0 SECOND,
+CONCAT('host-', LPAD(a.seq, 5, '0')), CONCAT('dc', a.seq MOD 7), a.seq * 10 + b.seq
+FROM seq_0_to_4999 a JOIN seq_0_to_1 b;
+FLUSH TABLES ms;
+INSERT INTO ms
+SELECT '2026-03-01 01:00:00' + INTERVAL (a.seq * 7 + b.seq * 1800) SECOND,
+CONCAT('host-', LPAD(a.seq, 5, '0')), CONCAT('dc', a.seq MOD 7), a.seq * 10 + b.seq + 100000
+FROM seq_0_to_4999 a JOIN seq_0_to_1 b;
+SELECT COUNT(*), COUNT(DISTINCT host), COUNT(DISTINCT dc), MIN(ts), MAX(ts) FROM ms;
+COUNT(*)	COUNT(DISTINCT host)	COUNT(DISTINCT dc)	MIN(ts)	MAX(ts)
+20000	5000	7	2026-03-01 00:00:00.000	2026-03-01 11:13:13.000
+SELECT SERIES, ROW_COUNT, PENDING_ROWS FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'ms';
+SERIES	ROW_COUNT	PENDING_ROWS
+5000	20000	10000
+SELECT COUNT(*), SUM(`ROWS`), MAX(SERIES) FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'ms';
+COUNT(*)	SUM(`ROWS`)	MAX(SERIES)
+11	10000	772
+# Single series lookups: first, last, middle, missing
+FLUSH STATUS;
+SELECT host, COUNT(*), SUM(v) FROM ms WHERE host = 'host-00000' GROUP BY host;
+host	COUNT(*)	SUM(v)
+host-00000	4	200002
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	5
+SELECT host, COUNT(*), SUM(v) FROM ms WHERE host = 'host-04999' GROUP BY host;
+host	COUNT(*)	SUM(v)
+host-04999	4	399962
+SELECT host, COUNT(*), SUM(v) FROM ms WHERE host = 'host-02500' GROUP BY host;
+host	COUNT(*)	SUM(v)
+host-02500	4	300002
+SELECT COUNT(*) FROM ms WHERE host = 'host-05000';
+COUNT(*)
+0
+# Tag with 7 values partitions the 5000 series
+SELECT dc, COUNT(*), COUNT(DISTINCT host) FROM ms GROUP BY dc ORDER BY dc;
+dc	COUNT(*)	COUNT(DISTINCT host)
+dc0	2860	715
+dc1	2860	715
+dc2	2856	714
+dc3	2856	714
+dc4	2856	714
+dc5	2856	714
+dc6	2856	714
+FLUSH STATUS;
+SELECT COUNT(*) FROM ms WHERE dc = 'dc3' AND host = 'host-00003';
+COUNT(*)
+4
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	5
+SELECT COUNT(*) FROM ms WHERE dc = 'dc4' AND host = 'host-00003';
+COUNT(*)
+0
+# Large IN lists (900 values, half of them missing)
+COUNT(*)	COUNT(DISTINCT host)	SUM(v)
+3600	900	260911800
+COUNT(*)
+3600
+Variable_name	Value
+Handler_read_rnd_next	3601
+COUNT(*)
+516
+COUNT(*)
+3445
+# Oracle: the same answer through a join with a MyISAM key table
+CREATE TABLE keys_t (h VARCHAR(16) PRIMARY KEY) ENGINE=MyISAM;
+INSERT INTO keys_t SELECT CONCAT('host-', LPAD(seq * 5, 5, '0')) FROM seq_0_to_899;
+SELECT COUNT(*), COUNT(DISTINCT host), SUM(v) FROM ms JOIN keys_t ON host = h;
+COUNT(*)	COUNT(DISTINCT host)	SUM(v)
+3600	900	260911800
+DROP TABLE keys_t;
+# IN lists at or above in_predicate_conversion_threshold (default 1000) are
+# rewritten by the server into a subquery, so no condition reaches the engine
+SELECT @@in_predicate_conversion_threshold;
+@@in_predicate_conversion_threshold
+1000
+COUNT(*)
+0
+Variable_name	Value
+Handler_read_rnd_next	20001
+COUNT(*)
+0
+Variable_name	Value
+Handler_read_rnd_next	1
+COUNT(*)	COUNT(DISTINCT host)
+12000	3000
+Variable_name	Value
+Handler_read_rnd_next	12001
+# Ordered scan across all series merges thousands of sorted streams
+SELECT ts, host, v FROM ms ORDER BY ts LIMIT 5;
+ts	host	v
+2026-03-01 00:00:00.000	host-00000	0
+2026-03-01 00:00:07.000	host-00001	10
+2026-03-01 00:00:14.000	host-00002	20
+2026-03-01 00:00:21.000	host-00003	30
+2026-03-01 00:00:28.000	host-00004	40
+SELECT ts, host, v FROM ms ORDER BY ts DESC LIMIT 5;
+ts	host	v
+2026-03-01 11:13:13.000	host-04999	149991
+2026-03-01 11:13:06.000	host-04998	149981
+2026-03-01 11:12:59.000	host-04997	149971
+2026-03-01 11:12:52.000	host-04996	149961
+2026-03-01 11:12:45.000	host-04995	149951
+SELECT COUNT(*) FROM ms WHERE ts BETWEEN '2026-03-01 00:30:00' AND '2026-03-01 00:30:59.999';
+COUNT(*)
+17
+# Compaction with many series keeps every row
+OPTIMIZE TABLE ms;
+Table	Op	Msg_type	Msg_text
+test.ms	optimize	status	OK
+SELECT COUNT(*), COUNT(DISTINCT host), SUM(v) FROM ms;
+COUNT(*)	COUNT(DISTINCT host)	SUM(v)
+20000	5000	1499910000
+SELECT host, COUNT(*), SUM(v) FROM ms WHERE host IN ('host-00000', 'host-04999') GROUP BY host ORDER BY host;
+host	COUNT(*)	SUM(v)
+host-00000	4	200002
+host-04999	4	399962
+CHECK TABLE ms;
+Table	Op	Msg_type	Msg_text
+test.ms	check	status	OK
+# Restart: series index is rebuilt from chunks + WAL
+INSERT INTO ms VALUES ('2026-03-01 02:00:00', 'host-new', 'dcX', 1);
+# restart
+SELECT COUNT(*), COUNT(DISTINCT host), SUM(v) FROM ms;
+COUNT(*)	COUNT(DISTINCT host)	SUM(v)
+20001	5001	1499910001
+SELECT host, v FROM ms WHERE host = 'host-new';
+host	v
+host-new	1
+SELECT SERIES FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'ms';
+SERIES
+5001
+# Many tag combinations: one series per (a, b) pair
+CREATE TABLE combo (ts DATETIME NOT NULL, a INT NOT NULL COMMENT 'TAG', b VARCHAR(8) NOT NULL COMMENT 'TAG', INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO combo SELECT '2026-01-01' + INTERVAL x.seq SECOND, x.seq MOD 100, CONCAT('b', x.seq DIV 100) FROM seq_0_to_2999 x;
+SELECT SERIES FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'combo';
+SERIES
+3000
+SELECT COUNT(*) FROM combo WHERE a = 7 AND b = 'b7';
+COUNT(*)
+1
+SELECT COUNT(*) FROM combo WHERE a = 7;
+COUNT(*)
+30
+SELECT COUNT(*) FROM combo WHERE b IN ('b1', 'b29');
+COUNT(*)
+200
+DROP TABLE combo, ms;

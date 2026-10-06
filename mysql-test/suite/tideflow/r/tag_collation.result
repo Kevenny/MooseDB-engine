@@ -1,0 +1,288 @@
+SET NAMES utf8mb4;
+CREATE TABLE tf (
+ts   DATETIME NOT NULL,
+ci   VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG',
+uni  VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci COMMENT 'TAG',
+bin  VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin COMMENT 'TAG',
+np   VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin COMMENT 'TAG',
+ch   CHAR(8) CHARACTER SET latin1 COMMENT 'TAG',
+n    INT,
+INDEX(ts)
+) ENGINE=TideFlow;
+CREATE TABLE ctl LIKE tf;
+ALTER TABLE ctl ENGINE=MyISAM;
+INSERT INTO tf VALUES ('2026-01-01 00:00:01', 'abc',    'abc',    'abc',    'abc',    'abc',    1),
+('2026-01-01 00:00:02', 'ABC',    'ÀBC',    'ABC',    'ABC',    'ABC',    2),
+('2026-01-01 00:00:03', 'abc ',   'abc ',   'abc ',   'abc ',   'abc ',   3),
+('2026-01-01 00:00:04', 'abc  ',  'abç',    'abc  ',  'abc  ',  'abc  ',  4),
+('2026-01-01 00:00:05', '',       '',       '',       '',       '',       5),
+('2026-01-01 00:00:06', ' ',      ' ',      ' ',      ' ',      ' ',      6),
+('2026-01-01 00:00:07', '😀',     '😀',     '😀',     '😀',     '?',      7),
+('2026-01-01 00:00:08', '🚀',     '🚀',     '🚀',     '🚀',     NULL,     8),
+('2026-01-01 00:00:09', 'ñandú',  'NANDU',  'ñandú',  'ñandú',  'n',      9),
+('2026-01-01 00:00:10', 'Straße', 'STRASSE','Straße', 'Straße', 's',      10),
+('2026-01-01 00:00:11', 'a\tb',   NULL,     NULL,     NULL,     NULL,     11),
+('2026-01-01 00:00:12', '日本語', '日本語', '日本語', '日本語', 'x',      12);
+INSERT INTO ctl VALUES ('2026-01-01 00:00:01', 'abc',    'abc',    'abc',    'abc',    'abc',    1),
+('2026-01-01 00:00:02', 'ABC',    'ÀBC',    'ABC',    'ABC',    'ABC',    2),
+('2026-01-01 00:00:03', 'abc ',   'abc ',   'abc ',   'abc ',   'abc ',   3),
+('2026-01-01 00:00:04', 'abc  ',  'abç',    'abc  ',  'abc  ',  'abc  ',  4),
+('2026-01-01 00:00:05', '',       '',       '',       '',       '',       5),
+('2026-01-01 00:00:06', ' ',      ' ',      ' ',      ' ',      ' ',      6),
+('2026-01-01 00:00:07', '😀',     '😀',     '😀',     '😀',     '?',      7),
+('2026-01-01 00:00:08', '🚀',     '🚀',     '🚀',     '🚀',     NULL,     8),
+('2026-01-01 00:00:09', 'ñandú',  'NANDU',  'ñandú',  'ñandú',  'n',      9),
+('2026-01-01 00:00:10', 'Straße', 'STRASSE','Straße', 'Straße', 's',      10),
+('2026-01-01 00:00:11', 'a\tb',   NULL,     NULL,     NULL,     NULL,     11),
+('2026-01-01 00:00:12', '日本語', '日本語', '日本語', '日本語', 'x',      12);
+# Second copy of the data in a sealed chunk
+FLUSH TABLES tf;
+INSERT INTO tf SELECT ts + INTERVAL 1 DAY, ci, uni, bin, np, ch, n + 100 FROM ctl;
+INSERT INTO ctl SELECT ts + INTERVAL 1 DAY, ci, uni, bin, np, ch, n + 100 FROM ctl;
+# Number of distinct series seen through each collation
+SELECT COUNT(*) FROM tf;
+COUNT(*)
+24
+SELECT COUNT(DISTINCT ci), COUNT(DISTINCT uni), COUNT(DISTINCT bin), COUNT(DISTINCT np), COUNT(DISTINCT ch) FROM tf;
+COUNT(DISTINCT ci)	COUNT(DISTINCT uni)	COUNT(DISTINCT bin)	COUNT(DISTINCT np)	COUNT(DISTINCT ch)
+7	6	8	11	6
+SELECT COUNT(DISTINCT ci), COUNT(DISTINCT uni), COUNT(DISTINCT bin), COUNT(DISTINCT np), COUNT(DISTINCT ch) FROM ctl;
+COUNT(DISTINCT ci)	COUNT(DISTINCT uni)	COUNT(DISTINCT bin)	COUNT(DISTINCT np)	COUNT(DISTINCT ch)
+7	6	8	11	6
+# Each CALL runs one predicate on tf and on ctl: status, predicate, tf count/sum(n), ctl count/sum(n)
+CREATE PROCEDURE cmp(p TEXT CHARACTER SET utf8mb4)
+BEGIN
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @a FROM tf WHERE ', p);
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @b FROM ctl WHERE ', p);
+SELECT IF(@a = @b, 'OK', 'FAIL') AS status, p AS predicate, @a AS tideflow, @b AS control;
+END//
+CALL cmp("ci = 'abc'");
+status	predicate	tideflow	control
+OK	ci = 'abc'	8/420	8/420
+CALL cmp("ci = 'ABC'");
+status	predicate	tideflow	control
+OK	ci = 'ABC'	8/420	8/420
+CALL cmp("ci = 'abc  '");
+status	predicate	tideflow	control
+OK	ci = 'abc  '	8/420	8/420
+CALL cmp("ci = ''");
+status	predicate	tideflow	control
+OK	ci = ''	4/222	4/222
+CALL cmp("ci = ' '");
+status	predicate	tideflow	control
+OK	ci = ' '	4/222	4/222
+CALL cmp("ci = '😀'");
+status	predicate	tideflow	control
+OK	ci = '😀'	4/230	4/230
+CALL cmp("ci = '🚀'");
+status	predicate	tideflow	control
+OK	ci = '🚀'	4/230	4/230
+CALL cmp("ci = 'nandu'");
+status	predicate	tideflow	control
+OK	ci = 'nandu'	2/118	2/118
+CALL cmp("ci = 'ñandú'");
+status	predicate	tideflow	control
+OK	ci = 'ñandú'	2/118	2/118
+CALL cmp("ci = 'strasse'");
+status	predicate	tideflow	control
+OK	ci = 'strasse'	0/0	0/0
+CALL cmp("ci = 'Straße'");
+status	predicate	tideflow	control
+OK	ci = 'Straße'	2/120	2/120
+CALL cmp("ci IN ('abc', '😀')");
+status	predicate	tideflow	control
+OK	ci IN ('abc', '😀')	12/650	12/650
+CALL cmp("ci IN ('', ' ')");
+status	predicate	tideflow	control
+OK	ci IN ('', ' ')	4/222	4/222
+CALL cmp("ci = 'abc' COLLATE utf8mb4_bin");
+status	predicate	tideflow	control
+OK	ci = 'abc' COLLATE utf8mb4_bin	6/316	6/316
+CALL cmp("ci = 'abc ' COLLATE utf8mb4_bin");
+status	predicate	tideflow	control
+OK	ci = 'abc ' COLLATE utf8mb4_bin	6/316	6/316
+CALL cmp("ci = 'abc' COLLATE utf8mb4_nopad_bin");
+status	predicate	tideflow	control
+OK	ci = 'abc' COLLATE utf8mb4_nopad_bin	2/102	2/102
+CALL cmp("ci = 'ABC' COLLATE utf8mb4_general_nopad_ci");
+status	predicate	tideflow	control
+OK	ci = 'ABC' COLLATE utf8mb4_general_nopad_ci	4/206	4/206
+CALL cmp("ci = 'abc ' COLLATE utf8mb4_general_nopad_ci");
+status	predicate	tideflow	control
+OK	ci = 'abc ' COLLATE utf8mb4_general_nopad_ci	2/106	2/106
+CALL cmp("uni = 'abc'");
+status	predicate	tideflow	control
+OK	uni = 'abc'	8/420	8/420
+CALL cmp("uni = 'ABC'");
+status	predicate	tideflow	control
+OK	uni = 'ABC'	8/420	8/420
+CALL cmp("uni = 'abç'");
+status	predicate	tideflow	control
+OK	uni = 'abç'	8/420	8/420
+CALL cmp("uni = 'abc '");
+status	predicate	tideflow	control
+OK	uni = 'abc '	8/420	8/420
+CALL cmp("uni = 'nandu'");
+status	predicate	tideflow	control
+OK	uni = 'nandu'	2/118	2/118
+CALL cmp("uni = 'strasse'");
+status	predicate	tideflow	control
+OK	uni = 'strasse'	2/120	2/120
+CALL cmp("uni = '😀'");
+status	predicate	tideflow	control
+OK	uni = '😀'	4/230	4/230
+CALL cmp("uni = '🚀'");
+status	predicate	tideflow	control
+OK	uni = '🚀'	4/230	4/230
+CALL cmp("uni = '😀' COLLATE utf8mb4_bin");
+status	predicate	tideflow	control
+OK	uni = '😀' COLLATE utf8mb4_bin	2/114	2/114
+CALL cmp("uni IN ('abc', 'ñandú')");
+status	predicate	tideflow	control
+OK	uni IN ('abc', 'ñandú')	10/538	10/538
+CALL cmp("uni = ''");
+status	predicate	tideflow	control
+OK	uni = ''	4/222	4/222
+CALL cmp("uni IS NULL");
+status	predicate	tideflow	control
+OK	uni IS NULL	2/122	2/122
+CALL cmp("uni = NULL");
+status	predicate	tideflow	control
+OK	uni = NULL	0/0	0/0
+CALL cmp("bin = 'abc'");
+status	predicate	tideflow	control
+OK	bin = 'abc'	6/316	6/316
+CALL cmp("bin = 'ABC'");
+status	predicate	tideflow	control
+OK	bin = 'ABC'	2/104	2/104
+CALL cmp("bin = 'abc  '");
+status	predicate	tideflow	control
+OK	bin = 'abc  '	6/316	6/316
+CALL cmp("bin = ''");
+status	predicate	tideflow	control
+OK	bin = ''	4/222	4/222
+CALL cmp("bin = '😀'");
+status	predicate	tideflow	control
+OK	bin = '😀'	2/114	2/114
+CALL cmp("bin IN ('abc', 'ABC', 'abc  ')");
+status	predicate	tideflow	control
+OK	bin IN ('abc', 'ABC', 'abc  ')	8/420	8/420
+CALL cmp("bin = 'ABC' COLLATE utf8mb4_general_ci");
+status	predicate	tideflow	control
+OK	bin = 'ABC' COLLATE utf8mb4_general_ci	8/420	8/420
+CALL cmp("bin = 'abc' COLLATE utf8mb4_unicode_ci");
+status	predicate	tideflow	control
+OK	bin = 'abc' COLLATE utf8mb4_unicode_ci	8/420	8/420
+CALL cmp("np = 'abc'");
+status	predicate	tideflow	control
+OK	np = 'abc'	2/102	2/102
+CALL cmp("np = 'abc '");
+status	predicate	tideflow	control
+OK	np = 'abc '	2/106	2/106
+CALL cmp("np = 'abc  '");
+status	predicate	tideflow	control
+OK	np = 'abc  '	2/108	2/108
+CALL cmp("np = 'abc   '");
+status	predicate	tideflow	control
+OK	np = 'abc   '	0/0	0/0
+CALL cmp("np = ''");
+status	predicate	tideflow	control
+OK	np = ''	2/110	2/110
+CALL cmp("np = ' '");
+status	predicate	tideflow	control
+OK	np = ' '	2/112	2/112
+CALL cmp("np IN ('abc', 'abc ')");
+status	predicate	tideflow	control
+OK	np IN ('abc', 'abc ')	4/208	4/208
+CALL cmp("np = 'abc' COLLATE utf8mb4_general_ci");
+status	predicate	tideflow	control
+OK	np = 'abc' COLLATE utf8mb4_general_ci	8/420	8/420
+CALL cmp("ch = 'abc'");
+status	predicate	tideflow	control
+OK	ch = 'abc'	8/420	8/420
+CALL cmp("ch = 'abc   '");
+status	predicate	tideflow	control
+OK	ch = 'abc   '	8/420	8/420
+CALL cmp("ch = 'ABC'");
+status	predicate	tideflow	control
+OK	ch = 'ABC'	8/420	8/420
+CALL cmp("ch = ''");
+status	predicate	tideflow	control
+OK	ch = ''	4/222	4/222
+CALL cmp("ch = ' '");
+status	predicate	tideflow	control
+OK	ch = ' '	4/222	4/222
+CALL cmp("ch = '?'");
+status	predicate	tideflow	control
+OK	ch = '?'	2/114	2/114
+CALL cmp("ch = 'n'");
+status	predicate	tideflow	control
+OK	ch = 'n'	2/118	2/118
+CALL cmp("ch IS NULL");
+status	predicate	tideflow	control
+OK	ch IS NULL	4/238	4/238
+CALL cmp("ch IN ('s', 'x', 'zzz')");
+status	predicate	tideflow	control
+OK	ch IN ('s', 'x', 'zzz')	4/244	4/244
+CALL cmp("ch = _latin1'abc' COLLATE latin1_bin");
+status	predicate	tideflow	control
+OK	ch = _latin1'abc' COLLATE latin1_bin	6/316	6/316
+CALL cmp("ci = 'abc' AND uni = 'abc'");
+status	predicate	tideflow	control
+OK	ci = 'abc' AND uni = 'abc'	8/420	8/420
+CALL cmp("ci = 'abc' AND uni = 'ÀBC'");
+status	predicate	tideflow	control
+OK	ci = 'abc' AND uni = 'ÀBC'	8/420	8/420
+CALL cmp("ci = 'abc' AND bin = 'ABC'");
+status	predicate	tideflow	control
+OK	ci = 'abc' AND bin = 'ABC'	2/104	2/104
+CALL cmp("ci = 'abc' AND np = 'abc '");
+status	predicate	tideflow	control
+OK	ci = 'abc' AND np = 'abc '	2/106	2/106
+CALL cmp("ci IN ('abc', 'xyz') AND ch IN ('abc', 'ABC')");
+status	predicate	tideflow	control
+OK	ci IN ('abc', 'xyz') AND ch IN ('abc', 'ABC')	8/420	8/420
+CALL cmp("ci = 'abc' AND n > 100");
+status	predicate	tideflow	control
+OK	ci = 'abc' AND n > 100	4/410	4/410
+CALL cmp("ci = 'abc' OR n = 5");
+status	predicate	tideflow	control
+OK	ci = 'abc' OR n = 5	9/425	9/425
+CALL cmp("NOT (ci = 'abc')");
+status	predicate	tideflow	control
+OK	NOT (ci = 'abc')	16/936	16/936
+CALL cmp("ci <> 'abc'");
+status	predicate	tideflow	control
+OK	ci <> 'abc'	16/936	16/936
+CALL cmp("ci LIKE 'ab%'");
+status	predicate	tideflow	control
+OK	ci LIKE 'ab%'	8/420	8/420
+CALL cmp("ci = 'a\tb'");
+status	predicate	tideflow	control
+OK	ci = 'a	b'	2/122	2/122
+CALL cmp("ci = CONCAT('ab', 'c')");
+status	predicate	tideflow	control
+OK	ci = CONCAT('ab', 'c')	8/420	8/420
+CALL cmp("ci = LOWER('ABC')");
+status	predicate	tideflow	control
+OK	ci = LOWER('ABC')	8/420	8/420
+CALL cmp("ci = ch");
+status	predicate	tideflow	control
+OK	ci = ch	12/642	12/642
+DROP PROCEDURE cmp;
+# Pushdown must prune series even for exotic collations
+FLUSH STATUS;
+SELECT COUNT(*) FROM tf WHERE ci = '😀';
+COUNT(*)
+4
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	5
+FLUSH STATUS;
+SELECT COUNT(*) FROM tf WHERE bin = 'ñandú';
+COUNT(*)
+2
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	3
+DROP TABLE tf, ctl;

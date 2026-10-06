@@ -1,0 +1,36 @@
+#
+# KNOWN BUG (reported, not fixed): tideflow_compact_impl() and
+# tideflow_retention_impl() check no privilege. The procedures get a SELECT
+# check for free from the query they build, but the UDFs can be called
+# directly, and they act on ANY table that another session holds open in the
+# table cache, whatever the caller's grants on it.
+#
+# The test expects the CORRECT behavior (access denied), so it fails until the
+# bug is fixed.
+#
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE FUNCTION tideflow_compact_impl RETURNS INTEGER SONAME 'ha_tideflow.so';
+CREATE FUNCTION tideflow_retention_impl RETURNS INTEGER SONAME 'ha_tideflow.so';
+CREATE TABLE secret (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=TideFlow RETENTION_PERIOD='30 DAYS';
+INSERT INTO secret VALUES ('2001-01-01', 1), (NOW(), 2);
+FLUSH TABLES secret;
+CREATE USER 'nobody'@'localhost';
+
+--echo # Another session holds the table open
+SELECT COUNT(*) FROM secret;
+
+connect (nobody,localhost,nobody,,);
+--error ER_TABLEACCESS_DENIED_ERROR,ER_SPECIFIC_ACCESS_DENIED_ERROR
+SELECT tideflow_retention_impl('test', 'secret');
+--error ER_TABLEACCESS_DENIED_ERROR,ER_SPECIFIC_ACCESS_DENIED_ERROR
+SELECT tideflow_compact_impl('test', 'secret', '', '');
+disconnect nobody;
+connection default;
+
+--echo # The expired row must still be there: nobody had the right to expire it
+SELECT COUNT(*) FROM secret;
+DROP USER 'nobody'@'localhost';
+DROP TABLE secret;
+DROP FUNCTION tideflow_compact_impl;
+DROP FUNCTION tideflow_retention_impl;

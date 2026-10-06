@@ -1,0 +1,1 @@
+--plugin-load-add=file_key_management --file-key-management-filename=$MYSQL_TEST_DIR/suite/tideflow/std_data/keys.txt

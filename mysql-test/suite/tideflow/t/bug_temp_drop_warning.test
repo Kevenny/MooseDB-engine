@@ -1,0 +1,16 @@
+#
+# KNOWN BUG (reported, engine not fixed): dropping a TEMPORARY TideFlow table
+# that still has rows in its MemTable logs, in the error log,
+#   [Warning] TideFlow: flush on close failed: I/O error: No such file or directory
+# The table directory is deleted before the open handler is closed and the
+# close path tries to flush the MemTable. Base tables do not do this.
+#
+# The test expects the CORRECT behavior (a clean server log), so it fails with
+# "Found warnings/errors in server log file" until the bug is fixed.
+#
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE TEMPORARY TABLE tt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO tt VALUES ('2026-01-01', 1);
+DROP TEMPORARY TABLE tt;
+SELECT 'done' AS status;

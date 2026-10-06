@@ -1,0 +1,137 @@
+#
+# Inclusive/exclusive ranges and ordered scans exactly on chunk boundaries,
+# for every CHUNK_INTERVAL, before and after the epoch, at the lower and upper
+# limits of DATETIME, with microsecond neighbours of every boundary. A MyISAM
+# table with the same rows is the oracle for every probe.
+#
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE TABLE probes (id INT AUTO_INCREMENT PRIMARY KEY, p DATETIME(6) NOT NULL) ENGINE=MyISAM;
+CREATE TABLE results (kind VARCHAR(16), chunk_interval VARCHAR(8), probe DATETIME(6), op VARCHAR(24), tideflow VARCHAR(64), control VARCHAR(64)) ENGINE=MyISAM;
+CREATE TABLE src (ts DATETIME(6) NOT NULL, v INT NOT NULL) ENGINE=MyISAM;
+
+--echo # Rows: every half hour from 1969-12-14 to 1970-01-18 and from 2026-02-25 to 2026-03-04,
+--echo # with the microsecond before and after each of them, plus month edges
+--echo # in several years and the extremes of the DATETIME range
+INSERT INTO src (ts, v)
+  SELECT b + INTERVAL d MICROSECOND, 0
+  FROM (SELECT '1969-12-14 00:00:00' + INTERVAL seq * 30 MINUTE AS b FROM seq_0_to_1679) x,
+       (SELECT -1 AS d UNION ALL SELECT 0 UNION ALL SELECT 1) y;
+INSERT INTO src (ts, v)
+  SELECT b + INTERVAL d MICROSECOND, 0
+  FROM (SELECT '2026-02-25 00:00:00' + INTERVAL seq * 30 MINUTE AS b FROM seq_0_to_335) x,
+       (SELECT -1 AS d UNION ALL SELECT 0 UNION ALL SELECT 1) y;
+INSERT INTO src (ts, v)
+  SELECT m + INTERVAL d MICROSECOND, 0
+  FROM (SELECT DATE_FORMAT('1900-01-01' + INTERVAL seq MONTH, '%Y-%m-01') AS m FROM seq_0_to_2400) x,
+       (SELECT -1 AS d UNION ALL SELECT 0 UNION ALL SELECT 1) y
+  WHERE m BETWEEN '1969-06-01' AND '2030-01-01' AND MONTH(m) IN (1, 2, 3, 12) AND YEAR(m) IN (1969, 1970, 2000, 2024, 2025, 2026, 2027);
+INSERT INTO src (ts, v) VALUES
+  ('1000-01-01 00:00:00.000000', 0), ('1000-01-01 00:00:00.000001', 0), ('1000-01-01 00:59:59.999999', 0),
+  ('1000-01-01 01:00:00.000000', 0), ('1000-01-07 00:00:00.000000', 0), ('1000-01-31 23:59:59.999999', 0),
+  ('1000-02-01 00:00:00.000000', 0), ('1969-12-31 23:59:59.999999', 0), ('1970-01-01 00:00:00.000000', 0),
+  ('9999-12-01 00:00:00.000000', 0), ('9999-11-30 23:59:59.999999', 0), ('9999-12-31 23:00:00.000000', 0),
+  ('9999-12-31 22:59:59.999999', 0), ('9999-12-31 23:59:59.999998', 0), ('9999-12-31 23:59:59.999999', 0);
+--echo # Unique ids (the order of insertion is scrambled on purpose)
+ALTER TABLE src ADD COLUMN id INT NOT NULL AUTO_INCREMENT PRIMARY KEY;
+UPDATE src SET v = (id * 7919) MOD 1000003;
+SELECT COUNT(*), COUNT(DISTINCT ts), MIN(ts), MAX(ts) FROM src;
+
+--echo # Probe values: about 75 existing rows plus hand-picked boundaries
+INSERT INTO probes (p) SELECT ts FROM src WHERE id MOD 83 = 0;
+INSERT INTO probes (p) VALUES ('1000-01-01 00:00:00.000000'), ('9999-12-31 23:59:59.999999'),
+  ('1969-12-31 23:59:59.999999'), ('1970-01-01 00:00:00.000000'), ('2026-03-01 00:00:00.000000'),
+  ('1000-01-01 00:00:00.000001'), ('9999-12-31 23:59:59.999998'), ('1970-01-01 00:00:00.000001'),
+  ('2026-02-28 23:59:59.999999'), ('1970-01-01 01:00:00.000000'), ('1970-01-08 00:00:00.000000'),
+  ('1969-12-25 00:00:00.000000'), ('1970-01-02 00:00:00.000000'), ('1970-01-02 00:00:00.000001');
+SELECT COUNT(*) AS probes FROM probes;
+
+DELIMITER //;
+CREATE PROCEDURE compare(kind VARCHAR(16), chunk_interval VARCHAR(8))
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE pr DATETIME(6);
+  DECLARE nx DATETIME(6);
+  DECLARE a, b VARCHAR(64);
+  DECLARE cur CURSOR FOR SELECT p, IFNULL(LEAD(p) OVER (ORDER BY id), p) FROM probes ORDER BY id;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+  OPEN cur;
+  loop1: LOOP
+    FETCH cur INTO pr, nx;
+    IF done THEN LEAVE loop1; END IF;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO a FROM tf WHERE ts = pr;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO b FROM ctl WHERE ts = pr;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '=', a, b); END IF;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO a FROM tf WHERE ts < pr;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO b FROM ctl WHERE ts < pr;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '<', a, b); END IF;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO a FROM tf WHERE ts <= pr;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO b FROM ctl WHERE ts <= pr;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '<=', a, b); END IF;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO a FROM tf WHERE ts > pr;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO b FROM ctl WHERE ts > pr;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '>', a, b); END IF;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO a FROM tf WHERE ts >= pr;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO b FROM ctl WHERE ts >= pr;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '>=', a, b); END IF;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO a FROM tf WHERE ts BETWEEN LEAST(pr, nx) AND GREATEST(pr, nx);
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO b FROM ctl WHERE ts BETWEEN LEAST(pr, nx) AND GREATEST(pr, nx);
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, 'between next', a, b); END IF;
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO a FROM tf WHERE ts > LEAST(pr, nx) AND ts < GREATEST(pr, nx);
+    SELECT CONCAT(COUNT(*), '/', IFNULL(SUM(v), 0)) INTO b FROM ctl WHERE ts > LEAST(pr, nx) AND ts < GREATEST(pr, nx);
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, 'open interval', a, b); END IF;
+    SELECT IFNULL((SELECT ts FROM tf WHERE ts <= pr ORDER BY ts DESC LIMIT 1), 'none') INTO a;
+    SELECT IFNULL((SELECT ts FROM ctl WHERE ts <= pr ORDER BY ts DESC LIMIT 1), 'none') INTO b;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '<= desc limit 1', a, b); END IF;
+    SELECT IFNULL((SELECT ts FROM tf WHERE ts < pr ORDER BY ts DESC LIMIT 1), 'none') INTO a;
+    SELECT IFNULL((SELECT ts FROM ctl WHERE ts < pr ORDER BY ts DESC LIMIT 1), 'none') INTO b;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '< desc limit 1', a, b); END IF;
+    SELECT IFNULL((SELECT ts FROM tf WHERE ts >= pr ORDER BY ts LIMIT 1), 'none') INTO a;
+    SELECT IFNULL((SELECT ts FROM ctl WHERE ts >= pr ORDER BY ts LIMIT 1), 'none') INTO b;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '>= asc limit 1', a, b); END IF;
+    SELECT IFNULL((SELECT ts FROM tf WHERE ts > pr ORDER BY ts LIMIT 1), 'none') INTO a;
+    SELECT IFNULL((SELECT ts FROM ctl WHERE ts > pr ORDER BY ts LIMIT 1), 'none') INTO b;
+    IF a <> b THEN INSERT INTO results VALUES (kind, chunk_interval, pr, '> asc limit 1', a, b); END IF;
+  END LOOP;
+  CLOSE cur;
+END//
+DELIMITER ;//
+
+CREATE TABLE ctl (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MyISAM;
+INSERT INTO ctl SELECT ts, v FROM src;
+
+let $i= 0;
+while ($i < 6)
+{
+  let $ci= `SELECT ELT($i + 1, '1 HOUR', '6 HOUR', '12 HOUR', '1 DAY', '1 WEEK', '1 MONTH')`;
+  --echo # ---- CHUNK_INTERVAL = $ci ----
+  eval CREATE TABLE tf (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=TideFlow CHUNK_INTERVAL='$ci';
+  --echo # first half sealed in chunks, second half in the MemTable
+  INSERT INTO tf SELECT ts, v FROM src WHERE id MOD 2 = 0;
+  FLUSH TABLES tf;
+  INSERT INTO tf SELECT ts, v FROM src WHERE id MOD 2 = 1;
+  --disable_query_log
+  eval CALL compare('memtable+chunks', '$ci');
+  --enable_query_log
+  FLUSH TABLES tf;
+  --disable_query_log
+  eval CALL compare('chunks', '$ci');
+  --enable_query_log
+  OPTIMIZE TABLE tf;
+  --disable_query_log
+  eval CALL compare('compacted', '$ci');
+  --enable_query_log
+  SELECT COUNT(*) = (SELECT COUNT(*) FROM src) AS all_rows, COUNT(DISTINCT ts) = (SELECT COUNT(DISTINCT ts) FROM src) AS all_ts FROM tf;
+  SELECT COUNT(*) > 1 AS several_chunks FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'tf';
+  SELECT COUNT(*) AS full_scan_matches FROM tf WHERE v >= 0;
+  DROP TABLE tf;
+  inc $i;
+}
+
+--echo # Mismatches between TideFlow and the control table (expected: none)
+SELECT kind, chunk_interval, probe, op, tideflow, control FROM results ORDER BY chunk_interval, kind, probe, op LIMIT 40;
+SELECT COUNT(*) AS mismatches FROM results;
+
+DROP PROCEDURE compare;
+DROP TABLE probes, results, src, ctl;

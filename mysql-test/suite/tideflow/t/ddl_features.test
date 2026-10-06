@@ -1,0 +1,187 @@
+#
+# CREATE TABLE edge cases: which generic server features the engine accepts
+# or refuses (generated columns, CHECK, foreign keys, FULLTEXT, extra
+# indexes, system versioning, defaults, invisible columns, column limits),
+# TAGs on non-string types, and tables whose only column is the time axis.
+#
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+--echo # ---- Which column is the time axis ----
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE a1 (t1 DATETIME NOT NULL, t2 DATETIME NOT NULL, v INT, INDEX(t1), INDEX(t2)) ENGINE=TideFlow;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE a2 (t1 DATETIME NOT NULL, t2 DATETIME NOT NULL, v INT, INDEX(t1)) ENGINE=TideFlow TIMESTAMP_COLUMN='t2';
+CREATE TABLE a3 (t1 DATETIME NOT NULL, t2 DATETIME NOT NULL, v INT, INDEX(t1)) ENGINE=TideFlow TIMESTAMP_COLUMN='t1';
+INSERT INTO a3 VALUES ('2026-01-01', '2020-01-01', 1), ('2026-01-01', '2030-06-01', 2);
+FLUSH TABLES a3;
+SELECT * FROM a3 ORDER BY v;
+SELECT MIN(t2), MAX(t2) FROM a3;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE a4 (ts DATETIME NOT NULL COMMENT 'TAG', INDEX(ts)) ENGINE=TideFlow;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE a5 (ts DATE NOT NULL, INDEX(ts)) ENGINE=TideFlow;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE a6 (ts BIGINT NOT NULL, INDEX(ts)) ENGINE=TideFlow;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE a7 (a INT) ENGINE=TideFlow;
+SET default_storage_engine = TideFlow;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE a8 (a INT);
+SET default_storage_engine = DEFAULT;
+DROP TABLE a3;
+
+--echo # ---- Generic features the engine does not support ----
+--error ER_UNSUPPORTED_ENGINE_FOR_GENERATED_COLUMNS
+CREATE TABLE g1 (ts DATETIME NOT NULL, v INT, g INT AS (v * 2) VIRTUAL, INDEX(ts)) ENGINE=TideFlow;
+--error ER_UNSUPPORTED_ENGINE_FOR_GENERATED_COLUMNS
+CREATE TABLE g2 (ts DATETIME NOT NULL, v INT, g INT AS (v + 1) PERSISTENT, INDEX(ts)) ENGINE=TideFlow;
+--error ER_UNSUPPORTED_ENGINE_FOR_GENERATED_COLUMNS
+CREATE TABLE g3 (ts DATETIME NOT NULL, v INT, g INT AS (v * 2) VIRTUAL COMMENT 'TAG', INDEX(ts)) ENGINE=TideFlow;
+--error ER_NULL_COLUMN_IN_INDEX
+CREATE TABLE g4 (ts DATETIME NOT NULL, v INT, g INT AS (v * 2) VIRTUAL, INDEX(ts), INDEX(g)) ENGINE=TideFlow;
+--error ER_TABLE_CANT_HANDLE_FT
+CREATE TABLE ft (ts DATETIME NOT NULL, t TEXT, INDEX(ts), FULLTEXT(t)) ENGINE=TideFlow;
+--error ER_NULL_COLUMN_IN_INDEX
+CREATE TABLE fk (ts DATETIME NOT NULL, v INT, INDEX(ts), FOREIGN KEY (v) REFERENCES a3 (t1)) ENGINE=TideFlow;
+--error ER_WRONG_SUB_KEY
+CREATE TABLE pf (ts DATETIME NOT NULL, v INT, INDEX(ts(1))) ENGINE=TideFlow;
+--error ER_TOO_MANY_KEY_PARTS
+CREATE TABLE sp (ts DATETIME NOT NULL, v INT NOT NULL, INDEX a(ts), INDEX c(ts, v)) ENGINE=TideFlow;
+--error ER_TABLE_MUST_HAVE_COLUMNS
+CREATE TABLE sq SEQUENCE=1 ENGINE=TideFlow;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE SEQUENCE s1 ENGINE=TideFlow;
+
+--echo # ---- CHECK constraints are enforced by the server ----
+CREATE TABLE c1 (ts DATETIME NOT NULL, v INT CHECK (v > 0), INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO c1 VALUES ('2026-01-01', 5);
+--error ER_CONSTRAINT_FAILED
+INSERT INTO c1 VALUES ('2026-01-02', -5);
+SELECT * FROM c1;
+DROP TABLE c1;
+
+--echo # ---- Column attributes ----
+CREATE TABLE ic (ts DATETIME NOT NULL, v INT INVISIBLE, w INT, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO ic (ts, v, w) VALUES ('2026-01-01', 1, 2);
+FLUSH TABLES ic;
+SELECT * FROM ic;
+SELECT ts, v, w FROM ic;
+CREATE TABLE ds (ts DATETIME NOT NULL DEFAULT '2020-01-01', v INT DEFAULT 7, s VARCHAR(5) NOT NULL DEFAULT 'dflt', INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO ds () VALUES ();
+INSERT INTO ds (v) VALUES (1);
+INSERT INTO ds (s) VALUES (DEFAULT);
+FLUSH TABLES ds;
+SELECT * FROM ds ORDER BY v;
+CREATE TABLE ts2 (ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, v INT, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO ts2 (v) VALUES (1);
+SELECT COUNT(*) FROM ts2 WHERE ts > NOW() - INTERVAL 1 MINUTE;
+DROP TABLE ic, ds, ts2;
+
+--echo # ---- System versioning: accepted, but only as plain history-less inserts ----
+CREATE TABLE v1 (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=TideFlow WITH SYSTEM VERSIONING;
+INSERT INTO v1 VALUES ('2026-01-01', 1), ('2026-01-02', 2);
+FLUSH TABLES v1;
+SELECT ts, v, row_start > '2000-01-01' AS started FROM v1 FOR SYSTEM_TIME ALL;
+--error ER_ILLEGAL_HA
+UPDATE v1 SET v = 5;
+--error ER_ILLEGAL_HA
+DELETE FROM v1 WHERE v = 1;
+--error ER_VERS_NOT_SUPPORTED
+TRUNCATE v1;
+SELECT COUNT(*) FROM v1;
+DROP TABLE v1;
+
+--echo # ---- A TAG can have any type; pushdown only applies to string constants ----
+CREATE TABLE tg (ts DATETIME NOT NULL, a INT NOT NULL COMMENT 'TAG', b DOUBLE COMMENT 'TAG', c DECIMAL(10,2) COMMENT 'TAG',
+  d TEXT COMMENT 'TAG', e BLOB COMMENT 'TAG', f DATE COMMENT 'TAG', h ENUM('x','y') COMMENT 'TAG', j JSON COMMENT 'TAG', INDEX(ts))
+  ENGINE=TideFlow;
+CREATE TABLE tg_ctl (ts DATETIME NOT NULL, a INT NOT NULL, b DOUBLE, c DECIMAL(10,2), d TEXT, e BLOB, f DATE, h ENUM('x','y'), j JSON, INDEX(ts))
+  ENGINE=MyISAM;
+INSERT INTO tg VALUES ('2026-01-01', 1, 1.5, 2.25, 'text', 'blob', '2026-01-01', 'y', '{"a":1}'),
+                      ('2026-01-02', 1, NULL, NULL, NULL, NULL, NULL, 'x', NULL),
+                      ('2026-01-03', 2, 1.5, 2.25, 'text', 'blob2', '2026-01-02', 'x', '{"a":2}'),
+                      ('2026-01-04', 2, 1.5, 2.20, 'TEXT ', 'blob', '2026-01-01', 'y', '[]');
+INSERT INTO tg_ctl SELECT * FROM tg;
+FLUSH TABLES tg;
+INSERT INTO tg VALUES ('2026-01-05', 1, 1.5, 2.25, 'text', 'blob', '2026-01-01', 'y', '{"a":1}');
+INSERT INTO tg_ctl VALUES ('2026-01-05', 1, 1.5, 2.25, 'text', 'blob', '2026-01-01', 'y', '{"a":1}');
+DELIMITER //;
+CREATE PROCEDURE cmp(p TEXT)
+BEGIN
+  EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(a), 0)) INTO @a FROM tg WHERE ', p);
+  EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(a), 0)) INTO @b FROM tg_ctl WHERE ', p);
+  SELECT IF(@a = @b, 'OK', 'FAIL') AS status, p AS predicate, @a AS tideflow, @b AS control;
+END//
+DELIMITER ;//
+CALL cmp("a = 1");
+CALL cmp("a = '1'");
+CALL cmp("a IN (1, 2)");
+CALL cmp("a = 1.0");
+CALL cmp("b = 1.5");
+CALL cmp("b = '1.5'");
+CALL cmp("b IS NULL");
+CALL cmp("c = 2.25");
+CALL cmp("c = 2.2");
+CALL cmp("c = '2.20'");
+CALL cmp("d = 'text'");
+CALL cmp("d = 'TEXT'");
+CALL cmp("d = 'text '");
+CALL cmp("d IN ('text', 'nope')");
+CALL cmp("d IS NULL");
+CALL cmp("e = 'blob'");
+CALL cmp("e = 'BLOB'");
+CALL cmp("e = X'626C6F62'");
+CALL cmp("f = '2026-01-01'");
+CALL cmp("f = 20260101");
+CALL cmp("f = '2026-01-01 10:00:00'");
+CALL cmp("h = 'x'");
+CALL cmp("h = 'X'");
+CALL cmp("h = 2");
+CALL cmp("h = 'z'");
+CALL cmp("h IN ('x', 'y') AND a = 2");
+CALL cmp("j = '{\"a\":1}'");
+CALL cmp("j = JSON_OBJECT('a', 1)");
+CALL cmp("a = 1 AND d = 'text' AND h = 'y'");
+CALL cmp("a = 1 AND d = 'text' AND h = 'x'");
+CALL cmp("a = 2 OR h = 'y'");
+DROP PROCEDURE cmp;
+DROP TABLE tg, tg_ctl;
+
+--echo # ---- Tables whose only column is the time axis ----
+CREATE TABLE only1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO only1 VALUES ('2026-01-01'), ('2026-01-01'), ('2026-01-02');
+SELECT * FROM only1;
+FLUSH TABLES only1;
+INSERT INTO only1 VALUES ('2026-01-01');
+SELECT ts, COUNT(*) FROM only1 GROUP BY ts ORDER BY ts;
+SELECT COUNT(*) FROM only1 WHERE ts = '2026-01-01';
+SELECT ts FROM only1 ORDER BY ts DESC LIMIT 2;
+DROP TABLE only1;
+
+--echo # ---- Many columns: 1000 fit, 4000+ are refused by the server ----
+--disable_query_log
+let $cols= `SELECT GROUP_CONCAT(CONCAT('c', seq, ' INT') SEPARATOR ',') FROM seq_1_to_1000`;
+eval CREATE TABLE wide (ts DATETIME NOT NULL, $cols, INDEX(ts)) ENGINE=TideFlow;
+let $vals= `SELECT GROUP_CONCAT(seq) FROM seq_1_to_1000`;
+eval INSERT INTO wide VALUES ('2026-01-01', $vals);
+eval INSERT INTO wide VALUES ('2026-01-02', $vals);
+--enable_query_log
+FLUSH TABLES wide;
+SELECT COUNT(*), SUM(c1), SUM(c500), SUM(c1000) FROM wide;
+SELECT c1, c500, c1000 FROM wide ORDER BY ts DESC LIMIT 1;
+CHECK TABLE wide;
+DROP TABLE wide;
+--disable_query_log
+let $cols= `SELECT GROUP_CONCAT(CONCAT('c', seq, ' INT') SEPARATOR ',') FROM seq_1_to_5000`;
+--error ER_TOO_MANY_FIELDS
+eval CREATE TABLE wide2 (ts DATETIME NOT NULL, $cols, INDEX(ts)) ENGINE=TideFlow;
+--enable_query_log
+
+--echo # ---- Long values: a 4 MB cell and a 16 MB row ----
+CREATE TABLE big (ts DATETIME NOT NULL, a LONGBLOB, b LONGTEXT CHARACTER SET latin1, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO big VALUES ('2026-01-01', REPEAT('a', 4194304), 'x');
+INSERT INTO big VALUES ('2026-01-02', REPEAT('b', 8388608), REPEAT('c', 8388608));
+FLUSH TABLES big;
+SELECT ts, LENGTH(a), LENGTH(b), MD5(a) = MD5(REPEAT(SUBSTR(a, 1, 1), LENGTH(a))) AS intact FROM big ORDER BY ts;
+DROP TABLE big;

@@ -1,0 +1,156 @@
+#
+# Edge cases of the type mapping: numeric limits, negative zero, DECIMAL,
+# empty/long VARCHAR, utf8mb4 values, extreme dates and microseconds. Every
+# SELECT runs against the MemTable and again against a sealed chunk.
+#
+--source suite/tideflow/include/have_tideflow.inc
+SET NAMES utf8mb4;
+
+--echo # Integer limits of every width
+CREATE TABLE ints (
+    ts   DATETIME NOT NULL,
+    k    INT NOT NULL,
+    t1   TINYINT, t1u TINYINT UNSIGNED,
+    s2   SMALLINT, s2u SMALLINT UNSIGNED,
+    m3   MEDIUMINT, m3u MEDIUMINT UNSIGNED,
+    i4   INT, i4u INT UNSIGNED,
+    b8   BIGINT, b8u BIGINT UNSIGNED,
+    bt   BIT(64),
+    INDEX(ts)
+) ENGINE=TideFlow;
+INSERT INTO ints VALUES
+  ('2026-01-01', 1, -128, 255, -32768, 65535, -8388608, 16777215,
+   -2147483648, 4294967295, -9223372036854775808, 18446744073709551615, b'1111111111111111111111111111111111111111111111111111111111111111'),
+  ('2026-01-01', 2, 127, 0, 32767, 0, 8388607, 0, 2147483647, 0,
+   9223372036854775807, 0, b'0'),
+  ('2026-01-01', 3, 0, 1, 0, 1, 0, 1, 0, 1, 0, 9223372036854775808, b'1');
+let $q= SELECT k, t1, t1u, s2, s2u, m3, m3u, i4, i4u, b8, b8u, BIN(bt) FROM ints ORDER BY k;
+eval $q;
+FLUSH TABLES ints;
+eval $q;
+SELECT SUM(b8u), MAX(b8u), MIN(b8) FROM ints;
+DROP TABLE ints;
+
+--echo # FLOAT/DOUBLE extremes, negative zero, tiny and huge magnitudes
+CREATE TABLE fl (ts DATETIME NOT NULL, k INT NOT NULL, f FLOAT, d DOUBLE, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO fl VALUES
+  ('2026-01-01', 1, 3.402823e38, 1.7976931348623157e308),
+  ('2026-01-01', 2, -3.402823e38, -1.7976931348623157e308),
+  ('2026-01-01', 3, 1.17549435e-38, 2.2250738585072014e-308),
+  ('2026-01-01', 4, 0e0, 0e0),
+  ('2026-01-01', 5, 1e-45, 4.9e-324),
+  ('2026-01-01', 6, 1e30, 1e308),
+  ('2026-01-01', 7, NULL, NULL);
+let $q= SELECT k, f, d, d = 0 AS is_zero FROM fl ORDER BY k;
+eval $q;
+FLUSH TABLES fl;
+eval $q;
+--echo # Sign of negative zero is preserved bit for bit
+--echo # A computed negative zero must keep its sign, like in a MyISAM control table
+CREATE TABLE fl_ctl (k INT, f FLOAT, d DOUBLE) ENGINE=MyISAM;
+INSERT INTO fl VALUES ('2026-01-01', 9, 0e0 * -1, 0e0 * -1), ('2026-01-01', 10, 0e0, 0e0);
+INSERT INTO fl_ctl VALUES (9, 0e0 * -1, 0e0 * -1), (10, 0e0, 0e0);
+FLUSH TABLES fl;
+--echo # ATAN2(0, -0) = pi, ATAN2(0, +0) = 0
+SELECT fl.k, ATAN2(0e0, fl.d) = ATAN2(0e0, fl_ctl.d) AS same_d, ATAN2(0e0, fl.f) = ATAN2(0e0, fl_ctl.f) AS same_f
+  FROM fl JOIN fl_ctl ON fl.k = fl_ctl.k ORDER BY fl.k;
+SELECT k, ATAN2(0e0, d) FROM fl WHERE k IN (9, 10) ORDER BY k;
+DROP TABLE fl_ctl;
+SELECT MAX(d), MIN(d), COUNT(d) FROM fl;
+--echo # Overflow is rejected by the server before reaching the engine
+--error ER_WARN_DATA_OUT_OF_RANGE
+INSERT INTO fl VALUES ('2026-01-01', 8, 1e39, 1);
+DROP TABLE fl;
+
+--echo # DECIMAL: exact digits, signs, scale and precision limits
+CREATE TABLE dc (ts DATETIME NOT NULL, k INT NOT NULL,
+                 d1 DECIMAL(65,30), d2 DECIMAL(10,0), d3 DECIMAL(18,4) UNSIGNED, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO dc VALUES
+  ('2026-01-01', 1, 12345678901234567890123456789012345.123456789012345678901234567890, 9999999999, 99999999999999.9999),
+  ('2026-01-01', 2, -12345678901234567890123456789012345.123456789012345678901234567890, -9999999999, 0),
+  ('2026-01-01', 3, 0.000000000000000000000000000001, 0, 0.0001),
+  ('2026-01-01', 4, -0.000000000000000000000000000001, -0, 1),
+  ('2026-01-01', 5, NULL, NULL, NULL);
+let $q= SELECT k, d1, d2, d3 FROM dc ORDER BY k;
+eval $q;
+FLUSH TABLES dc;
+eval $q;
+SELECT k FROM dc WHERE d1 = 0.000000000000000000000000000001;
+SELECT SUM(d3) FROM dc;
+DROP TABLE dc;
+
+--echo # VARCHAR/TEXT/BLOB: empty, NULL, max length, binary content
+CREATE TABLE sv (ts DATETIME NOT NULL, k INT NOT NULL,
+                 v VARCHAR(255) CHARACTER SET latin1, lv VARCHAR(16000) CHARACTER SET latin1,
+                 lt LONGTEXT CHARACTER SET latin1, bl MEDIUMBLOB, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO sv VALUES
+  ('2026-01-01', 1, '', '', '', ''),
+  ('2026-01-01', 2, NULL, NULL, NULL, NULL),
+  ('2026-01-01', 3, REPEAT('a', 255), REPEAT('b', 16000), REPEAT('c', 1000000), REPEAT(X'00FF', 100000)),
+  ('2026-01-01', 4, ' ', ' ', ' ', X'20'),
+  ('2026-01-01', 5, 'trailing  ', 'trailing  ', 'trailing  ', X'0A0D00'),
+  ('2026-01-01', 6, CHAR(0 USING latin1), '', '', X'00');
+let $q= SELECT k, LENGTH(v), v IS NULL, LENGTH(lv), LENGTH(lt), LENGTH(bl), MD5(CONCAT(IFNULL(lv,''), IFNULL(lt,''), IFNULL(HEX(bl),''))) FROM sv ORDER BY k;
+eval $q;
+FLUSH TABLES sv;
+eval $q;
+SELECT k, HEX(v) FROM sv WHERE k IN (4, 5, 6) ORDER BY k;
+DROP TABLE sv;
+
+--echo # utf8mb4 payload: 4-byte characters in ordinary columns
+CREATE TABLE u8 (ts DATETIME NOT NULL, k INT NOT NULL, v VARCHAR(64) CHARACTER SET utf8mb4, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO u8 VALUES ('2026-01-01', 1, 'ok 😀 🚀 日本語 ñ'), ('2026-01-01', 2, REPEAT('😀', 64));
+let $q= SELECT k, v, CHAR_LENGTH(v), LENGTH(v), HEX(LEFT(v, 1)) FROM u8 ORDER BY k;
+eval $q;
+FLUSH TABLES u8;
+eval $q;
+DROP TABLE u8;
+
+--echo # Other column kinds kept as text: DATE/TIME/ENUM/SET/JSON limits
+CREATE TABLE ot (ts DATETIME NOT NULL, k INT NOT NULL,
+                 dt DATE, tm TIME(6), e ENUM('a','b','c') NOT NULL, s SET('x','y','z'),
+                 js JSON, yr YEAR, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO ot VALUES
+  ('2026-01-01', 1, '1000-01-01', '-838:59:59.000000', 'c', 'x,z', '{"k": "😀", "n": [1, 2.5, null]}', 1901),
+  ('2026-01-01', 2, '9999-12-31', '838:59:59.999999', 'a', '', '"s"', 2155),
+  ('2026-01-01', 3, NULL, NULL, 'b', NULL, NULL, 0);
+let $q= SELECT k, dt, tm, e, e+0, s, s+0, js, yr FROM ot ORDER BY k;
+eval $q;
+FLUSH TABLES ot;
+eval $q;
+DROP TABLE ot;
+
+--echo # Extreme time-axis values and microsecond precision (DATETIME)
+CREATE TABLE tx (ts DATETIME(6) NOT NULL, k INT NOT NULL, INDEX(ts)) ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+INSERT INTO tx VALUES
+  ('1000-01-01 00:00:00.000000', 1),
+  ('1000-01-01 00:00:00.000001', 2),
+  ('1969-12-31 23:59:59.999999', 3),
+  ('1970-01-01 00:00:00.000000', 4),
+  ('1970-01-01 00:00:00.000001', 5),
+  ('2038-01-19 03:14:07.999999', 6),
+  ('2038-01-19 03:14:08.000000', 7),
+  ('2106-02-07 06:28:16.000000', 8),
+  ('9999-12-31 23:59:59.999998', 9),
+  ('9999-12-31 23:59:59.999999', 10);
+SHOW WARNINGS;
+let $q= SELECT k, ts FROM tx ORDER BY ts, k;
+eval $q;
+FLUSH TABLES tx;
+eval $q;
+SELECT k FROM tx WHERE ts = '9999-12-31 23:59:59.999999';
+SELECT k FROM tx WHERE ts = '1000-01-01 00:00:00.000001';
+SELECT k FROM tx WHERE ts > '9999-12-31 23:59:59.999998';
+SELECT k FROM tx WHERE ts < '1000-01-01 00:00:00.000001';
+SELECT k FROM tx WHERE ts BETWEEN '1969-12-31 23:59:59.999999' AND '1970-01-01 00:00:00.000001' ORDER BY ts;
+SELECT k FROM tx ORDER BY ts DESC LIMIT 3;
+SELECT MIN(ts), MAX(ts), COUNT(*) FROM tx;
+DROP TABLE tx;
+
+--echo # Fractional-second precision is whatever the column declares
+CREATE TABLE tp (ts DATETIME(3) NOT NULL, k INT NOT NULL, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO tp VALUES ('2026-01-01 00:00:00.1234', 1), ('2026-01-01 00:00:00.9996', 2), ('2026-01-01 00:00:00.0005', 3);
+SELECT k, ts FROM tp ORDER BY ts, k;
+FLUSH TABLES tp;
+SELECT k, ts FROM tp ORDER BY ts, k;
+DROP TABLE tp;

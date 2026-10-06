@@ -24,7 +24,8 @@ pub(crate) fn encode(bits: impl IntoIterator<Item = bool>, out: &mut Vec<u8>) {
 }
 
 pub(crate) fn decode(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<bool>> {
-    let mut out = Vec::with_capacity(count);
+    // `count` comes from the file: start small and let the runs grow the vector.
+    let mut out = Vec::with_capacity(count.min(r.remaining().saturating_mul(64)));
     let mut current = false;
     while out.len() < count {
         let run = usize::try_from(r.varint()?).map_err(|_| corrupt("RLE run too long"))?;
@@ -57,6 +58,18 @@ mod tests {
         rt(&[false, false, true, true, true, false]);
         assert_eq!(rt(&vec![false; 100_000]), 3);
         assert_eq!(rt(&[true; 10]), 2);
+    }
+
+    #[test]
+    fn forged_runs_and_counts_are_rejected() {
+        // A single run of 128M against a small expected count.
+        let mut buf = Vec::new();
+        put_varint(&mut buf, 0);
+        put_varint(&mut buf, 128 << 20);
+        assert!(decode(&mut ByteReader::new(&buf), 1000).is_err());
+        // An absurd expected count with a tiny stream must fail, not allocate.
+        assert!(decode(&mut ByteReader::new(&buf[..1]), usize::MAX).is_err());
+        assert!(decode(&mut ByteReader::new(&[]), usize::MAX).is_err());
     }
 
     #[test]

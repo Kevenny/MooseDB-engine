@@ -1,0 +1,49 @@
+#
+# KNOWN BUG (reported, not fixed): changing the NUMBER of partitions of a
+# HASH/KEY partitioned TideFlow table corrupts the data silently, because
+# ha_partition moves rows by copy + delete_row() and the engine's delete_row()
+# only returns HA_ERR_WRONG_COMMAND:
+#   ALTER TABLE ... ADD PARTITION      30 rows become 37 (moved rows are duplicated)
+#   ALTER TABLE ... COALESCE PARTITION 30 rows become 20 (rows of the dropped partition are lost)
+# REBUILD PARTITION also logs "TideFlow: flush on close failed".
+#
+# The engine should either refuse PARTITION BY (HTON_NO_PARTITION) or keep the
+# rows. The test expects the rows to be preserved (or the ALTER to fail),
+# so it fails until the bug is fixed.
+#
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+--source include/have_partition.inc
+
+CREATE TABLE ctl (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MyISAM PARTITION BY HASH(v) PARTITIONS 3;
+CREATE TABLE pt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=TideFlow PARTITION BY HASH(v) PARTITIONS 3;
+INSERT INTO pt SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_0_to_29;
+INSERT INTO ctl SELECT * FROM pt;
+SELECT COUNT(*) FROM pt;
+
+--disable_abort_on_error
+--disable_result_log
+ALTER TABLE pt ADD PARTITION (PARTITION p3);
+ALTER TABLE ctl ADD PARTITION (PARTITION p3);
+--enable_result_log
+--enable_abort_on_error
+--echo # rows after ADD PARTITION: must still be 30
+SELECT COUNT(*) FROM pt;
+
+--disable_abort_on_error
+--disable_result_log
+ALTER TABLE pt COALESCE PARTITION 1;
+ALTER TABLE ctl COALESCE PARTITION 1;
+--enable_result_log
+--enable_abort_on_error
+--echo # rows after COALESCE PARTITION: must still be 30
+SELECT COUNT(*) FROM pt;
+SELECT COUNT(*) FROM ctl;
+
+--disable_abort_on_error
+--disable_result_log
+ALTER TABLE pt REBUILD PARTITION p0;
+--enable_result_log
+--enable_abort_on_error
+SELECT COUNT(*) FROM pt;
+DROP TABLE pt, ctl;

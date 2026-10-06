@@ -116,6 +116,13 @@ pub(crate) fn encode(ty: ColumnType, values: &[&Value], codec: Codec) -> Result<
         ColumnType::Tag => return Err(invalid("TAG columns are not stored in data blocks")),
     };
 
+    if payload.len() > compression::MAX_BLOCK_RAW {
+        return Err(invalid(format!(
+            "column block of {} bytes exceeds the {} byte limit",
+            payload.len(),
+            compression::MAX_BLOCK_RAW
+        )));
+    }
     let raw_len = u32::try_from(payload.len()).map_err(|_| invalid("column block exceeds 4GiB"))?;
     let (codec_id, stored) = match codec {
         Codec::None => (CODEC_NONE, payload),
@@ -269,6 +276,32 @@ mod tests {
         let v = rt(ColumnType::Float64, vals, Codec::Zstd(3));
         assert!(t.bytes.len() * 100 < t.plain_len, "timestamps: {} of {}", t.bytes.len(), t.plain_len);
         assert!(v.bytes.len() * 10 < v.plain_len, "values: {} of {}", v.bytes.len(), v.plain_len);
+    }
+
+    /// Builds a block with a valid CRC around arbitrary header fields.
+    fn forge(codec: u8, raw_len: u32, stored: &[u8]) -> Vec<u8> {
+        let mut b = vec![ENC_DELTA, codec, 0, 0];
+        put_u32(&mut b, raw_len);
+        let mut h = crc32fast::Hasher::new();
+        h.update(&b);
+        h.update(stored);
+        put_u32(&mut b, h.finalize());
+        b.extend_from_slice(stored);
+        b
+    }
+
+    #[test]
+    fn forged_raw_len_is_corrupt_not_oom() {
+        let small = [1u8; 32];
+        let lz4 = compression::compress(Codec::Lz4, &small).unwrap();
+        let zstd = compression::compress(Codec::Zstd(3), &small).unwrap();
+        for (codec, stored) in [(compression::CODEC_LZ4, &lz4), (compression::CODEC_ZSTD, &zstd)] {
+            for raw in [0xFFFF_FFF0u32, u32::MAX, 1 << 30] {
+                assert!(matches!(unpack(&forge(codec, raw, stored)), Err(crate::error::Error::Corrupt(_))));
+            }
+        }
+        // A consistent block still unpacks.
+        assert!(unpack(&forge(compression::CODEC_ZSTD, small.len() as u32, &zstd)).is_ok());
     }
 
     #[test]

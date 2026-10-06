@@ -1,0 +1,147 @@
+#
+# TIMESTAMP (a real instant) versus DATETIME (wall clock treated as UTC) as the
+# time axis, under different session time zones, on both sides of a flush.
+# A MyISAM table with the same columns is the oracle.
+#
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+SET @save_tz = @@global.time_zone;
+SET GLOBAL time_zone = '+00:00';
+connect (c1,localhost,root,,test);
+connection c1;
+SELECT @@session.time_zone;
+
+CREATE TABLE tf_ts (ts TIMESTAMP(3) NOT NULL, k INT NOT NULL, INDEX(ts)) ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE ct_ts (ts TIMESTAMP(3) NOT NULL, k INT NOT NULL, INDEX(ts)) ENGINE=MyISAM;
+CREATE TABLE tf_dt (ts DATETIME(3) NOT NULL, k INT NOT NULL, INDEX(ts)) ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE ct_dt (ts DATETIME(3) NOT NULL, k INT NOT NULL, INDEX(ts)) ENGINE=MyISAM;
+
+--echo # Rows written under +00:00: a row every 45 minutes for 3 days
+INSERT INTO tf_ts SELECT '2026-03-10 00:00:00' + INTERVAL seq * 45 MINUTE, seq FROM seq_0_to_95;
+INSERT INTO ct_ts SELECT ts, k FROM tf_ts;
+INSERT INTO tf_dt SELECT '2026-03-10 00:00:00' + INTERVAL seq * 45 MINUTE, seq FROM seq_0_to_95;
+INSERT INTO ct_dt SELECT ts, k FROM tf_dt;
+FLUSH TABLES tf_ts, tf_dt;
+--echo # ... and 96 more under -07:30 (instants differ by 7.5 hours for the same wall clock)
+SET time_zone = '-07:30';
+INSERT INTO tf_ts SELECT '2026-03-10 00:00:00' + INTERVAL seq * 45 MINUTE, 1000 + seq FROM seq_0_to_95;
+INSERT INTO ct_ts SELECT '2026-03-10 00:00:00' + INTERVAL seq * 45 MINUTE, 1000 + seq FROM seq_0_to_95;
+INSERT INTO tf_dt SELECT '2026-03-10 00:00:00' + INTERVAL seq * 45 MINUTE, 1000 + seq FROM seq_0_to_95;
+INSERT INTO ct_dt SELECT '2026-03-10 00:00:00' + INTERVAL seq * 45 MINUTE, 1000 + seq FROM seq_0_to_95;
+
+CREATE TABLE chk (label VARCHAR(40), what VARCHAR(40), same INT, tideflow VARCHAR(200)) ENGINE=MyISAM;
+
+DELIMITER //;
+CREATE PROCEDURE same(label VARCHAR(40))
+BEGIN
+  DECLARE a, b VARCHAR(200);
+  SELECT CONCAT(COUNT(*), '/', SUM(k), '/', MIN(ts), '/', MAX(ts)) INTO a FROM tf_ts;
+  SELECT CONCAT(COUNT(*), '/', SUM(k), '/', MIN(ts), '/', MAX(ts)) INTO b FROM ct_ts;
+  INSERT INTO chk VALUES (label, 'timestamp full scan', a <=> b, a);
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO a FROM tf_ts WHERE ts >= '2026-03-11 12:00:00' AND ts < '2026-03-12 06:30:00';
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO b FROM ct_ts WHERE ts >= '2026-03-11 12:00:00' AND ts < '2026-03-12 06:30:00';
+  INSERT INTO chk VALUES (label, 'timestamp range', a <=> b, a);
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO a FROM tf_ts WHERE ts = '2026-03-11 02:15:00';
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO b FROM ct_ts WHERE ts = '2026-03-11 02:15:00';
+  INSERT INTO chk VALUES (label, 'timestamp equality', a <=> b, a);
+  SELECT GROUP_CONCAT(k ORDER BY ts DESC, k) INTO a FROM (SELECT ts, k FROM tf_ts WHERE ts > '2026-03-10 20:00:00' ORDER BY ts DESC LIMIT 6) x;
+  SELECT GROUP_CONCAT(k ORDER BY ts DESC, k) INTO b FROM (SELECT ts, k FROM ct_ts WHERE ts > '2026-03-10 20:00:00' ORDER BY ts DESC LIMIT 6) x;
+  INSERT INTO chk VALUES (label, 'timestamp desc limit', a <=> b, a);
+  SELECT CONCAT(COUNT(*), '/', SUM(k), '/', MIN(ts), '/', MAX(ts)) INTO a FROM tf_dt;
+  SELECT CONCAT(COUNT(*), '/', SUM(k), '/', MIN(ts), '/', MAX(ts)) INTO b FROM ct_dt;
+  INSERT INTO chk VALUES (label, 'datetime full scan', a <=> b, a);
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO a FROM tf_dt WHERE ts >= '2026-03-11 12:00:00' AND ts < '2026-03-12 06:30:00';
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO b FROM ct_dt WHERE ts >= '2026-03-11 12:00:00' AND ts < '2026-03-12 06:30:00';
+  INSERT INTO chk VALUES (label, 'datetime range', a <=> b, a);
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO a FROM tf_ts WHERE ts BETWEEN CONVERT_TZ('2026-03-11 12:00:00', '+00:00', @@session.time_zone) AND CONVERT_TZ('2026-03-11 18:00:00', '+00:00', @@session.time_zone);
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO b FROM ct_ts WHERE ts BETWEEN CONVERT_TZ('2026-03-11 12:00:00', '+00:00', @@session.time_zone) AND CONVERT_TZ('2026-03-11 18:00:00', '+00:00', @@session.time_zone);
+  INSERT INTO chk VALUES (label, 'timestamp range via CONVERT_TZ', a <=> b, a);
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO a FROM tf_ts WHERE UNIX_TIMESTAMP(ts) BETWEEN 1773230400 AND 1773252000;
+  SELECT CONCAT(COUNT(*), '/', SUM(k)) INTO b FROM ct_ts WHERE UNIX_TIMESTAMP(ts) BETWEEN 1773230400 AND 1773252000;
+  INSERT INTO chk VALUES (label, 'timestamp range via UNIX_TIMESTAMP', a <=> b, a);
+END//
+DELIMITER ;//
+
+--echo # ---- Same session zone as the writer of the second batch (-07:30) ----
+CALL same('-07:30, memtable+chunks');
+FLUSH TABLES;
+CALL same('-07:30, chunks');
+--echo # ---- Reading under other zones: TIMESTAMP values shift, DATETIME values do not ----
+SET time_zone = '+00:00';
+CALL same('+00:00');
+SET time_zone = '+13:00';
+CALL same('+13:00');
+SET time_zone = '-12:00';
+CALL same('-12:00');
+SET time_zone = '+05:45';
+CALL same('+05:45');
+SET time_zone = SYSTEM;
+CALL same('SYSTEM');
+
+--echo # A TIMESTAMP is displayed in the session zone, a DATETIME is not
+SET time_zone = '+00:00';
+SELECT ts, k FROM tf_ts WHERE k IN (0, 1000) ORDER BY k;
+SELECT ts, k FROM tf_dt WHERE k IN (0, 1000) ORDER BY k;
+SET time_zone = '+09:00';
+SELECT ts, k FROM tf_ts WHERE k IN (0, 1000) ORDER BY k;
+SELECT ts, k FROM tf_dt WHERE k IN (0, 1000) ORDER BY k;
+SELECT UNIX_TIMESTAMP(ts) FROM tf_ts WHERE k IN (0, 1000) ORDER BY k;
+SELECT UNIX_TIMESTAMP(ts) FROM ct_ts WHERE k IN (0, 1000) ORDER BY k;
+
+--echo # Chunk boundaries of a TIMESTAMP axis are UTC hours, whatever the writer's zone
+SET time_zone = '+05:45';
+CREATE TABLE tb (ts TIMESTAMP NOT NULL, k INT, INDEX(ts)) ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+INSERT INTO tb VALUES ('2026-03-10 05:44:59', 1), ('2026-03-10 05:45:00', 2), ('2026-03-10 06:44:59', 3), ('2026-03-10 06:45:00', 4);
+FLUSH TABLES tb;
+SELECT COUNT(*) AS chunks, SUM(`ROWS`) FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'tb';
+SELECT `ROWS`, TS_MIN, TS_MAX FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'tb' ORDER BY TS_MIN;
+DROP TABLE tb;
+
+--echo # Changing the zone between two statements in the same session
+SET time_zone = '+00:00';
+SELECT COUNT(*) FROM tf_ts WHERE ts < '2026-03-10 12:00:00';
+SET time_zone = '+12:00';
+SELECT COUNT(*) FROM tf_ts WHERE ts < '2026-03-10 12:00:00';
+SELECT COUNT(*) FROM ct_ts WHERE ts < '2026-03-10 12:00:00';
+SET time_zone = '-12:00';
+SELECT COUNT(*) FROM tf_ts WHERE ts < '2026-03-10 12:00:00';
+SELECT COUNT(*) FROM ct_ts WHERE ts < '2026-03-10 12:00:00';
+
+--echo # ---- TIMESTAMP limits (same behavior as the control table) ----
+SET time_zone = '+00:00';
+INSERT INTO tf_ts VALUES ('1970-01-01 00:00:01.000', -1);
+INSERT INTO ct_ts VALUES ('1970-01-01 00:00:01.000', -1);
+INSERT INTO tf_ts VALUES ('2038-01-19 03:14:07.999', -2);
+INSERT INTO ct_ts VALUES ('2038-01-19 03:14:07.999', -2);
+--error ER_TRUNCATED_WRONG_VALUE
+INSERT INTO tf_ts VALUES ('1970-01-01 00:00:00.000', -3);
+--error ER_TRUNCATED_WRONG_VALUE
+INSERT INTO ct_ts VALUES ('1970-01-01 00:00:00.000', -3);
+--error ER_TRUNCATED_WRONG_VALUE
+INSERT INTO tf_ts VALUES ('2106-02-07 06:28:16.000', -4);
+--error ER_TRUNCATED_WRONG_VALUE
+INSERT INTO ct_ts VALUES ('2106-02-07 06:28:16.000', -4);
+SET time_zone = '+13:00';
+--error ER_TRUNCATED_WRONG_VALUE
+INSERT INTO tf_ts VALUES ('1970-01-01 10:00:00.000', -5);
+--error ER_TRUNCATED_WRONG_VALUE
+INSERT INTO ct_ts VALUES ('1970-01-01 10:00:00.000', -5);
+SET time_zone = '+00:00';
+SELECT ts, k FROM tf_ts WHERE k < 0 ORDER BY ts;
+SELECT ts, k FROM ct_ts WHERE k < 0 ORDER BY ts;
+FLUSH TABLES tf_ts;
+SELECT ts, k FROM tf_ts WHERE k < 0 ORDER BY ts;
+SELECT MIN(ts), MAX(ts), COUNT(*) FROM tf_ts;
+
+--echo # ---- Summary of all comparisons ----
+SELECT label, COUNT(*) AS checks, SUM(same) AS same FROM chk GROUP BY label ORDER BY MIN(FIELD(label, '-07:30, memtable+chunks', '-07:30, chunks', '+00:00', '+13:00', '-12:00', '+05:45', 'SYSTEM'));
+SELECT label, what, tideflow FROM chk WHERE same <> 1;
+SELECT what, tideflow FROM chk WHERE label = '+00:00' ORDER BY what;
+SELECT what, tideflow FROM chk WHERE label = '+13:00' ORDER BY what;
+DROP PROCEDURE same;
+DROP TABLE chk;
+DROP TABLE tf_ts, ct_ts, tf_dt, ct_dt;
+disconnect c1;
+connection default;
+SET GLOBAL time_zone = @save_tz;
