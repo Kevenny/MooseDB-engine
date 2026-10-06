@@ -112,8 +112,12 @@ impl ChunkInterval {
     pub fn bucket(self, ts: i64) -> (i64, i64) {
         match self {
             ChunkInterval::Fixed { width, align } => {
-                let start = (ts - align).div_euclid(width) * width + align;
-                (start, start.saturating_add(width))
+                // i128: `ts - align` overflows i64 for ts near i64::MIN. A start
+                // below i64::MIN saturates, so the bucket still contains `ts`.
+                let (w, a) = (i128::from(width), i128::from(align));
+                let start = (i128::from(ts) - a).div_euclid(w) * w + a;
+                let clamp = |v: i128| i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX });
+                (clamp(start), clamp(start + w))
             }
             ChunkInterval::Month => {
                 let ord = month_ordinal(ts);
@@ -166,8 +170,12 @@ impl Compression {
 }
 
 pub const DEFAULT_MEMTABLE_SIZE: u64 = 64 << 20;
-/// Small enough for tests to force flushes, large enough to avoid pathological chunk counts.
-pub const MIN_MEMTABLE_SIZE: u64 = 4 << 10;
+/// Smallest MEMTABLE_SIZE. Every flush writes at least one chunk file and a
+/// WAL segment, so a tiny MemTable turns a trickle of inserts into a flood of
+/// files. Enforced at CREATE; tables created with less (older versions) are
+/// clamped up when opened. Tests that need to force flushes lower
+/// `TableOptions::memtable_size_bytes` directly on the validated config.
+pub const MIN_MEMTABLE_SIZE: u64 = 1 << 20;
 /// Upper bound of MEMTABLE_SIZE. A flush encodes each column of a series into
 /// one block of at most `compression::MAX_BLOCK_RAW` (256 MiB); a MemTable
 /// holds at most twice this size (while flushes fail) and a block takes at
@@ -229,13 +237,13 @@ impl TableOptions {
         };
         let memtable_size_bytes = match raw.memtable_size_bytes {
             0 => DEFAULT_MEMTABLE_SIZE,
-            s if s < MIN_MEMTABLE_SIZE => {
-                return Err(invalid(format!("MEMTABLE_SIZE must be at least {MIN_MEMTABLE_SIZE} bytes")))
+            s if s < MIN_MEMTABLE_SIZE && strict => {
+                return Err(invalid(format!("MEMTABLE_SIZE must be at least {MIN_MEMTABLE_SIZE} bytes (1 MiB)")))
             }
             s if s > MAX_MEMTABLE_SIZE && strict => {
                 return Err(invalid(format!("MEMTABLE_SIZE must be at most {MAX_MEMTABLE_SIZE} bytes")))
             }
-            s => s.min(MAX_MEMTABLE_SIZE),
+            s => s.clamp(MIN_MEMTABLE_SIZE, MAX_MEMTABLE_SIZE),
         };
         let ci = raw.chunk_interval.unwrap_or(ChunkInterval::DEFAULT);
         let rp = raw.retention_period.unwrap_or("FOREVER");
@@ -382,6 +390,14 @@ mod tests {
             month.bucket(t),
             (days_from_civil(2026, 10, 1) * MICROS_PER_DAY, days_from_civil(2026, 11, 1) * MICROS_PER_DAY)
         );
+        // Extreme timestamps neither overflow nor leave their bucket.
+        for iv in ["1 HOUR", "1 DAY", "1 WEEK", "1 MONTH"] {
+            let iv = ChunkInterval::parse(iv).unwrap();
+            for ts in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+                let (lo, hi) = iv.bucket(ts);
+                assert!(lo <= ts && ts <= hi && lo < hi, "{iv:?} {ts}: {lo}..{hi}");
+            }
+        }
         // Negative timestamps bucket downward, not toward zero.
         assert_eq!(day.bucket(-1).0, -MICROS_PER_DAY);
     }
@@ -438,6 +454,20 @@ mod tests {
         assert!(TableConfig::new("/tmp/x", schema.clone(), &huge).is_err());
         let ok = RawOptions { memtable_size_bytes: MAX_MEMTABLE_SIZE, ..Default::default() };
         assert!(TableConfig::new("/tmp/x", schema.clone(), &ok).is_ok());
+        // MEMTABLE_SIZE below 1 MiB: refused at CREATE, clamped for existing tables.
+        let tiny = RawOptions { memtable_size_bytes: 4096, ..Default::default() };
+        assert!(TableConfig::new("/tmp/x", schema.clone(), &tiny).is_err());
+        let c = TableConfig::for_existing("/tmp/x", schema.clone(), &tiny).unwrap();
+        assert_eq!(c.opts.memtable_size_bytes, MIN_MEMTABLE_SIZE);
+        assert_eq!(
+            TableOptions::from_text(
+                "memtable_size=4096
+"
+            )
+            .unwrap()
+            .memtable_size_bytes,
+            MIN_MEMTABLE_SIZE
+        );
         // An existing table with an older, larger setting still opens, clamped.
         let c =
             TableConfig::for_existing("/tmp/x", schema, &RawOptions { memtable_size_bytes: 1 << 40, ..huge }).unwrap();

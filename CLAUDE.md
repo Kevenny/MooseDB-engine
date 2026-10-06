@@ -31,7 +31,8 @@ mysqld ──► ha_moosedb.so (C++20, Handler API)
 
 - `docker build` / `cmake --build` (configuração do servidor MariaDB é verbosa)
 - `cargo test --workspace` / `cargo clippy --all-targets`
-- a suíte MTR (`run-mtr.sh`, 14 testes, diffs `.reject` podem ser longos)
+- a suíte MTR (`run-mtr.sh`, todos os `mysql-test/suite/moosedb/t/*.test`;
+  diffs `.reject` podem ser longos)
 - benchmarks (encode/decode, compressão, scan)
 - testes de crash-recovery (`kill -9` + replay de WAL)
 
@@ -82,6 +83,14 @@ editar é direto, sem delegação.
 
 Qualquer diff que viole essas regras deve ser bloqueado — ver skill
 `moosedb-safety-review` / agent `storage-code-reviewer`.
+
+**Enforcement automático**: o hook versionado `.githooks/pre-commit` bloqueia
+`unsafe` fora do FFI, perda de `forbid(unsafe_code)`, `panic = "abort"`,
+plugin fora de `MODULE_ONLY` e `new`/`delete` crus no handler; com Docker,
+roda também clippy e `cbindgen --verify`. Ative uma vez por clone:
+`git config core.hooksPath .githooks`. O CMake falha se não houver
+`cbindgen` (header não verificável). O hook não substitui a revisão — ele
+não cobre durabilidade, concorrência, bounds-check nem nullptr.
 
 ### Protocolo de durabilidade (não violar silenciosamente)
 

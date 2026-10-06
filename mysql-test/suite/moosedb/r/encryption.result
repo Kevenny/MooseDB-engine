@@ -46,7 +46,27 @@ COUNT(*)
 plaintext found in 0 file(s)
 # Keys must exist and be 256 bits
 CREATE TABLE bad (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=99;
-ERROR HY000: MooseDB: invalid argument: encryption key 99 is not available: not found: encryption key 99 (version latest) is not available
+ERROR HY000: MooseDB: invalid argument: encryption key 99 is not available: encryption: encryption key 99 (version latest) is not available
 CREATE TABLE bad (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=3;
 ERROR HY000: MooseDB: invalid argument: encryption key 3 is not available: invalid argument: encryption key 3 is not a 256-bit key
+# A wrong key is a decryption failure (HA_ERR_DECRYPTION_FAILED), not corruption
+call mtr.add_suppression("MooseDB");
+INSERT INTO s VALUES ('2026-01-02', 'SECRET-HOST-NAME', 'CONFIDENTIAL-after');
+# restart: --file-key-management-filename=MYSQL_TEST_DIR/suite/moosedb/std_data/keys_wrong.txt
+SELECT COUNT(*) FROM s;
+ERROR HY000: Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series count mismatch (corrupt file or wrong encryption key)' from MooseDB
+SHOW WARNINGS;
+Level	Code	Message
+Error	1296	Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series count mismatch (corrupt file or wrong encryption key)' from MooseDB
+INSERT INTO s VALUES ('2026-01-03', 'SECRET-HOST-NAME', 'CONFIDENTIAL-wrong-key');
+ERROR HY000: Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series count mismatch (corrupt file or wrong encryption key)' from MooseDB
+# The files were not touched: with the right key again, all data is back
+# restart
+SELECT COUNT(*), MAX(note) FROM s;
+COUNT(*)	MAX(note)
+501	CONFIDENTIAL-after
+CHECK TABLE s;
+Table	Op	Msg_type	Msg_text
+test.s	check	status	OK
+plaintext found in 0 file(s)
 DROP TABLE s;

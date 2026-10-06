@@ -1,0 +1,110 @@
+#
+# No message visible to a client may contain a host path (datadir, table
+# directory, chunk file path): CHECK TABLE, OPTIMIZE, the UDFs behind the
+# procedures, INFORMATION_SCHEMA warnings, CREATE/RENAME and handler errors
+# all go through the same scrubbing. Core messages name a chunk as
+# db.table/chunk_....tfl (never a host path). The results hold no
+# replace_regex on purpose: if a path leaked, the .result would contain the
+# datadir of the test run.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+call mtr.add_suppression("MooseDB");
+call mtr.add_suppression("marked as crashed");
+call mtr.add_suppression("Checking table");
+call mtr.add_suppression("Got error");
+
+let MYSQLD_DATADIR= `SELECT @@datadir`;
+--exec $MYSQL test < $MOOSEDB_INSTALL_SQL
+
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO t VALUES ('2026-01-01 01:00:00', 1);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-01 02:00:00', 2);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-01 03:00:00', 3);
+FLUSH TABLES t;
+
+--echo # Corrupt the oldest chunk (the table is closed, only the newest is verified at open)
+--let CORRUPT_WHICH= 0
+--source suite/moosedb/include/corrupt_chunk.inc
+
+--echo # CHECK TABLE: warning carries the core message
+CHECK TABLE t;
+
+--echo # OPTIMIZE: the core error is raised as a warning
+OPTIMIZE TABLE t;
+
+--echo # Read through the handler: generic error, no path
+--error ER_CRASHED_ON_USAGE
+SELECT SUM(v) FROM t;
+
+--echo # UDF behind CALL moosedb_compact: the error text is scrubbed
+--error ER_UNKNOWN_ERROR
+CALL moosedb_compact('test.t', NULL, NULL);
+
+--echo # INFORMATION_SCHEMA: a table whose MANIFEST is unreadable
+FLUSH TABLES;
+--perl
+use strict;
+my $f = "$ENV{MYSQLD_DATADIR}/test/t/MANIFEST";
+open(my $fh, '>:raw', $f) or die "open $f: $!";
+print $fh "garbage";
+close($fh);
+EOF
+SELECT COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 't';
+SHOW WARNINGS;
+SELECT COUNT(*) FROM information_schema.MOOSEDB_CHUNKS;
+SHOW WARNINGS;
+
+--echo # Opening the table with that MANIFEST fails with a path-free message
+--error ER_CRASHED_ON_USAGE
+SELECT COUNT(*) FROM t;
+SHOW WARNINGS;
+
+DROP TABLE t;
+
+--echo # CREATE / RENAME where a stray directory is in the way
+--perl
+use strict;
+for my $n ("stray", "stray2") {
+  mkdir "$ENV{MYSQLD_DATADIR}/test/$n" or die "mkdir $n: $!";
+  open(my $fh, '>', "$ENV{MYSQLD_DATADIR}/test/$n/MANIFEST") or die; print $fh "x"; close($fh);
+}
+EOF
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE stray (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+SHOW WARNINGS;
+CREATE TABLE src (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+--echo # (the server itself words the RENAME error; the engine message is not shown)
+--error ER_ERROR_ON_RENAME
+RENAME TABLE src TO stray2;
+DROP TABLE src;
+
+--echo # moosedb_apply_retention on a table whose MANIFEST is unreadable
+CREATE TABLE r (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+INSERT INTO r VALUES ('2001-01-01 00:00:00', 1), (NOW(), 2);
+FLUSH TABLES r;
+SELECT COUNT(*) FROM r;
+--perl
+use strict;
+open(my $fh, '>:raw', "$ENV{MYSQLD_DATADIR}/test/r/MANIFEST") or die; print $fh "garbage"; close($fh);
+EOF
+FLUSH TABLES;
+--error ER_CRASHED_ON_USAGE
+CALL moosedb_apply_retention('test.r');
+SHOW WARNINGS;
+DROP TABLE IF EXISTS r;
+--perl
+use strict;
+for my $n ("stray", "stray2") {
+  my $d = "$ENV{MYSQLD_DATADIR}/test/$n";
+  unlink glob("$d/*"); rmdir $d;
+}
+EOF
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;

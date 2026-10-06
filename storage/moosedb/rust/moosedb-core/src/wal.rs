@@ -150,6 +150,8 @@ pub(crate) struct Wal {
     cipher: Option<CipherParams>,
     /// Logical file offset of the next byte to append.
     offset: u64,
+    /// Size of the segment header: `offset == header_len` means no entries.
+    header_len: u64,
     /// Whether bytes were appended since the last `sync`.
     dirty: bool,
     /// Set by the first failed write/flush/fsync. The buffered data may be
@@ -185,6 +187,7 @@ impl Wal {
             out: BufWriter::with_capacity(1 << 20, file),
             cipher,
             offset: header.len() as u64,
+            header_len: header.len() as u64,
             dirty: false,
             failed: false,
         })
@@ -192,6 +195,11 @@ impl Wal {
 
     pub(crate) fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Whether nothing was appended since the segment was created.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.offset == self.header_len
     }
 
     pub(crate) fn append(&mut self, payload: &[u8]) -> Result<()> {
@@ -313,6 +321,11 @@ pub(crate) fn replay(
     let cipher = if flags & FLAG_ENCRYPTED != 0 {
         crate::crypto::ensure_available()?;
         match r.take(PARAMS_LEN) {
+            // A segment with a header and nothing else holds no data, so its
+            // key is irrelevant: do not ask for it. Otherwise a retired key
+            // version would make an idle table (whose only WAL file is the
+            // empty segment its last open created) impossible to open.
+            Ok(_) if r.remaining() == 0 => return Ok(never_used(0)),
             Ok(b) => Some(CipherParams::decode(b)?),
             Err(_) => return Ok(never_used(data.len())),
         }
@@ -373,6 +386,20 @@ pub(crate) struct Replayed {
     /// must use larger ids, or a COMMIT could adopt the dropped rows of an
     /// old uncommitted batch that still sits in a retained segment.
     pub max_batch_id: u64,
+    /// Committed batches (or single rows) that `reject` vetoed: none of their
+    /// rows were handed to `on_row`.
+    pub rejected: Vec<Rejected>,
+}
+
+/// A committed batch held back whole because one of its rows was vetoed.
+pub(crate) struct Rejected {
+    /// `None` for a single-row commit.
+    pub batch: Option<u64>,
+    pub rows: usize,
+    /// Total payload bytes of its rows.
+    pub bytes: usize,
+    /// Segments that hold its rows.
+    pub segments: std::collections::BTreeSet<u64>,
 }
 
 /// Replays `segs` (ascending) and hands every *committed* row to `on_row`
@@ -384,14 +411,20 @@ pub(crate) struct Replayed {
 /// rows can precede the flush point). With `recover`, a torn tail of the last
 /// segment is cut off and never-used segments are deleted; otherwise the
 /// files are left untouched.
+///
+/// `reject` is asked about every row of a batch about to be applied; if it
+/// says yes for any row, the whole batch is withheld (all or nothing) and
+/// reported in `Replayed::rejected`.
 pub(crate) fn replay_committed(
     dir: &Path,
     segs: &[u64],
     flushed_seq: u64,
     recover: bool,
+    reject: &dyn Fn(&[u8]) -> bool,
     mut on_row: impl FnMut(u64, &[u8]) -> Result<()>,
 ) -> Result<Replayed> {
-    let mut pending: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
+    let mut rejected: Vec<Rejected> = Vec::new();
+    let mut pending: HashMap<u64, Vec<(u64, Vec<u8>)>> = HashMap::new();
     let mut max_batch_id = 0u64;
     for (i, &seq) in segs.iter().enumerate() {
         let torn = match (recover, i + 1 == segs.len()) {
@@ -403,7 +436,7 @@ pub(crate) fn replay_committed(
             match parse_entry(version, payload)? {
                 Entry::Row(batch, row) => {
                     max_batch_id = max_batch_id.max(batch);
-                    pending.entry(batch).or_default().push(row.to_vec());
+                    pending.entry(batch).or_default().push((seq, row.to_vec()));
                 }
                 Entry::Commit(batch) => {
                     max_batch_id = max_batch_id.max(batch);
@@ -412,14 +445,32 @@ pub(crate) fn replay_committed(
                         let rows = rows.ok_or_else(|| {
                             corrupt(format!("WAL segment {seq}: COMMIT of batch {batch} without its rows"))
                         })?;
-                        for row in &rows {
-                            on_row(seq, row)?;
+                        if rows.iter().any(|(_, r)| reject(r)) {
+                            rejected.push(Rejected {
+                                batch: Some(batch),
+                                rows: rows.len(),
+                                bytes: rows.iter().map(|(_, r)| r.len()).sum(),
+                                segments: rows.iter().map(|(s, _)| *s).collect(),
+                            });
+                        } else {
+                            for (_, row) in &rows {
+                                on_row(seq, row)?;
+                            }
                         }
                     }
                 }
                 Entry::RowCommit(row) => {
                     if seq > flushed_seq {
-                        on_row(seq, row)?;
+                        if reject(row) {
+                            rejected.push(Rejected {
+                                batch: None,
+                                rows: 1,
+                                bytes: row.len(),
+                                segments: std::iter::once(seq).collect(),
+                            });
+                        } else {
+                            on_row(seq, row)?;
+                        }
                     }
                 }
             }
@@ -442,7 +493,7 @@ pub(crate) fn replay_committed(
     if dropped > 0 && recover {
         warn(&format!("WAL replay: discarded {dropped} batch(es) that never committed"));
     }
-    Ok(Replayed { max_batch_id })
+    Ok(Replayed { max_batch_id, rejected })
 }
 
 #[cfg(test)]
@@ -579,7 +630,7 @@ mod tests {
 
     fn committed(dir: &Path, segs: &[u64], flushed: u64) -> (Vec<(u64, Vec<u8>)>, u64) {
         let mut got = Vec::new();
-        let out = replay_committed(dir, segs, flushed, true, |seq, p| {
+        let out = replay_committed(dir, segs, flushed, true, &|_| false, |seq, p| {
             got.push((seq, p.to_vec()));
             Ok(())
         })
@@ -635,7 +686,7 @@ mod tests {
         w.append(&commit_entry(9)).unwrap();
         w.sync(true).unwrap();
         drop(w);
-        let err = replay_committed(dir.path(), &[1], 0, true, |_, _| Ok(())).err().unwrap();
+        let err = replay_committed(dir.path(), &[1], 0, true, &|_| false, |_, _| Ok(())).err().unwrap();
         assert!(matches!(err, Error::Corrupt(_)));
     }
 

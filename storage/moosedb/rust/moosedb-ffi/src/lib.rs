@@ -51,6 +51,10 @@ pub enum TFStatus {
     TF_ERR_INTERNAL = 8,
     /// The operation or feature is not available.
     TF_ERR_UNSUPPORTED = 9,
+    /// Decryption failed or the encryption key / key version is not available
+    /// (wrong or retired key, damaged ciphertext): distinct from
+    /// `TF_ERR_CORRUPT` because the data may be intact.
+    TF_ERR_CRYPTO = 10,
 }
 
 /// Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -263,7 +267,7 @@ fn status_of(e: &Error) -> TFStatus {
         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => TFStatus::TF_ERR_NOT_FOUND,
         Error::Io(_) => TFStatus::TF_ERR_IO,
         Error::Corrupt(_) => TFStatus::TF_ERR_CORRUPT,
-        Error::Crypto(_) => TFStatus::TF_ERR_CORRUPT,
+        Error::Crypto(_) => TFStatus::TF_ERR_CRYPTO,
         Error::Full(_) => TFStatus::TF_ERR_FULL,
         Error::NotFound(_) => TFStatus::TF_ERR_NOT_FOUND,
         Error::InvalidArg(_) => TFStatus::TF_ERR_INVALID_ARG,
@@ -497,7 +501,7 @@ pub extern "C" fn moosedb_set_key_callback(cb: TFKeyCallback) -> TFStatus {
                     return Err(Error::InvalidArg(format!("encryption key {key_id} is not a 256-bit key")));
                 }
                 if rc != 0 {
-                    return Err(Error::NotFound(format!(
+                    return Err(Error::Crypto(format!(
                         "encryption key {key_id} (version {}) is not available",
                         version.map_or("latest".to_string(), |v| v.to_string())
                     )));
@@ -830,12 +834,17 @@ pub unsafe extern "C" fn moosedb_scan_open_filtered(
     out_scan: *mut *mut MooseDBScan,
 ) -> TFStatus {
     let mut filter = ScanFilter::range(ts_start_us, ts_end_us);
-    if series_count >= 0 {
-        // SAFETY: caller contract.
-        match unsafe { slice(series_ids, series_count as usize, "series_ids") } {
-            Ok(ids) => filter.series = Some(ids.to_vec()),
-            Err(e) => return guard(|| Err(e)),
+    let status = guard(|| {
+        if series_count >= 0 {
+            // SAFETY: caller contract.
+            let ids = unsafe { slice(series_ids, series_count as usize, "series_ids") }?;
+            // Copying can fail (allocation): keep it under the guard.
+            filter.series = Some(ids.to_vec());
         }
+        Ok(())
+    });
+    if status != TFStatus::TF_OK {
+        return status;
     }
     open_scan(table, &filter, sorted, out_scan)
 }
@@ -1265,4 +1274,29 @@ pub unsafe extern "C" fn moosedb_free_str(ptr: *mut c_char) {
             drop(unsafe { CString::from_raw(ptr) });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crypto_errors_have_their_own_status() {
+        assert_eq!(TFStatus::TF_ERR_CRYPTO as i32, 10);
+        assert_eq!(status_of(&Error::Crypto("wrong key".into())), TFStatus::TF_ERR_CRYPTO);
+        assert_eq!(status_of(&Error::Corrupt("x".into())), TFStatus::TF_ERR_CORRUPT);
+        // Existing codes keep their values.
+        assert_eq!(TFStatus::TF_ERR_UNSUPPORTED as i32, 9);
+        assert_eq!(TFStatus::TF_ERR_CORRUPT as i32, 2);
+    }
+
+    #[test]
+    fn scan_open_filtered_reports_bad_pointers_instead_of_crashing() {
+        let mut out: *mut MooseDBScan = ptr::null_mut();
+        // SAFETY: a NULL table and a NULL id list with a positive count are
+        // rejected before anything is dereferenced.
+        let st = unsafe { moosedb_scan_open_filtered(ptr::null_mut(), 0, 1, ptr::null(), 3, false, &mut out) };
+        assert_ne!(st, TFStatus::TF_OK);
+        assert!(out.is_null());
+    }
 }

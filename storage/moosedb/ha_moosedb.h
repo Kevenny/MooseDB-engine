@@ -205,8 +205,8 @@ private:
                       int not_found_error);
   int read_from_scan(uchar *buf, bool backward, int end_error);
   int fill_record(uchar *buf, const TFRow &row);
-  longlong key_to_ts(uint idx, const uchar *key);
-  int map_status(TFStatus status);
+  int key_to_ts(uint idx, const uchar *key, longlong *out);
+  int map_status(TFStatus status, const char *name= nullptr);
   int commit_batch();   /* publish + sync the open statement batch, if any */
 
   void collect_tag_predicates(const Item *cond,

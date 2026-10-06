@@ -13,6 +13,7 @@
 #include "ha_moosedb.h"
 
 #include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -145,6 +146,65 @@ std::string table_label(const TABLE_SHARE *s)
          (s->table_name.str ? s->table_name.str : "?");
 }
 
+/* Characters that can be part of a path component: a match must not start
+   or end inside one (so "test/t" never matches inside "latest/t2"). */
+bool is_path_char(char c)
+{
+  return isalnum((unsigned char) c) || c == '_' || c == '-' || c == '.' ||
+         c == '/' || c == '#' || c == '@';
+}
+
+/* Like replace_all, but only for matches delimited by non-path characters
+   (or a '/' right after, for a directory prefix). */
+void replace_bounded(std::string *s, const std::string &from,
+                     const std::string &to)
+{
+  if (from.empty())
+    return;
+  for (size_t pos= 0; (pos= s->find(from, pos)) != std::string::npos;)
+  {
+    const bool left= pos == 0 || !is_path_char((*s)[pos - 1]);
+    const size_t end= pos + from.size();
+    const bool right= end >= s->size() || (*s)[end] == '/' ||
+                      !is_path_char((*s)[end]);
+    if (left && right)
+    {
+      s->replace(pos, from.size(), to);
+      pos+= to.size();
+    }
+    else
+      pos++;
+  }
+}
+
+/* Spellings of the data directory, computed once. Empty when the datadir is
+   relative or too short to be told apart from ordinary text ("./", "/"). */
+const std::vector<std::string> &datadir_variants()
+{
+  static const std::vector<std::string> v= [] {
+    std::vector<std::string> out;
+    std::string home(mysql_real_data_home);
+    if (home.size() > 1 && home[0] == '/')
+    {
+      out.push_back(home);
+      std::error_code ec;
+      std::filesystem::path abs= std::filesystem::absolute(home, ec);
+      if (!ec)
+        out.push_back(abs.lexically_normal().string());
+      ec.clear();
+      std::filesystem::path canon= std::filesystem::canonical(home, ec);
+      if (!ec)
+        out.push_back((canon / "").string());
+      std::sort(out.begin(), out.end(),
+                [](const std::string &x, const std::string &y)
+                { return x.size() > y.size(); });
+      out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
+    return out;
+  }();
+  return v;
+}
+
 /*
   Removes host paths (the table directory as given by the server, its
   absolute form, and the data directory) from an engine message so that
@@ -155,24 +215,45 @@ std::string scrub_paths(std::string msg, const std::string &name,
 {
   if (!name.empty())
   {
-    replace_all(&msg, name, label);
+    replace_bounded(&msg, name, label);
     std::error_code ec;
     std::filesystem::path abs= std::filesystem::absolute(name, ec);
     if (!ec)
-      replace_all(&msg, abs.lexically_normal().string(), label);
+      replace_bounded(&msg, abs.lexically_normal().string(), label);
+    /* "./db/t" -> "db/t", only as a whole path (bounded) */
     if (name.compare(0, 2, "./") == 0)
-      replace_all(&msg, name.substr(2), label);
+      replace_bounded(&msg, name.substr(2), label);
   }
-  if (mysql_real_data_home[0])
-  {
-    std::string home(mysql_real_data_home);
+  for (const std::string &home : datadir_variants())
     replace_all(&msg, home, "");
-    std::error_code ec;
-    std::filesystem::path abs= std::filesystem::absolute(home, ec);
-    if (!ec)
-      replace_all(&msg, abs.lexically_normal().string(), "");
-  }
   return msg;
+}
+
+/* "db.table" label out of a server table path ("./db/table"), for messages
+   raised where no TABLE_SHARE is at hand (DROP, RENAME). */
+std::string label_from_path(const std::string &name)
+{
+  std::string n= name;
+  while (!n.empty() && n.back() == '/')
+    n.pop_back();
+  const size_t last= n.rfind('/');
+  if (last == std::string::npos)
+    return n.empty() ? "?" : n;
+  const size_t prev= last ? n.rfind('/', last - 1) : std::string::npos;
+  const std::string tbl= n.substr(last + 1);
+  const std::string db= prev == std::string::npos
+                          ? "" : n.substr(prev + 1, last - prev - 1);
+  return db.empty() || db == "." ? tbl : db + "." + tbl;
+}
+
+/*
+  The one place engine messages become client-visible: takes the pending
+  Rust error of this thread and strips every host path from it (the table
+  directory in all its spellings and the data directory).
+*/
+std::string client_error(const std::string &path, const std::string &label)
+{
+  return scrub_paths(take_last_error(), path, label);
 }
 
 /* Engine-private error codes, reported through get_error_message(). */
@@ -227,7 +308,7 @@ static MYSQL_SYSVAR_ULONGLONG(memtable_flush_threshold,
   "MemTable size in bytes that triggers a flush to a chunk, for tables "
   "without an explicit MEMTABLE_SIZE. Applies to tables opened afterwards. "
   "At most 96 MiB, so a flushed column block stays below the 256 MiB limit",
-  NULL, NULL, 64ULL << 20, 4096, 96ULL << 20, 0);
+  NULL, NULL, 64ULL << 20, 1ULL << 20, 96ULL << 20, 0);
 
 static MYSQL_SYSVAR_UINT(compaction_trigger_chunks,
   srv_compaction_trigger_chunks, PLUGIN_VAR_RQCMDARG,
@@ -564,24 +645,40 @@ void tf_batch_closer::operator()(MooseDBBatch *b) const noexcept
 
 ha_moosedb::~ha_moosedb()= default;
 
-int ha_moosedb::map_status(TFStatus status)
+int ha_moosedb::map_status(TFStatus status, const char *name)
 {
   if (status == TF_OK)
     return 0;
-  last_error_= take_last_error();
+  /* Every message that can reach a client goes through here: no host path. */
+  if (share_ && !share_->path.empty())
+    last_error_= client_error(share_->path, share_->display);
+  else if (name && name[0])
+    last_error_= client_error(name, label_from_path(name));
+  else
+    last_error_= client_error("", "");
   switch (status) {
   case TF_ERR_FULL:      return HA_ERR_RECORD_FILE_FULL;
   case TF_ERR_READONLY:  return HA_ERR_TABLE_READONLY;
   case TF_ERR_CORRUPT:   return HA_ERR_CRASHED_ON_USAGE;
   case TF_ERR_OOM:       return HA_ERR_OUT_OF_MEM;
   case TF_ERR_NOT_FOUND: return HA_ERR_NO_SUCH_TABLE;
+  case TF_ERR_CRYPTO:    return HA_ERR_DECRYPTION_FAILED;
   default:               return HA_ERR_MOOSEDB_BASE + (int) status;
   }
 }
 
 bool ha_moosedb::get_error_message(int error, String *buf)
 {
-  if (error >= HA_ERR_MOOSEDB_BASE && !last_error_.empty())
+  if (!buf)
+    return false;
+  if (error == HA_ERR_DECRYPTION_FAILED)
+  {
+    /* last_error_ was scrubbed by map_status(): no host path in it. */
+    const std::string msg= last_error_.empty()
+      ? std::string("wrong or unavailable encryption key") : last_error_;
+    buf->copy(msg.c_str(), msg.length(), system_charset_info);
+  }
+  else if (error >= HA_ERR_MOOSEDB_BASE && !last_error_.empty())
     buf->copy(last_error_.c_str(), last_error_.length(), system_charset_info);
   return false;
 }
@@ -612,7 +709,8 @@ MooseDB_share *ha_moosedb::get_share()
 int ha_moosedb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *)
 {
   DBUG_ENTER("ha_moosedb::create");
-  if (!table_arg || !name)
+  assert(table_arg && name);
+  if (!table_arg || !table_arg->s || !name)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
 
   tf_layout layout;
@@ -627,8 +725,7 @@ int ha_moosedb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *)
   TFStatus st= moosedb_table_create(name, &cfg.cfg);
   if (st != TF_OK)
   {
-    std::string msg= scrub_paths(take_last_error(), name,
-                                 table_label(table_arg->s));
+    std::string msg= client_error(name, table_label(table_arg->s));
     my_printf_error(ER_ILLEGAL_HA_CREATE_OPTION, "MooseDB: %s", MYF(0),
                     msg.c_str());
     DBUG_RETURN(HA_WRONG_CREATE_OPTION);
@@ -665,7 +762,6 @@ int ha_moosedb::open(const char *name, int, uint)
       share_->table.reset(t);
       if (error)
       {
-        last_error_= scrub_paths(last_error_, name, share_->display);
         sql_print_error("MooseDB: cannot open %s: %s",
                         share_->display.c_str(), last_error_.c_str());
       }
@@ -705,7 +801,7 @@ int ha_moosedb::delete_table(const char *name)
     take_last_error();
     DBUG_RETURN(ENOENT);
   }
-  DBUG_RETURN(map_status(st));
+  DBUG_RETURN(map_status(st, name));
 }
 
 int ha_moosedb::rename_table(const char *from, const char *to)
@@ -717,7 +813,7 @@ int ha_moosedb::rename_table(const char *from, const char *to)
     take_last_error();
     DBUG_RETURN(ENOENT);
   }
-  DBUG_RETURN(map_status(st));
+  DBUG_RETURN(map_status(st, from));
 }
 
 /* ── Row conversion ───────────────────────────────────────────────────── */
@@ -725,10 +821,13 @@ int ha_moosedb::rename_table(const char *from, const char *to)
 int ha_moosedb::write_row(const uchar *buf)
 {
   DBUG_ENTER("ha_moosedb::write_row");
-  if (!share_ || !share_->table)
+  assert(table);
+  if (!table || !buf || !share_ || !share_->table)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
 
   const tf_layout &l= share_->layout;
+  if (values_.size() < l.columns.size() || str_bufs_.size() < l.columns.size())
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   const my_ptrdiff_t diff= buf - table->record[0];
   MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
   int error= 0;
@@ -736,6 +835,12 @@ int ha_moosedb::write_row(const uchar *buf)
   for (size_t i= 0; i < l.columns.size() && !error; i++)
   {
     const tf_column &c= l.columns[i];
+    if (c.field_index >= table->s->fields || !table->field[c.field_index] ||
+        i >= values_.size() || i >= str_bufs_.size())
+    {
+      error= HA_ERR_INTERNAL_ERROR;
+      break;
+    }
     Field *f= table->field[c.field_index];
     TFValue &v= values_[i];
     v.kind= (uint8_t) c.type;
@@ -834,6 +939,9 @@ int ha_moosedb::write_row(const uchar *buf)
 
 int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
 {
+  assert(table);
+  if (!table || !share_)
+    return HA_ERR_INTERNAL_ERROR;
   const tf_layout &l= share_->layout;
   if (row.col_count != l.columns.size() || !row.values)
   {
@@ -848,6 +956,11 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
   {
     const tf_column &c= l.columns[i];
     const TFValue &v= row.values[i];
+    if (c.field_index >= table->s->fields || !table->field[c.field_index])
+    {
+      dbug_tmp_restore_column_map(&table->write_set, old_map);
+      return HA_ERR_INTERNAL_ERROR;
+    }
     Field *f= table->field[c.field_index];
     f->move_field_offset(diff);
     if (v.is_null)
@@ -908,8 +1021,6 @@ int ha_moosedb::commit_batch()
     moosedb_batch_commit(b, srv_wal_sync_mode == WAL_SYNC_FSYNC));
   if (error)
   {
-    last_error_= share_ ? scrub_paths(last_error_, share_->path,
-                                      share_->display) : last_error_;
     sql_print_error("MooseDB: statement commit failed: %s",
                     last_error_.c_str());
   }
@@ -1022,8 +1133,7 @@ int ha_moosedb::check(THD *thd, HA_CHECK_OPT *)
     DBUG_RETURN(error);
   if (bad)
   {
-    std::string msg= scrub_paths(take_last_error(), share_->path,
-                                 share_->display);
+    std::string msg= client_error(share_->path, share_->display);
     push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN, ER_NOT_KEYFILE,
                         "MooseDB: %u corrupt chunk(s): %s", bad, msg.c_str());
     sql_print_error("MooseDB: CHECK TABLE %s found %u corrupt chunk(s): %s",
@@ -1040,8 +1150,28 @@ int ha_moosedb::optimize(THD *thd, HA_CHECK_OPT *)
     DBUG_RETURN(HA_ADMIN_INTERNAL_ERROR);
   /* Seal the MemTable, expire old chunks, merge and re-encode the rest. */
   int error= moosedb_force_flush();
+  /*
+    Retention deletes data: moosedb_apply_retention requires DELETE, while
+    OPTIMIZE only needs SELECT+INSERT, so apply it only when the user could
+    have run the procedure. Otherwise just flush and compact.
+  */
+  bool retention_skipped= false;
   if (!error)
-    error= map_status(moosedb_apply_retention(share_->table.get()));
+  {
+    bool may_delete= true;
+    if (thd && table && table->s && table->s->tmp_table == NO_TMP_TABLE)
+    {
+      LEX_CSTRING db_l= table->s->db;
+      LEX_CSTRING tbl_l= table->s->table_name;
+      TABLE_LIST tl;
+      tl.init_one_table(&db_l, &tbl_l, nullptr, TL_READ);
+      may_delete= !check_table_access(thd, DELETE_ACL, &tl, false, 1, true);
+    }
+    if (may_delete)
+      error= map_status(moosedb_apply_retention(share_->table.get()));
+    else
+      retention_skipped= true;
+  }
   if (!error)
     error= moosedb_compact_chunks(LONGLONG_MIN, LONGLONG_MAX);
   if (error)
@@ -1050,6 +1180,10 @@ int ha_moosedb::optimize(THD *thd, HA_CHECK_OPT *)
                         "MooseDB: %s", last_error_.c_str());
     DBUG_RETURN(HA_ADMIN_FAILED);
   }
+  if (retention_skipped)
+    push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
+                        "MooseDB: retention skipped: DELETE privilege "
+                        "required");
   DBUG_RETURN(HA_ADMIN_OK);
 }
 
@@ -1443,10 +1577,15 @@ int ha_moosedb::index_end()
   DBUG_RETURN(0);
 }
 
-longlong ha_moosedb::key_to_ts(uint idx, const uchar *key)
+int ha_moosedb::key_to_ts(uint idx, const uchar *key, longlong *out)
 {
+  assert(table && key);
+  if (!table || !key || !out || !table->key_info || idx >= table->s->keys)
+    return HA_ERR_INTERNAL_ERROR;
   KEY *ki= &table->key_info[idx];
-  Field *f= ki->key_part[0].field;
+  Field *f= ki->key_part ? ki->key_part[0].field : nullptr;
+  if (!f)
+    return HA_ERR_INTERNAL_ERROR;
   /* Decode through the field itself, using record[1] as scratch space. */
   key_restore(table->record[1], key, ki, ki->key_part[0].store_length);
   const my_ptrdiff_t diff= table->record[1] - table->record[0];
@@ -1467,7 +1606,8 @@ longlong ha_moosedb::key_to_ts(uint idx, const uchar *key)
       ts= time_to_micros(lt);
   }
   f->move_field_offset(-diff);
-  return ts;
+  *out= ts;
+  return 0;
 }
 
 int ha_moosedb::open_range_scan(longlong lo, longlong hi, bool backward,
@@ -1491,7 +1631,11 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
                 find_flag == HA_READ_PREFIX_LAST_OR_PREV
                 ? index_last(buf) : index_first(buf));
 
-  const longlong ts= key_to_ts(active_index, key);
+  if (!table || active_index >= table->s->keys)
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  longlong ts;
+  if (int error= key_to_ts(active_index, key, &ts))
+    DBUG_RETURN(error);
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   bool backward= false;
   switch (find_flag) {
@@ -1523,7 +1667,12 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
     inclusively is always a superset, the server re-checks the bound.
   */
   if (!backward && end_range && end_range->key)
-    hi= std::min(hi, key_to_ts(active_index, end_range->key));
+  {
+    longlong end_ts;
+    if (int error= key_to_ts(active_index, end_range->key, &end_ts))
+      DBUG_RETURN(error);
+    hi= std::min(hi, end_ts);
+  }
   DBUG_RETURN(open_range_scan(lo, hi, backward, buf, HA_ERR_KEY_NOT_FOUND));
 }
 
@@ -1588,13 +1737,15 @@ ha_rows ha_moosedb::records_in_range(uint inx, const key_range *min_key,
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   if (min_key)
   {
-    lo= key_to_ts(inx, min_key->key);
+    if (key_to_ts(inx, min_key->key, &lo))
+      DBUG_RETURN(HA_POS_ERROR);
     if (min_key->flag == HA_READ_AFTER_KEY && lo < LONGLONG_MAX)
       lo++;
   }
   if (max_key)
   {
-    hi= key_to_ts(inx, max_key->key);
+    if (key_to_ts(inx, max_key->key, &hi))
+      DBUG_RETURN(HA_POS_ERROR);
     if (max_key->flag == HA_READ_BEFORE_KEY && hi > LONGLONG_MIN)
       hi--;
   }
@@ -1684,7 +1835,8 @@ template <typename F> int fill_moosedb_is(THD *thd, F f)
     {
       push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
                           ER_UNKNOWN_ERROR, "MooseDB: %s.%s: %s", db, tbl,
-                          take_last_error().c_str());
+                          client_error(path, std::string(db) + "." + tbl)
+                            .c_str());
       return false;
     }
     std::unique_ptr<MooseDBInfo, tf_info_closer> info(raw);
@@ -1870,7 +2022,8 @@ bool parse_bound(const char *s, size_t len, longlong dflt, longlong *out)
   tables). The UDFs are callable directly, so they cannot rely on the SELECT
   check the procedures get from the statement they build.
 */
-MooseDBTable *lookup_open_table(UDF_ARGS *args, privilege_t need)
+MooseDBTable *lookup_open_table(UDF_ARGS *args, privilege_t need,
+                               std::string *path_out, std::string *label_out)
 {
   THD *thd= current_thd;
   assert(thd);
@@ -1906,6 +2059,8 @@ MooseDBTable *lookup_open_table(UDF_ARGS *args, privilege_t need)
   }
   char path[FN_REFLEN + 1];
   build_table_filename(path, sizeof(path) - 1, db.c_str(), tbl.c_str(), "", 0);
+  *path_out= path;
+  *label_out= db + "." + tbl;
   MooseDBTable *t= nullptr;
   if (moosedb_table_lookup(path, &t) != TF_OK)
   {
@@ -1948,7 +2103,8 @@ long long moosedb_compact_impl(UDF_INIT *, UDF_ARGS *args, char *,
                                 char *error)
 {
   /* Privilege first (see lookup_open_table), then argument validation. */
-  tf_table_ptr t(lookup_open_table(args, ALTER_ACL));
+  std::string path, label;
+  tf_table_ptr t(lookup_open_table(args, ALTER_ACL, &path, &label));
   if (!t)
   {
     *error= 1;
@@ -1967,7 +2123,7 @@ long long moosedb_compact_impl(UDF_INIT *, UDF_ARGS *args, char *,
   if (moosedb_compact(t.get(), lo, hi) != TF_OK)
   {
     my_printf_error(ER_UNKNOWN_ERROR, "MooseDB: %s", MYF(0),
-                    take_last_error().c_str());
+                    client_error(path, label).c_str());
     *error= 1;
     return 0;
   }
@@ -1984,7 +2140,8 @@ my_bool moosedb_retention_impl_init(UDF_INIT *initid, UDF_ARGS *args,
 long long moosedb_retention_impl(UDF_INIT *, UDF_ARGS *args, char *,
                                   char *error)
 {
-  tf_table_ptr t(lookup_open_table(args, DELETE_ACL));
+  std::string path, label;
+  tf_table_ptr t(lookup_open_table(args, DELETE_ACL, &path, &label));
   if (!t)
   {
     *error= 1;
@@ -1993,7 +2150,7 @@ long long moosedb_retention_impl(UDF_INIT *, UDF_ARGS *args, char *,
   if (moosedb_apply_retention(t.get()) != TF_OK)
   {
     my_printf_error(ER_UNKNOWN_ERROR, "MooseDB: %s", MYF(0),
-                    take_last_error().c_str());
+                    client_error(path, label).c_str());
     *error= 1;
     return 0;
   }

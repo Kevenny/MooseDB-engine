@@ -1,24 +1,28 @@
-CREATE TABLE c (ts DATETIME(6) NOT NULL, w INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=65536;
+CREATE TABLE c (ts DATETIME(6) NOT NULL, w INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=1048576;
 INSERT INTO c SELECT '2026-01-01' + INTERVAL seq SECOND, 0 FROM seq_1_to_200;
 # A slow reader holds the table...
 connect  reader, localhost, root,,;
 SELECT COUNT(*), SLEEP(3) FROM c WHERE w = 0 AND SLEEP(0.01) = 0;
-# ... while two writers insert (and flush, the MemTable is tiny)
+# ... while two writers insert (60000 rows against a 1 MiB MemTable: several flushes)
 connect  w1, localhost, root,,;
-INSERT INTO c SELECT '2026-02-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_3000;
+INSERT INTO c SELECT '2026-02-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_30000;
 connect  w2, localhost, root,,;
-INSERT INTO c SELECT '2026-03-01' + INTERVAL seq SECOND, 2 FROM seq_1_to_3000;
+INSERT INTO c SELECT '2026-03-01' + INTERVAL seq SECOND, 2 FROM seq_1_to_30000;
 connection w1;
 # The reader is still running: the writers were not blocked
 connection default;
+# Proof that flushes ran while the reader held the table (no FLUSH issued)
+SELECT CHUNKS >= 2 AS flushed, PENDING_ROWS < 60200 AS not_all_pending FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'c';
+flushed	not_all_pending
+1	1
 SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE 'SELECT COUNT(*), SLEEP(3)%';
 COUNT(*)
 1
 SELECT w, COUNT(*) FROM c GROUP BY w ORDER BY w;
 w	COUNT(*)
 0	200
-1	3000
-2	3000
+1	30000
+2	30000
 # The reader saw its snapshot
 connection reader;
 COUNT(*)	SLEEP(3)
@@ -27,20 +31,24 @@ disconnect reader;
 disconnect w1;
 disconnect w2;
 connection default;
-# Filesort (rnd_pos) while another session flushes and compacts
+# Filesort (rnd_pos) while another session flushes (and the background compactor may run)
 connect  w3, localhost, root,,;
-INSERT INTO c SELECT '2026-04-01' + INTERVAL seq SECOND, 3 FROM seq_1_to_5000;
+INSERT INTO c SELECT '2026-04-01' + INTERVAL seq SECOND, 3 FROM seq_1_to_50000;
 connection default;
 SELECT w, v FROM (SELECT w, ts AS v FROM c WHERE w IN (1, 2) ORDER BY w DESC, ts DESC LIMIT 2) x ORDER BY w, v DESC;
 w	v
-2	2026-03-01 00:50:00.000000
-2	2026-03-01 00:49:59.000000
+2	2026-03-01 08:20:00.000000
+2	2026-03-01 08:19:59.000000
 connection w3;
 disconnect w3;
 connection default;
 SELECT COUNT(*) FROM c;
 COUNT(*)
-11200
+110200
+# Flushed chunks (possibly merged by the background compactor) are still there
+SELECT CHUNKS >= 2 AS chunked FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'c';
+chunked
+1
 # LOCK TABLES: every single-row INSERT is durable right away
 LOCK TABLES c WRITE;
 INSERT INTO c VALUES ('2026-05-01', 5);

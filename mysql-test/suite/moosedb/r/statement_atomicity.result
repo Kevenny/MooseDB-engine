@@ -12,8 +12,12 @@ connection default;
 SELECT COUNT(*) FROM a;
 COUNT(*)
 2000000
-# Same with a tiny MemTable (the batch spills to disk)
-CREATE TABLE b (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=4096;
+# The default MemTable (64 MiB) was exceeded too: chunks exist without any FLUSH
+SELECT CHUNKS > 0 AS spilled FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'a';
+spilled
+1
+# Same with a 1 MiB MemTable (the batch spills to disk)
+CREATE TABLE b (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=1048576;
 connection wr;
 INSERT INTO b SELECT '2026-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_200000;
 connection default;
@@ -24,8 +28,12 @@ connection default;
 SELECT COUNT(*), SUM(v) FROM b;
 COUNT(*)	SUM(v)
 200000	20000100000
+# Proof of the spill: sealed chunks exist although nothing flushed the table
+SELECT CHUNKS > 1 AS spilled, PENDING_ROWS < 200000 AS not_all_pending FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'b';
+spilled	not_all_pending
+1	1
 # Two concurrent writers into the same table
-CREATE TABLE c2 (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=4096;
+CREATE TABLE c2 (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=1048576;
 connection wr;
 INSERT INTO c2 SELECT '2026-01-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_150000;
 connection wr2;
@@ -40,6 +48,9 @@ SELECT v, COUNT(*) FROM c2 GROUP BY v ORDER BY v;
 v	COUNT(*)
 1	150000
 2	150000
+SELECT CHUNKS > 1 AS spilled, PENDING_ROWS < 300000 AS not_all_pending FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'c2';
+spilled	not_all_pending
+1	1
 # Multi-row INSERT is one statement too
 INSERT INTO c2 VALUES ('2027-01-01', 3), ('2027-01-02', 3), ('2027-01-03', 3);
 SELECT COUNT(*) FROM c2 WHERE v = 3;

@@ -26,6 +26,10 @@ typedef enum {
   TF_ERR_INTERNAL = 8,
   // The operation or feature is not available.
   TF_ERR_UNSUPPORTED = 9,
+  // Decryption failed or the encryption key / key version is not available
+  // (wrong or retired key, damaged ciphertext): distinct from
+  // `TF_ERR_CORRUPT` because the data may be intact.
+  TF_ERR_CRYPTO = 10,
 } TFStatus;
 
 // Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.

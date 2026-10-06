@@ -17,7 +17,10 @@ mysqld ──► ha_moosedb.so
 | Módulo (`moosedb-core`) | Responsabilidade |
 |---|---|
 | `table` | estado da tabela, protocolo de durabilidade, recuperação |
-| `wal` | segmentos `[CRC][len][linha]`, cifrados opcionalmente |
+| `wal` | segmentos v2 (`ROW`/`COMMIT`/`ROW_COMMIT` com CRC), cifrados opcionalmente; v1 legível |
+| `batch` | lotes por statement: buffer privado, commit atômico, spill para chunks em estágio |
+| `manifest` | MANIFEST v2 (`wal_seq`, `replay_seq`, chunks vivos), troca atômica |
+| `fsutil` | `write_atomic`, `sync_dir`, fsync que marca falha (poison) |
 | `memtable` | buffer em segmentos imutáveis (snapshot O(1)) |
 | `chunk`, `chunk_writer`, `chunk_reader`, `block` | formato `.tfl` v2, blocos por coluna |
 | `compression/` | delta-of-delta, delta, Simple8b, Gorilla, RLE, LZ4/ZSTD |
@@ -166,7 +169,32 @@ controla uma alocação sem teto (um OOM aborta o `mysqld` e não é capturado
 por `catch_unwind`). Bloco descomprimido ≤ 256 MiB e plausível em relação ao
 tamanho armazenado; série ≤ 2²⁷ linhas por chunk, soma das séries = contagem
 do header; RLE e decodificação crescem sob demanda. Violação → `Corrupt`.
-Os mesmos limites são aplicados na escrita (erro explícito, nunca perda).
+Aritmética sobre ids/seqs lidos usa `checked_*` (overflow → `Corrupt`).
+
+Na escrita: valor ≤ **64 MiB** por coluna e linha ≤ **128 MiB** (erro
+explícito, sem envenenar a tabela). Flush, spill e compactação dividem uma
+série em várias partes/chunks quando um bloco passaria de 256 MiB, então
+nenhum dado aceito gera estado irrecuperável. Uma linha de WAL antigo acima
+de 128 MiB não entra na tabela — e, para manter o tudo-ou-nada, **o lote
+inteiro dela também não**. Os segmentos que contêm esse lote são copiados de
+forma atômica (`.tmp` → fsync → rename) para `wal_NNNNNN.tfl.wal.oversized`
+antes de qualquer checkpoint, e um warning lista lote, linhas, bytes e
+arquivos. A engine nunca lê esses arquivos: são cópias byte a byte de
+segmentos WAL v2 (ainda cifrados com a versão original da chave, se a tabela
+for cifrada — aposentar essa versão os torna ilegíveis). O operador pode
+extrair e reinserir as linhas com valores dentro do limite, ou apagá-los.
+
+Se uma thread entra em panic segurando o estado da tabela, toda operação
+(leitura inclusive) falha na hora com "table must be reopened" — nunca
+devolve estado possivelmente inconsistente; reabrir resolve.
+
+### Coleta do WAL
+
+Segmentos não reutilizados na abertura (keystream CTR único), mas também não
+acumulam: a abertura de uma tabela com MemTable vazia grava o checkpoint e
+apaga os segmentos antigos; FLUSH/OPTIMIZE com MemTable vazia e o commit de
+um lote com spill coletam entradas mortas (respeitando lotes abertos).
+Segmento cifrado só com header não exige a chave no replay.
 
 ## Concorrência
 
@@ -260,7 +288,7 @@ v3. Salvaguardas atuais:
 | 7 | `max_supported_key_parts = 4` | `1`, só índice no timestamp, não-UNIQUE | O otimizador remove condições usadas em `ref`; um índice composto exigiria igualdade exata em todas as partes. TAGs são filtradas por pushdown. |
 | 8 | `HA_CAN_INDEX_BLOBS` | removido; `+HA_BINLOG_*_CAPABLE`, `HA_NO_AUTO_INCREMENT`, `HA_READ_ORDER`, `HA_CAN_TABLE_CONDITION_PUSHDOWN` | Binlog (§13), `ORDER BY ts DESC` pelo índice, pushdown de TAG. |
 | 9 | TFValue com `bool`/enum/união anônima | `uint8_t bool_val`, `uint8_t kind`, união `data` | Ler `bool`/enum inválido vindo do C é UB no Rust; cbindgen não gera união anônima. |
-| 10 | — | `TF_ERR_INTERNAL`, `TF_ERR_UNSUPPORTED` | Panic capturado / recurso indisponível. |
+| 10 | — | `TF_ERR_INTERNAL`, `TF_ERR_UNSUPPORTED`, `TF_ERR_CRYPTO` (10) | Panic capturado / recurso indisponível / falha de decriptação ou chave indisponível (vira `HA_ERR_DECRYPTION_FAILED`). |
 | 11 | API FFI mínima | + sync do WAL, truncate, scans filtrados/bidirecionais, snapshots, séries, check, estimativa, inspeção, manutenção, chaves, settings | Necessárias para a Handler API completa e os recursos acima. |
 | 12 | fsync por `write_row` | commit do **lote** no fim do statement (`external_lock(F_UNLCK)`, `end_bulk_insert`; sob `LOCK TABLES`, cada INSERT de uma linha) com fsync conforme `wal_sync_mode` | Linha confirmada = statement retornou OK; fsync por linha inviabiliza 1M linhas em 30 s. Ver §Atomicidade por statement. |
 | 13 | Entrada do WAL `[CRC][len][ts][series_id][valores]` | header de segmento + `[CRC][len][linha]` | Header guarda os parâmetros de criptografia; `series_id` é reconstruído no replay. |
@@ -293,7 +321,11 @@ v3. Salvaguardas atuais:
   pelo background até o conjunto de chunks mudar (só `OPTIMIZE` força) — isso
   inclui a recodificação quente→fria e falhas transitórias (ENOSPC/EIO), e
   um `OPTIMIZE` com parte dos grupos falhando retorna OK (falhas só no log).
-* `MEMTABLE_SIZE` ≤ 96 MiB (garante blocos de flush < 256 MiB); tabelas antigas
+* Retenção é física e local a cada servidor (sem eventos de binlog): mestre e
+  réplica podem diferir temporariamente nas linhas já expiradas — inclusive
+  quando um `OPTIMIZE` sem `DELETE` no mestre é replicado e a thread SQL da
+  réplica, com todos os privilégios, aplica a retenção.
+* 1 MiB ≤ `MEMTABLE_SIZE` ≤ 96 MiB (garante blocos de flush < 256 MiB); tabelas antigas
   com valor maior abrem com o valor limitado.
 * O plugin se declara `EXPERIMENTAL`: requer `plugin_maturity=experimental`.
 * Criptografia sem integridade autenticada (ver §Criptografia).

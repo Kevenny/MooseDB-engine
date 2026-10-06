@@ -18,7 +18,10 @@ tools:
 | Módulo | Responsabilidade |
 |---|---|
 | `table.rs` | estado da tabela, protocolo de durabilidade, recuperação |
-| `wal.rs` | segmentos `[CRC][len][linha]`, cifrados opcionalmente |
+| `wal.rs` | segmentos v2: entradas `ROW(batch_id)`/`COMMIT(batch_id)`/`ROW_COMMIT` com CRC, cifradas opcionalmente; v1 legível |
+| `batch.rs` | lotes por statement: buffer privado, commit atômico, spill para chunks em estágio |
+| `manifest.rs` | MANIFEST v2 (`wal_seq`, `replay_seq`, chunks vivos), troca atômica |
+| `fsutil.rs` | `write_atomic`, `sync_dir`, wrappers de fsync que marcam falha (poison) |
 | `memtable.rs` | buffer em segmentos imutáveis (snapshot O(1)) |
 | `chunk.rs`, `chunk_writer.rs`, `chunk_reader.rs`, `block.rs` | formato `.tfl` v2, blocos por coluna |
 | `compression/` | delta-of-delta, delta, Simple8b, Gorilla, RLE, LZ4/ZSTD |
@@ -51,7 +54,8 @@ tipos MariaDB → Core.
    escrever em `.tmp` → fsync → rename → troca atômica do MANIFEST → chunk
    obsoleto só é apagado quando o último snapshot que o referencia é
    liberado (`ChunkFile::drop`).
-4. Concorrência: appends são serializados num mutex; leitores só seguram o
+4. Concorrência: escritores acumulam linhas em **lotes** privados e só tomam o
+   mutex no commit; leitores só seguram o
    mutex para tirar um **snapshot** (lista de chunks + segmentos congelados
    da MemTable, sem cópia). Não introduza cópia de dados onde hoje há
    snapshot compartilhado — isso é uma regressão de performance silenciosa.
@@ -61,6 +65,15 @@ tipos MariaDB → Core.
    `moosedb-build-runner`, target `moosedb_ffi_header_check`).
 6. `panic = "unwind"` no profile release é deliberado — nunca sugira trocar
    para `"abort"`.
+7. Invariantes de lote/WAL (ver `docs/architecture.md` §Atomicidade por
+   statement): COMMIT só é publicado na MemTable **depois** do sync;
+   `replay_seq` nunca passa a primeira linha de um lote aberto; replay só
+   aplica COMMIT em segmento `> wal_seq`; ids de lote nunca se repetem;
+   TRUNCATE invalida lotes por época; spill confirma por um único swap de
+   MANIFEST.
+8. Dados lidos do disco são **não confiáveis**: nenhum campo lido controla
+   alocação sem teto (OOM aborta o `mysqld` — `catch_unwind` não pega); use
+   `checked_*` em aritmética sobre ids/seqs/contagens lidas.
 
 ## Fluxo de trabalho
 

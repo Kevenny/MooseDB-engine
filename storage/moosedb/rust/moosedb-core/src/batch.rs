@@ -28,9 +28,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::chunk::ChunkMeta;
-use crate::chunk_writer::ChunkBuilder;
-use crate::crypto::CipherParams;
-use crate::error::{invalid, Error, Result};
+use crate::chunk_writer::{chunks_needed, write_bucket, SeriesParts};
+use crate::compaction::split_series;
+use crate::error::{corrupt, invalid, Error, Result};
 use crate::fsutil::{is_fsync_error, sync_dir};
 use crate::index::series::{row_tags, series_key};
 use crate::log::warn;
@@ -60,6 +60,11 @@ pub struct Batch {
     finished: bool,
 }
 
+/// Half-open time interval `[start, end)` of a chunk.
+type Bucket = (i64, i64);
+/// A series of a bucket (local id) with its rows cut into column-block-sized parts.
+type LocalParts<'a> = (u64, Vec<&'a [&'a Row]>);
+
 fn stale() -> Error {
     invalid("the table was truncated while the batch was open")
 }
@@ -71,7 +76,8 @@ impl Table {
         let inner = &mut *guard;
         inner.check_writable()?;
         let id = inner.next_batch_id;
-        inner.next_batch_id += 1;
+        inner.next_batch_id =
+            id.checked_add(1).ok_or_else(|| corrupt("batch ids are exhausted (implausible id in the WAL)"))?;
         let epoch = inner.epoch;
         drop(guard);
         let spill_limit = usize::try_from(self.config.opts.memtable_size_bytes).unwrap_or(usize::MAX).max(1);
@@ -104,7 +110,7 @@ impl Batch {
             return Err(invalid("the batch is already finished"));
         }
         let table = self.table.clone();
-        table.schema.validate_row(&row)?;
+        table.schema.validate_for_write(&row)?;
         // Spill *before* taking the row: a failed spill then fails this row
         // alone instead of reporting an error for a row that was kept.
         if self.bytes >= self.spill_limit && !self.rows.is_empty() {
@@ -260,6 +266,12 @@ impl Batch {
         let mut chunks = inner.chunks.clone();
         chunks.extend(staged.into_iter().map(Arc::new));
         inner.replace_chunks(chunks);
+        // The rows this batch logged before spilling are dead weight in the
+        // WAL: collect them now, unless another batch still needs those
+        // segments (the check is inside).
+        if let Err(e) = table.collect_wal_locked(inner) {
+            warn(&format!("cannot collect WAL segments after a batch commit: {e}"));
+        }
         Ok(())
     }
 
@@ -302,6 +314,13 @@ fn stage_rows(table: &Table, rows: &[MemRow], local_tags: &[Vec<Value>], epoch: 
     if groups.is_empty() {
         return Ok(Vec::new());
     }
+    // A series too big for one column block is cut into parts; part k of every
+    // series goes to chunk k of its bucket (as flushes and compaction do).
+    let split: Vec<(Bucket, Vec<LocalParts>)> = groups
+        .iter()
+        .map(|(bucket, series)| (*bucket, series.iter().map(|(&local, rows)| (local, split_series(rows))).collect()))
+        .collect();
+    let total: u64 = split.iter().map(|(_, s)| s.iter().map(|(_, parts)| parts.len()).max().unwrap_or(0) as u64).sum();
     // Series ids and chunk ids come from shared state: take them in one short
     // critical section. (Series registered for a batch that later aborts stay
     // in the index, without rows; harmless, and gone after a reopen.)
@@ -318,23 +337,37 @@ fn stage_rows(table: &Table, rows: &[MemRow], local_tags: &[Vec<Value>], epoch: 
                 global.entry(local).or_insert_with(|| inner.series.get_or_insert(&local_tags[local as usize]));
             }
         }
-        let first = inner.manifest.next_chunk_id;
-        inner.manifest.next_chunk_id += groups.len() as u64;
+        let first = inner.reserve_chunk_ids(total)?;
         (global, first, inner.wal.seq())
     };
 
     let now = crate::time::now_micros();
-    let mut written: Vec<ChunkMeta> = Vec::with_capacity(groups.len());
+    let mut written: Vec<ChunkMeta> = Vec::new();
     let result = (|| -> Result<()> {
-        for (i, (bucket, series)) in groups.iter().enumerate() {
-            let cipher = opts.encryption_key_id.map(CipherParams::for_new_file).transpose()?;
-            let mut b = ChunkBuilder::new(&table.schema, opts.codec_for(bucket.1, now), cipher);
-            let mut order: Vec<(u64, u64)> = series.keys().map(|&l| (global[&l], l)).collect();
-            order.sort_unstable();
-            for (sid, local) in order {
-                b.add_series(sid, &local_tags[local as usize], &series[&local])?;
-            }
-            written.push(b.finish(dir, first_id + i as u64, wal_seq, *bucket)?);
+        let mut next = first_id;
+        for (bucket, series) in split {
+            let mut parts: Vec<SeriesParts<'_>> = series
+                .into_iter()
+                .map(|(local, parts)| SeriesParts {
+                    series_id: global[&local],
+                    tags: &local_tags[local as usize],
+                    parts,
+                })
+                .collect();
+            parts.sort_unstable_by_key(|p| p.series_id);
+            let codec = opts.codec_for(bucket.1, now);
+            write_bucket(
+                &table.schema,
+                codec,
+                opts.encryption_key_id,
+                dir,
+                bucket,
+                &parts,
+                next,
+                wal_seq,
+                &mut written,
+            )?;
+            next += chunks_needed(&parts) as u64;
         }
         sync_dir(dir)
     })();

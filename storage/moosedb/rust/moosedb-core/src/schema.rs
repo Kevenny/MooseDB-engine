@@ -89,6 +89,15 @@ pub struct Column {
     pub ty: ColumnType,
 }
 
+/// Largest single value (VARCHAR/TAG/DECIMAL bytes) a write accepts. A flush
+/// encodes each column of a series into one block of at most
+/// `compression::MAX_BLOCK_RAW` (256 MiB) and cannot split one value, so the
+/// ceiling must leave room for the block overhead and for neighbours.
+pub const MAX_VALUE_BYTES: usize = 64 << 20;
+/// Largest sum of the byte values of one row a write accepts. Well below the
+/// WAL entry limit (1 GiB), so an accepted row always fits one WAL entry.
+pub const MAX_ROW_BYTES: usize = 128 << 20;
+
 /// Upper bound on columns per table; also keeps row encodings within `u16` counts.
 pub const MAX_COLUMNS: usize = 4096;
 
@@ -167,6 +176,31 @@ impl Schema {
         Ok(())
     }
 
+    /// [`Schema::validate_row`] plus the size limits of the *write* path.
+    /// WAL replay uses `validate_row` alone: data accepted by an older
+    /// version (which allowed up to 1 GiB per entry) must stay readable.
+    pub fn validate_for_write(&self, row: &[Value]) -> Result<()> {
+        self.validate_row(row)?;
+        let mut total = 0usize;
+        for (v, c) in row.iter().zip(&self.columns) {
+            if let Value::Bytes(b) = v {
+                if b.len() > MAX_VALUE_BYTES {
+                    return Err(invalid(format!(
+                        "value of {} bytes exceeds the {} MiB limit (column '{}')",
+                        b.len(),
+                        MAX_VALUE_BYTES >> 20,
+                        c.name
+                    )));
+                }
+                total += b.len();
+            }
+        }
+        if total > MAX_ROW_BYTES {
+            return Err(invalid(format!("row of {total} bytes exceeds the {} MiB limit", MAX_ROW_BYTES >> 20)));
+        }
+        Ok(())
+    }
+
     /// Stable fingerprint of the column type layout, stored in every chunk to
     /// detect a chunk being opened with an incompatible schema.
     pub fn fingerprint(&self) -> u32 {
@@ -211,6 +245,29 @@ mod tests {
         assert!(s.validate_row(&[Value::Null, Value::Bytes(b"a".to_vec()), Value::Float64(1.0)]).is_err());
         assert!(s.validate_row(&[Value::Timestamp(1), Value::Int(3), Value::Float64(1.0)]).is_err());
         assert!(s.validate_row(&[Value::Timestamp(1), Value::Bytes(b"a".to_vec()), Value::Null]).is_ok());
+    }
+
+    #[test]
+    fn write_limits_apply_per_value_and_per_row_but_not_to_validate_row() {
+        let s = Schema::new(
+            vec![
+                Column { name: "ts".into(), ty: ColumnType::Timestamp },
+                Column { name: "a".into(), ty: ColumnType::Varchar },
+                Column { name: "b".into(), ty: ColumnType::Varchar },
+                Column { name: "c".into(), ty: ColumnType::Varchar },
+            ],
+            0,
+        )
+        .unwrap();
+        let big = |n: usize| Value::Bytes(vec![0u8; n]);
+        let row = |a, b, c| vec![Value::Timestamp(1), a, b, c];
+        assert!(s.validate_for_write(&row(big(MAX_VALUE_BYTES), big(MAX_VALUE_BYTES), Value::Null)).is_ok());
+        let err = s.validate_for_write(&row(big(MAX_VALUE_BYTES + 1), Value::Null, Value::Null)).unwrap_err();
+        assert!(err.to_string().contains("exceeds the 64 MiB limit"), "{err}");
+        let err = s.validate_for_write(&row(big(MAX_VALUE_BYTES), big(MAX_VALUE_BYTES), big(1))).unwrap_err();
+        assert!(err.to_string().contains("128 MiB"), "{err}");
+        // Replay accepts what older versions wrote.
+        assert!(s.validate_row(&row(big(MAX_VALUE_BYTES + 1), Value::Null, Value::Null)).is_ok());
     }
 
     #[test]

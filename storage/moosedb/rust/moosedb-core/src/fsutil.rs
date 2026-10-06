@@ -91,12 +91,18 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 /// rename over the target, fsync the directory.
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    {
+    let stored = (|| -> Result<()> {
         let mut f = File::create(&tmp)?;
         f.write_all(data)?;
         sync_all(&f)?;
+        drop(f);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = stored {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)?;
     if let Some(dir) = path.parent() {
         sync_dir(dir)?;
     }

@@ -109,11 +109,11 @@ SET GLOBAL moosedb_chunk_cache_size = DEFAULT;
 SELECT COUNT(*), SUM(v) FROM s;
 
 --echo # MemTable threshold applies to tables opened afterwards
-SET GLOBAL moosedb_memtable_flush_threshold = 4096;
+SET GLOBAL moosedb_memtable_flush_threshold = 1048576;
 CREATE TABLE small (ts DATETIME NOT NULL, v BIGINT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 MONTH';
 FLUSH TABLES;
-INSERT INTO small SELECT '2026-05-01' + INTERVAL seq SECOND, seq FROM seq_0_to_19999;
-SELECT SUM(PENDING_ROWS) < 20000 AS flushed_by_threshold, COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'small';
+INSERT INTO small SELECT '2026-05-01' + INTERVAL seq SECOND, seq FROM seq_0_to_199999;
+SELECT SUM(PENDING_ROWS) < 200000 AS flushed_by_threshold, COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'small';
 SELECT COUNT(*), SUM(v) FROM small;
 SET GLOBAL moosedb_memtable_flush_threshold = DEFAULT;
 --echo # An explicit MEMTABLE_SIZE wins over the variable
@@ -121,9 +121,9 @@ SET GLOBAL moosedb_memtable_flush_threshold = DEFAULT;
 --error ER_ILLEGAL_HA_CREATE_OPTION
 CREATE TABLE big (ts DATETIME NOT NULL, v BIGINT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 MONTH' MEMTABLE_SIZE=1073741824;
 CREATE TABLE big (ts DATETIME NOT NULL, v BIGINT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 MONTH' MEMTABLE_SIZE=50331648;
-SET GLOBAL moosedb_memtable_flush_threshold = 4096;
+SET GLOBAL moosedb_memtable_flush_threshold = 1048576;
 FLUSH TABLES;
-INSERT INTO big SELECT '2026-05-01' + INTERVAL seq SECOND, seq FROM seq_0_to_19999;
+INSERT INTO big SELECT '2026-05-01' + INTERVAL seq SECOND, seq FROM seq_0_to_199999;
 SELECT PENDING_ROWS, CHUNKS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'big';
 SET GLOBAL moosedb_memtable_flush_threshold = DEFAULT;
 

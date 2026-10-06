@@ -54,7 +54,7 @@ ERROR HY000: MooseDB: invalid argument: COMPRESSION 'GZIP' not supported; use ZS
 CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB COMPRESSION_LEVEL=25;
 ERROR HY000: Incorrect value '25' for option 'COMPRESSION_LEVEL'
 CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=100;
-ERROR HY000: MooseDB: invalid argument: MEMTABLE_SIZE must be at least 4096 bytes
+ERROR HY000: MooseDB: invalid argument: MEMTABLE_SIZE must be at least 1048576 bytes (1 MiB)
 # Table definition rules
 CREATE TABLE t1 (ts DATETIME NOT NULL, v INT) ENGINE=MooseDB;
 ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'

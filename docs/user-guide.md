@@ -97,13 +97,15 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
 
 ```sql
 FLUSH TABLES metricas;     -- sela a MemTable em chunks
-OPTIMIZE TABLE metricas;   -- flush + retenção + compactação de tudo
+OPTIMIZE TABLE metricas;   -- flush + retenção (exige DELETE) + compactação de tudo
 CALL moosedb_compact('metricas', '2026-01-01', '2026-06-30');
 CALL moosedb_apply_retention('metricas');
 CHECK TABLE metricas;      -- verifica o CRC32 de todos os chunks
 ```
 
-Privilégios: `moosedb_apply_retention` exige `DELETE` na tabela e
+Privilégios: `OPTIMIZE TABLE` só aplica a retenção se o usuário tiver
+`DELETE` na tabela (senão compacta e avisa "retention skipped");
+`moosedb_apply_retention` exige `DELETE` na tabela e
 `moosedb_compact`, `ALTER`. As procedures funcionam com qualquer charset de
 cliente (instale o script com o cliente que preferir).
 
@@ -145,8 +147,9 @@ antigos continuam legíveis.
 
 A criptografia protege a **confidencialidade**, não a integridade: quem pode
 escrever no datadir consegue adulterar dados cifrados sem ser detectado. Se a
-chave configurada não decifra a tabela, ela simplesmente não abre — nada é
-descartado; corrija a configuração de chaves e reabra.
+chave configurada não decifra a tabela, ela não abre (`Got error 192 ... from
+MooseDB`, erro de decriptação) — nada é descartado; corrija a configuração
+de chaves e reabra.
 
 ## Variáveis globais
 
@@ -165,3 +168,11 @@ descartado; corrija a configuração de chaves e reabra.
 
 Replicação por linha (RBR) e por statement funcionam para INSERT e TRUNCATE;
 cada réplica constrói os próprios chunks. Galera não é suportado.
+
+A **retenção é local a cada servidor**: a expiração apaga chunks inteiros
+pelo relógio de cada servidor e não gera eventos de binlog. Mestre e réplica
+podem, por um intervalo, diferir nas linhas já expiradas (por exemplo, um
+`OPTIMIZE` replicado aplica a retenção na réplica — cuja thread SQL tem todos
+os privilégios — mesmo quando o usuário do mestre não tinha `DELETE`). Com
+`moosedb_retention_check_interval > 0` os dois convergem; não compare
+mestre e réplica por contagem em tabelas com `RETENTION_PERIOD`.

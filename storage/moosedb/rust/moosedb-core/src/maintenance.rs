@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -24,6 +24,13 @@ use crate::time::{now_micros, MICROS_PER_SEC};
 
 static REGISTRY: Mutex<Vec<(PathBuf, Weak<Table>)>> = Mutex::new(Vec::new());
 
+/// Locks a mutex whose data stays consistent whatever a panicking holder was
+/// doing (registry list, job queue, unit guards): a poisoned lock must not
+/// switch maintenance off for the life of the process.
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Registry key: absolute, symlink-free path (falls back to the given path).
 fn key(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
@@ -32,7 +39,7 @@ fn key(dir: &Path) -> PathBuf {
 /// Opens a table, or returns the instance already open for that directory.
 pub fn open_shared(config: TableConfig) -> Result<Arc<Table>> {
     let k = key(&config.dir);
-    let mut reg = REGISTRY.lock().map_err(|_| invalid("table registry poisoned"))?;
+    let mut reg = lock_recover(&REGISTRY);
     reg.retain(|(_, w)| w.strong_count() > 0);
     if let Some(t) = reg.iter().find(|(p, _)| *p == k).and_then(|(_, w)| w.upgrade()) {
         if t.schema().fingerprint() != config.schema.fingerprint() {
@@ -48,11 +55,11 @@ pub fn open_shared(config: TableConfig) -> Result<Arc<Table>> {
 /// The open instance for `dir`, if any.
 pub fn lookup(dir: &Path) -> Option<Arc<Table>> {
     let k = key(dir);
-    REGISTRY.lock().ok()?.iter().find(|(p, _)| *p == k).and_then(|(_, w)| w.upgrade())
+    lock_recover(&REGISTRY).iter().find(|(p, _)| *p == k).and_then(|(_, w)| w.upgrade())
 }
 
 fn live_tables() -> Vec<Arc<Table>> {
-    REGISTRY.lock().map(|r| r.iter().filter_map(|(_, w)| w.upgrade()).collect()).unwrap_or_default()
+    lock_recover(&REGISTRY).iter().filter_map(|(_, w)| w.upgrade()).collect()
 }
 
 /// Called before a table directory is dropped or renamed: stops maintenance
@@ -60,14 +67,15 @@ fn live_tables() -> Vec<Arc<Table>> {
 /// running job to finish, and forgets the instance.
 pub(crate) fn retire(dir: &Path) {
     let k = key(dir);
-    let t = REGISTRY.lock().ok().and_then(|mut r| {
+    let t = {
+        let mut r = lock_recover(&REGISTRY);
         let t = r.iter().find(|(p, _)| *p == k).and_then(|(_, w)| w.upgrade());
         r.retain(|(p, _)| *p != k);
         t
-    });
+    };
     if let Some(t) = t {
         t.defunct.store(true, Ordering::Release);
-        drop(t.maint.lock());
+        drop(lock_recover(&t.maint));
     }
 }
 
@@ -85,7 +93,7 @@ impl Table {
             return Ok(());
         }
         if self.retention_due(now) {
-            let _m = self.maint.lock();
+            let _m = lock_recover(&self.maint);
             if !self.defunct.load(Ordering::Acquire) {
                 self.apply_retention(now)?;
             }
@@ -122,12 +130,42 @@ static POOL: Mutex<Option<Pool>> = Mutex::new(None);
 const TICK: Duration = Duration::from_secs(1);
 
 fn stopped(s: &Shared) -> bool {
-    s.stop.lock().map(|g| *g).unwrap_or(true)
+    *lock_recover(&s.stop)
+}
+
+/// Whether a table has background work: a retention sweep or a compaction.
+fn has_work(t: &Table, now: i64) -> bool {
+    t.retention_due(now) || t.compaction_pending(now)
+}
+
+/// Queues `t` for a worker if `due` says it has work. The probe runs under
+/// `catch_unwind` and per table: a panic (a bug in one table's code path)
+/// must neither kill the scheduler thread, which would end all maintenance of
+/// every table for the life of the process, nor skip the other tables.
+fn schedule(s: &Shared, t: &Arc<Table>, now: i64, due: &dyn Fn(&Table, i64) -> bool) {
+    match catch_unwind(AssertUnwindSafe(|| !t.defunct.load(Ordering::Acquire) && due(t, now))) {
+        Ok(true) => {
+            if !t.queued.swap(true, Ordering::AcqRel) {
+                lock_recover(&s.queue).push_back(Arc::downgrade(t));
+                s.work.notify_one();
+            }
+        }
+        Ok(false) => {}
+        Err(_) => warn(&format!("maintenance check of {} panicked; skipped this tick", t.dir().display())),
+    }
+}
+
+/// One scheduler tick over `tables`.
+fn tick(s: &Shared, tables: &[Arc<Table>], now: i64, due: &dyn Fn(&Table, i64) -> bool) {
+    for t in tables {
+        schedule(s, t, now, due);
+    }
 }
 
 fn scheduler(s: Arc<Shared>) {
     loop {
-        if let Ok(g) = s.stop.lock() {
+        {
+            let g = lock_recover(&s.stop);
             if *g {
                 return;
             }
@@ -137,14 +175,9 @@ fn scheduler(s: Arc<Shared>) {
             return;
         }
         let now = now_micros();
-        for t in live_tables() {
-            let due = !t.defunct.load(Ordering::Acquire) && (t.retention_due(now) || t.compaction_pending(now));
-            if due && !t.queued.swap(true, Ordering::AcqRel) {
-                if let Ok(mut q) = s.queue.lock() {
-                    q.push_back(Arc::downgrade(&t));
-                }
-                s.work.notify_one();
-            }
+        let ticked = catch_unwind(AssertUnwindSafe(|| tick(&s, &live_tables(), now, &has_work)));
+        if ticked.is_err() {
+            warn("maintenance scheduler tick panicked; continuing");
         }
     }
 }
@@ -152,7 +185,7 @@ fn scheduler(s: Arc<Shared>) {
 fn worker(s: Arc<Shared>) {
     loop {
         let job = {
-            let Ok(mut q) = s.queue.lock() else { return };
+            let mut q = lock_recover(&s.queue);
             loop {
                 if stopped(&s) {
                     return;
@@ -162,7 +195,7 @@ fn worker(s: Arc<Shared>) {
                 }
                 q = match s.work.wait_timeout(q, TICK) {
                     Ok((q, _)) => q,
-                    Err(_) => return,
+                    Err(poisoned) => poisoned.into_inner().0,
                 };
             }
         };
@@ -211,12 +244,67 @@ pub fn start(threads: usize) {
 /// Stops the pool and waits for running jobs to finish.
 pub fn stop() {
     let Some(pool) = POOL.lock().ok().and_then(|mut p| p.take()) else { return };
-    if let Ok(mut g) = pool.shared.stop.lock() {
-        *g = true;
-    }
+    *lock_recover(&pool.shared.stop) = true;
     pool.shared.wake.notify_all();
     pool.shared.work.notify_all();
     for h in pool.threads {
         let _ = h.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::RawOptions;
+    use crate::schema::{Column, ColumnType, Schema};
+
+    fn table(dir: &Path) -> Arc<Table> {
+        let schema = Schema::new(vec![Column { name: "ts".into(), ty: ColumnType::Timestamp }], 0).unwrap();
+        let cfg = TableConfig::new(dir, schema, &RawOptions::default()).unwrap();
+        Table::create(&cfg).unwrap();
+        Arc::new(Table::open(cfg).unwrap())
+    }
+
+    fn shared() -> Shared {
+        Shared {
+            queue: Mutex::new(VecDeque::new()),
+            work: Condvar::new(),
+            stop: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    #[test]
+    fn a_panicking_probe_skips_one_table_not_the_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (table(&dir.path().join("a")), table(&dir.path().join("b")));
+        let s = shared();
+        let bad = a.dir().to_path_buf();
+        let due = move |t: &Table, _now: i64| -> bool {
+            if t.dir() == bad {
+                panic!("boom");
+            }
+            true
+        };
+        tick(&s, &[a.clone(), b.clone()], 0, &due);
+        let queued = lock_recover(&s.queue).len();
+        assert_eq!(queued, 1, "the healthy table is still scheduled");
+        assert!(!a.queued.load(Ordering::Acquire));
+        assert!(b.queued.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn poisoned_scheduler_state_is_recovered() {
+        let s = Arc::new(shared());
+        let s2 = s.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = s2.queue.lock().unwrap();
+            let _h = s2.stop.lock().unwrap();
+            panic!("poison both");
+        })
+        .join();
+        assert!(s.queue.is_poisoned() && s.stop.is_poisoned());
+        assert!(!stopped(&s));
+        assert!(lock_recover(&s.queue).is_empty());
     }
 }

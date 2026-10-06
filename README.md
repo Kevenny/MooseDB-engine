@@ -46,6 +46,9 @@ docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
 docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh
 ```
 
+Antes do primeiro commit: `git config core.hooksPath .githooks` (guardrails
+automáticos — ver `CLAUDE.md`).
+
 ## Instalação
 
 ```ini

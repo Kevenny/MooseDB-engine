@@ -21,6 +21,52 @@ use crate::error::{invalid, Result};
 use crate::index::bloom::Bloom;
 use crate::schema::{Row, Schema, Value};
 
+/// The rows of one series within one time bucket, cut into parts that each
+/// fit one column block (see `compaction::split_series`).
+pub(crate) struct SeriesParts<'a> {
+    pub series_id: u64,
+    pub tags: &'a [Value],
+    pub parts: Vec<&'a [&'a Row]>,
+}
+
+/// Number of chunk files a bucket needs: part `k` of every series goes to
+/// chunk `k`, so a series never appears twice in one chunk.
+pub(crate) fn chunks_needed(series: &[SeriesParts<'_>]) -> usize {
+    series.iter().map(|s| s.parts.len()).max().unwrap_or(0)
+}
+
+/// Writes the chunk files of one bucket with ids `first_id..`, appending each
+/// finished chunk to `written` (so the caller can discard them if a later
+/// step fails). Files are fsynced and renamed into place, not yet listed in
+/// the MANIFEST.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_bucket(
+    schema: &Schema,
+    codec: Codec,
+    key_id: Option<u32>,
+    dir: &Path,
+    bucket: (i64, i64),
+    series: &[SeriesParts<'_>],
+    first_id: u64,
+    wal_seq: u64,
+    written: &mut Vec<ChunkMeta>,
+) -> Result<()> {
+    let mut builders = Vec::new();
+    for _ in 0..chunks_needed(series) {
+        let cipher = key_id.map(CipherParams::for_new_file).transpose()?;
+        builders.push(ChunkBuilder::new(schema, codec, cipher));
+    }
+    for sp in series {
+        for (k, part) in sp.parts.iter().enumerate() {
+            builders[k].add_series(sp.series_id, sp.tags, part)?;
+        }
+    }
+    for (k, b) in builders.into_iter().enumerate() {
+        written.push(b.finish(dir, first_id + k as u64, wal_seq, bucket)?);
+    }
+    Ok(())
+}
+
 pub(crate) struct ChunkBuilder<'a> {
     schema: &'a Schema,
     codec: Codec,
@@ -125,12 +171,20 @@ impl<'a> ChunkBuilder<'a> {
         let name = chunk_file_name(bucket, id);
         let path = dir.join(&name);
         let tmp = dir.join(format!("{name}.tmp"));
-        {
+        let stored = (|| -> Result<()> {
             let mut f = File::create(&tmp)?;
             f.write_all(&buf)?;
             crate::fsutil::sync_all(&f)?;
+            drop(f);
+            fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if let Err(e) = stored {
+            // ENOSPC and friends: do not leave a half-written `.tmp` behind
+            // until the next recovery (it would also eat the space we lack).
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
-        fs::rename(&tmp, &path)?;
 
         Ok(ChunkMeta {
             id,

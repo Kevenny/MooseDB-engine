@@ -1,6 +1,6 @@
 ---
 name: moosedb-mtr
-description: Roda a suíte MTR (14 testes funcionais) do MooseDB contra o servidor MariaDB oficial via Docker. Use para validar DDL, tipos, chunk queries, manutenção e recuperação de crash end-to-end.
+description: Roda a suíte MTR (todos os testes de mysql-test/suite/moosedb) do MooseDB contra o servidor MariaDB oficial via Docker. Use para validar DDL, tipos, chunk queries, manutenção e recuperação de crash end-to-end.
 ---
 
 # Suíte MTR — testes funcionais end-to-end
@@ -12,8 +12,11 @@ description: Roda a suíte MTR (14 testes funcionais) do MooseDB contra o servid
   `moosedb-core` (comportamento observável) pronta.
 - Quando o usuário pedir "roda a suíte MTR" / "testa DDL" / "testa tipos".
 
-Testes disponíveis em `mysql-test/suite/moosedb/t/`: `basic`, `chunk_query`,
-`types`, `crash_recovery`, `ddl`, `maintenance`.
+Testes disponíveis: `ls mysql-test/suite/moosedb/t/*.test` (não fixe a
+contagem aqui — ela cresce). Grupos úteis para iterar: atomicidade
+(`statement_atomicity`, `statement_crash`, `statement_errors`), crash
+(`crash_recovery`, `restart`, `restart_encrypted`), segurança (`security`,
+`udf_privilege`), concorrência (`concurrency`).
 
 ## Pré-requisito
 
@@ -29,7 +32,7 @@ docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh
 
 Um teste específico (mais rápido ao iterar):
 ```bash
-docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh --do-test=ddl
+docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh ddl statement_atomicity
 ```
 
 ## Contrato de saída
@@ -38,7 +41,7 @@ docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh --do-t
 
 ```json
 {
-  "total": 14, "passed": 0, "failed": 0,
+  "total": 0, "passed": 0, "failed": 0,
   "falhas": [{"teste": "ddl", "diff_resumido": "..."}]
 }
 ```

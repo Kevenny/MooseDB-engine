@@ -63,12 +63,12 @@ fn split_rows() -> usize {
 }
 
 /// Cuts sorted rows into consecutive parts that each fit one column block.
-fn split_series(rows: &[Row]) -> Vec<&[Row]> {
+pub(crate) fn split_series<R: std::borrow::Borrow<Row>>(rows: &[R]) -> Vec<&[R]> {
     let max_rows = split_rows().max(1);
     let mut parts = Vec::new();
     let (mut start, mut bytes) = (0usize, 0usize);
     for (i, r) in rows.iter().enumerate() {
-        let sz: usize = r.iter().map(crate::schema::Value::mem_size).sum();
+        let sz: usize = r.borrow().iter().map(crate::schema::Value::mem_size).sum();
         if i > start && (i - start >= max_rows || bytes + sz > SPLIT_BYTES) {
             parts.push(&rows[start..i]);
             start = i;
@@ -99,7 +99,7 @@ impl Table {
     /// Whether `compact_auto` would do anything (cheap; scheduler use).
     pub(crate) fn compaction_pending(&self, now: i64) -> bool {
         self.lock()
-            .map(|inner| !self.plan(&inner.chunks, now, &|_| true, false, &inner.no_gain).is_empty())
+            .map(|inner| !self.plan(&inner.chunks, now, &|_| true, false, None, &inner.no_gain).is_empty())
             .unwrap_or(false)
     }
 
@@ -109,6 +109,7 @@ impl Table {
         now: i64,
         in_scope: &dyn Fn((i64, i64)) -> bool,
         force: bool,
+        rekey_below: Option<u32>,
         no_gain: &HashSet<Vec<u64>>,
     ) -> Vec<Vec<Arc<ChunkMeta>>> {
         let opts = &self.config.opts;
@@ -128,21 +129,40 @@ impl Table {
                 }
                 let cold = !opts.is_hot(bucket.1, now);
                 let recode = cold && group.iter().any(|c| c.header.codec_id() != opts.cold_codec().id());
-                group.len() >= trigger || (force && group.len() > 1) || recode
+                // OPTIMIZE re-encrypts chunks sealed with an older key version
+                // (rewriting always uses the latest), so old versions can be retired.
+                let rekey = rekey_below
+                    .is_some_and(|v| group.iter().any(|c| c.cipher.as_ref().is_some_and(|k| k.key_version < v)));
+                group.len() >= trigger || (force && group.len() > 1) || recode || rekey
             })
             .map(|(_, g)| g)
             .collect()
     }
 
     fn run_compaction(&self, now: i64, in_scope: impl Fn((i64, i64)) -> bool, force: bool) -> Result<CompactionReport> {
-        let _maint = self.maint.lock().map_err(|_| Error::ReadOnly("maintenance lock poisoned".into()))?;
+        // `maint` guards no data: a panic in an earlier job must not disable
+        // maintenance of this table for good.
+        let _maint = self.maint.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.defunct.load(Ordering::Acquire) {
             return Ok(CompactionReport::default());
         }
+        let rekey_below = match self.config.opts.encryption_key_id {
+            Some(k) if force => match crate::crypto::latest_version(k) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn(&format!(
+                        "{}: cannot re-encrypt chunks with old key versions, latest version of key {k} unavailable: {e}",
+                        self.config.dir.display()
+                    ));
+                    None
+                }
+            },
+            _ => None,
+        };
         let groups = {
             let inner = self.lock()?;
             inner.check_writable()?;
-            self.plan(&inner.chunks, now, &in_scope, force, &inner.no_gain)
+            self.plan(&inner.chunks, now, &in_scope, force, rekey_below, &inner.no_gain)
         };
         let mut report = CompactionReport::default();
         let mut first_error = None;
@@ -199,8 +219,7 @@ impl Table {
             if !ids.iter().all(|i| inner.chunks.iter().any(|c| c.id == *i)) {
                 return Ok(None);
             }
-            let id = inner.manifest.next_chunk_id;
-            inner.manifest.next_chunk_id += 1;
+            let id = inner.reserve_chunk_ids(1)?;
             inner.compacting.extend(ids.iter().copied());
             id
         };
@@ -284,14 +303,7 @@ impl Table {
 
         // Extra ids (rare) come from the shared counter; the first was reserved up front.
         let extra = builders.len() - 1;
-        let first_extra = if extra > 0 {
-            let mut inner = self.lock()?;
-            let n = inner.manifest.next_chunk_id;
-            inner.manifest.next_chunk_id += extra as u64;
-            n
-        } else {
-            0
-        };
+        let first_extra = if extra > 0 { self.lock()?.reserve_chunk_ids(extra as u64)? } else { 0 };
         let mut metas: Vec<ChunkMeta> = Vec::with_capacity(builders.len());
         for (k, b) in builders.into_iter().enumerate() {
             let cid = if k == 0 { id } else { first_extra + (k as u64 - 1) };
@@ -352,6 +364,19 @@ mod tests {
             out.push(r);
         }
         out
+    }
+
+    #[test]
+    fn split_series_keeps_every_part_within_the_block_budget() {
+        // Three rows of ~100 MiB each (never touched, so no memory is used)
+        // cannot share one 256 MiB column block with room to spare.
+        let big = |ts: i64| -> Row { vec![Value::Timestamp(ts), Value::Bytes(vec![0u8; 100 << 20])] };
+        let rows: Vec<Row> = (0..3).map(big).collect();
+        let parts = split_series(&rows);
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.len() == 1));
+        let small: Vec<Row> = (0..1000).map(|i| vec![Value::Timestamp(i), Value::Float64(1.0)]).collect();
+        assert_eq!(split_series(&small).len(), 1);
     }
 
     #[test]
