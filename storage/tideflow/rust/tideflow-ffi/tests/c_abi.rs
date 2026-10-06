@@ -43,6 +43,7 @@ fn config() -> Config {
         column_count: 3,
         column_names: name_ptrs.as_ptr(),
         column_types: types.as_ptr(),
+        encryption_key_id: 0,
     };
     Config { _strings: strings, _name_ptrs: name_ptrs, _types: types, cfg }
 }
@@ -158,9 +159,42 @@ fn end_to_end_through_c_abi() {
     check(unsafe { tideflow_scan_position(scan, pos.as_mut_ptr()) }).unwrap();
     let first_ts = unsafe { (*row.values).data.ts_us };
     check(unsafe { tideflow_scan_next(scan, &mut row, &mut eof) }).unwrap();
-    check(unsafe { tideflow_scan_fetch(scan, pos.as_ptr(), &mut row) }).unwrap();
-    assert_eq!(unsafe { (*row.values).data.ts_us }, first_ts);
+    let mut snap = ptr::null_mut();
+    check(unsafe { tideflow_scan_snapshot(scan, &mut snap) }).unwrap();
     check(unsafe { tideflow_scan_close(scan) }).unwrap();
+    check(unsafe { tideflow_flush(t.0) }).unwrap(); // the snapshot still resolves the position
+    check(unsafe { tideflow_snapshot_fetch(snap, pos.as_ptr(), &mut row) }).unwrap();
+    assert_eq!(unsafe { (*row.values).data.ts_us }, first_ts);
+    check(unsafe { tideflow_snapshot_close(snap) }).unwrap();
+
+    // Series listing (TAG pushdown support).
+    let mut list = ptr::null_mut();
+    check(unsafe { tideflow_series_list(t.0, &mut list) }).unwrap();
+    assert_eq!(unsafe { tideflow_series_list_len(list) }, 2);
+    let mut id = 0u64;
+    check(unsafe { tideflow_series_list_get(list, 1, &mut id, &mut row) }).unwrap();
+    let tag = unsafe { (*row.values).data.str_val };
+    assert_eq!(unsafe { std::slice::from_raw_parts(tag.ptr.cast::<u8>(), tag.len as usize) }, b"srv02");
+    check(unsafe { tideflow_series_list_close(list) }).unwrap();
+    let mut scan = ptr::null_mut();
+    check(unsafe { tideflow_scan_open_filtered(t.0, i64::MIN, i64::MAX, &id, 1, true, &mut scan) }).unwrap();
+    check(unsafe { tideflow_scan_next(scan, &mut row, &mut eof) }).unwrap();
+    assert_eq!(unsafe { (*row.values).data.ts_us }, 3_000_000);
+    check(unsafe { tideflow_scan_next(scan, &mut row, &mut eof) }).unwrap();
+    assert!(eof);
+    check(unsafe { tideflow_scan_close(scan) }).unwrap();
+
+    // Diagnostics.
+    let mut info = ptr::null_mut();
+    let cpath = CString::new(path).unwrap();
+    check(unsafe { tideflow_inspect(cpath.as_ptr(), &mut info) }).unwrap();
+    let ti = unsafe { &*tideflow_info_table(info) };
+    assert!(ti.is_open);
+    assert_eq!(ti.row_count, 3);
+    assert_eq!(unsafe { CStr::from_ptr(ti.chunk_interval) }.to_str().unwrap(), "1 HOUR");
+    assert_eq!(unsafe { tideflow_info_chunk_count(info) }, ti.chunk_count);
+    assert!(unsafe { tideflow_info_chunk(info, 99) }.is_null());
+    unsafe { tideflow_info_close(info) };
 
     let mut bad = u32::MAX;
     check(unsafe { tideflow_check(t.0, &mut bad) }).unwrap();
@@ -202,7 +236,7 @@ fn errors_are_reported_not_panicked() {
     assert_eq!(read_rows(scan, true, 1).unwrap_err().0, TFStatus::TF_ERR_UNSUPPORTED);
     check(unsafe { tideflow_scan_close(scan) }).unwrap();
 
-    assert_eq!(unsafe { tideflow_compact(t.0, 0, 1) }, TFStatus::TF_ERR_UNSUPPORTED);
+    assert_eq!(unsafe { tideflow_compact(t.0, 0, 1) }, TFStatus::TF_OK);
 }
 
 #[test]

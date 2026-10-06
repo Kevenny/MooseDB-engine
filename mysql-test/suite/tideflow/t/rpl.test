@@ -1,0 +1,33 @@
+#
+# Row-based replication of TideFlow tables (spec §13): INSERTs replicate as
+# row events; each replica builds its own chunks.
+#
+--source include/have_binlog_format_row.inc
+--source include/master-slave.inc
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE TABLE r (ts DATETIME(6) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v DOUBLE, INDEX(ts))
+  ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+INSERT INTO r SELECT '2026-01-01' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq / 4 FROM seq_0_to_299;
+INSERT INTO r VALUES ('2026-01-02 00:00:00.123456', 'h9', NULL);
+TRUNCATE TABLE r;
+INSERT INTO r SELECT '2026-01-01' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq / 4 FROM seq_0_to_99;
+SELECT COUNT(*), SUM(v) FROM r;
+
+--sync_slave_with_master
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM r;
+SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_NAME = 'r';
+
+--echo # Row-level UPDATE/DELETE are refused on the master and never replicate
+connection master;
+--error ER_ILLEGAL_HA
+UPDATE r SET v = 0;
+--error ER_ILLEGAL_HA
+DELETE FROM r WHERE host = 'h1';
+--sync_slave_with_master
+SELECT COUNT(*) FROM r;
+
+connection master;
+DROP TABLE r;
+--source include/rpl_end.inc

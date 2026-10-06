@@ -1,119 +1,145 @@
-//! Serialization of a group of series into a sealed chunk file.
+//! Incremental construction of a sealed chunk file.
+//!
+//! Series are added one at a time (already sorted by timestamp); their column
+//! blocks are encoded and compressed immediately, so building a chunk only
+//! holds the *compressed* output plus one series in memory. This is what lets
+//! compaction merge large time buckets.
 
-use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+use crate::block;
 use crate::bytes::{put_i64, put_u32, put_u64};
 use crate::chunk::{
-    chunk_file_name, encode_block, encode_series_entry, flags, BlockRef, ChunkHeader, ChunkMeta, SeriesEntry,
-    FOOTER_MAGIC, HEADER_LEN, VERSION,
+    chunk_file_name, chunk_flags, encode_series_entry, series_offsets, BlockRef, ChunkFile, ChunkHeader, ChunkMeta,
+    SeriesEntry, FOOTER_MAGIC, HEADER_LEN, VERSION,
 };
+use crate::compression::Codec;
+use crate::crypto::CipherParams;
 use crate::error::{invalid, Result};
 use crate::index::bloom::Bloom;
-use crate::index::series::row_tags;
-use crate::schema::{Row, Schema};
+use crate::schema::{Row, Schema, Value};
 
-pub(crate) const BLOOM_FPR: f64 = 0.01;
-
-pub(crate) struct ChunkSpec<'a> {
-    pub id: u64,
-    pub wal_seq: u64,
-    pub bucket: (i64, i64),
-    /// series_id → rows sorted by timestamp. Must not be empty.
-    pub series: &'a BTreeMap<u64, Vec<&'a Row>>,
+pub(crate) struct ChunkBuilder<'a> {
+    schema: &'a Schema,
+    codec: Codec,
+    cipher: Option<CipherParams>,
+    data_start: u64,
+    /// Data section bytes (plaintext until `finish`).
+    data: Vec<u8>,
+    entries: Vec<SeriesEntry>,
+    raw_bytes: u64,
 }
 
-/// Writes the chunk to `<dir>/<name>.tmp`, fsyncs it and renames it into
-/// place. The caller is responsible for syncing the directory and for
-/// publishing the chunk through the MANIFEST.
-pub(crate) fn write_chunk(dir: &Path, schema: &Schema, spec: &ChunkSpec<'_>) -> Result<ChunkMeta> {
-    if spec.series.is_empty() {
-        return Err(invalid("refusing to write an empty chunk"));
+impl<'a> ChunkBuilder<'a> {
+    pub(crate) fn new(schema: &'a Schema, codec: Codec, cipher: Option<CipherParams>) -> ChunkBuilder<'a> {
+        let data_start = (HEADER_LEN + if cipher.is_some() { crate::chunk::ENC_HEADER_LEN } else { 0 }) as u64;
+        ChunkBuilder { schema, codec, cipher, data_start, data: Vec::new(), entries: Vec::new(), raw_bytes: 0 }
     }
-    let mut buf = vec![0u8; HEADER_LEN];
-    let mut entries = Vec::with_capacity(spec.series.len());
-    let mut bloom = Bloom::with_capacity(spec.series.len(), BLOOM_FPR);
-    let (mut ts_min, mut ts_max, mut row_count, mut raw_bytes) = (i64::MAX, i64::MIN, 0u64, 0u64);
 
-    for (&series_id, rows) in spec.series {
-        let Some(first) = rows.first() else { continue };
-        let s_min = schema.row_ts(first);
-        let s_max = rows.last().map_or(s_min, |r| schema.row_ts(r));
+    /// Appends one series. `rows` must be sorted by timestamp and non-empty.
+    pub(crate) fn add_series(&mut self, series_id: u64, tags: &[Value], rows: &[&Row]) -> Result<()> {
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return Err(invalid("empty series"));
+        };
         let n = u32::try_from(rows.len()).map_err(|_| invalid("too many rows in one series chunk"))?;
-        let mut blocks = Vec::with_capacity(schema.data_indices().len());
-        for &col in schema.data_indices() {
-            let (block, raw) = encode_block(schema.columns()[col].ty, rows.iter().map(|r| &r[col]))?;
+        let mut blocks = Vec::with_capacity(self.schema.data_indices().len());
+        let mut column: Vec<&Value> = Vec::with_capacity(rows.len());
+        for &col in self.schema.data_indices() {
+            column.clear();
+            column.extend(rows.iter().map(|r| &r[col]));
+            let b = block::encode(self.schema.columns()[col].ty, &column, self.codec)?;
             blocks.push(BlockRef {
-                offset: buf.len() as u64,
-                len: u32::try_from(block.len()).map_err(|_| invalid("column block exceeds 4GiB"))?,
+                offset: self.data_start + self.data.len() as u64,
+                len: u32::try_from(b.bytes.len()).map_err(|_| invalid("column block exceeds 4GiB"))?,
             });
-            buf.extend_from_slice(&block);
-            raw_bytes += raw as u64;
+            self.data.extend_from_slice(&b.bytes);
+            self.raw_bytes += b.plain_len as u64;
         }
-        bloom.insert(series_id);
-        entries.push(SeriesEntry {
+        self.entries.push(SeriesEntry {
             series_id,
             row_count: n,
-            ts_min: s_min,
-            ts_max: s_max,
-            tags: row_tags(schema, first),
+            ts_min: self.schema.row_ts(first),
+            ts_max: self.schema.row_ts(last),
+            tags: tags.to_vec(),
             blocks,
         });
-        ts_min = ts_min.min(s_min);
-        ts_max = ts_max.max(s_max);
-        row_count += u64::from(n);
+        Ok(())
     }
 
-    let index_offset = buf.len() as u64;
-    put_u64(&mut buf, raw_bytes);
-    put_i64(&mut buf, spec.bucket.0);
-    put_i64(&mut buf, spec.bucket.1);
-    put_u32(&mut buf, entries.len() as u32);
-    for e in &entries {
-        encode_series_entry(&mut buf, e);
+    /// Writes `<dir>/<name>.tmp`, fsyncs it and renames it into place. The
+    /// caller syncs the directory and publishes the chunk via the MANIFEST.
+    pub(crate) fn finish(self, dir: &Path, id: u64, wal_seq: u64, bucket: (i64, i64)) -> Result<ChunkMeta> {
+        if self.entries.is_empty() {
+            return Err(invalid("refusing to write an empty chunk"));
+        }
+        let mut bloom = Bloom::with_capacity(self.entries.len(), crate::settings::get().bloom_fpr());
+        for e in &self.entries {
+            bloom.insert(e.series_id);
+        }
+        let ts_min = self.entries.iter().map(|e| e.ts_min).min().unwrap_or(0);
+        let ts_max = self.entries.iter().map(|e| e.ts_max).max().unwrap_or(0);
+        let row_count: u64 = self.entries.iter().map(|e| u64::from(e.row_count)).sum();
+
+        let start = self.data_start as usize;
+        let mut buf = vec![0u8; start];
+        buf.extend_from_slice(&self.data);
+        let index_offset = buf.len() as u64;
+        put_u64(&mut buf, self.raw_bytes);
+        put_i64(&mut buf, bucket.0);
+        put_i64(&mut buf, bucket.1);
+        put_u32(&mut buf, self.entries.len() as u32);
+        for e in &self.entries {
+            encode_series_entry(&mut buf, e);
+        }
+        let bloom_offset = buf.len() as u64;
+        bloom.encode(&mut buf);
+
+        let header = ChunkHeader {
+            version: VERSION,
+            flags: chunk_flags(self.codec, self.cipher.is_some()),
+            ts_min,
+            ts_max,
+            row_count,
+            series_count: self.entries.len() as u32,
+            column_count: self.schema.columns().len() as u32,
+            chunk_id: id,
+            wal_seq,
+            schema_fingerprint: self.schema.fingerprint(),
+        };
+        buf[..HEADER_LEN].copy_from_slice(&header.encode());
+        if let Some(c) = &self.cipher {
+            buf[HEADER_LEN..start].copy_from_slice(&c.encode());
+            c.apply(&mut buf[start..], 0);
+        }
+        put_u64(&mut buf, index_offset);
+        put_u64(&mut buf, bloom_offset);
+        let file_crc = crc32fast::hash(&buf);
+        put_u32(&mut buf, file_crc);
+        buf.extend_from_slice(FOOTER_MAGIC);
+
+        let name = chunk_file_name(bucket, id);
+        let path = dir.join(&name);
+        let tmp = dir.join(format!("{name}.tmp"));
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+
+        Ok(ChunkMeta {
+            id,
+            file: ChunkFile::new(path),
+            header,
+            bucket,
+            raw_bytes: self.raw_bytes,
+            file_size: buf.len() as u64,
+            series_offsets: series_offsets(&self.entries),
+            series: self.entries,
+            bloom,
+            cipher: self.cipher,
+        })
     }
-    let bloom_offset = buf.len() as u64;
-    bloom.encode(&mut buf);
-
-    let header = ChunkHeader {
-        version: VERSION,
-        flags: flags::SEALED,
-        ts_min,
-        ts_max,
-        row_count,
-        series_count: entries.len() as u32,
-        column_count: schema.columns().len() as u32,
-        chunk_id: spec.id,
-        wal_seq: spec.wal_seq,
-        schema_fingerprint: schema.fingerprint(),
-    };
-    buf[..HEADER_LEN].copy_from_slice(&header.encode());
-    put_u64(&mut buf, index_offset);
-    put_u64(&mut buf, bloom_offset);
-    let file_crc = crc32fast::hash(&buf);
-    put_u32(&mut buf, file_crc);
-    buf.extend_from_slice(FOOTER_MAGIC);
-
-    let name = chunk_file_name(spec.bucket, spec.id);
-    let path = dir.join(&name);
-    let tmp = dir.join(format!("{name}.tmp"));
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&buf)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &path)?;
-
-    Ok(ChunkMeta {
-        id: spec.id,
-        path,
-        header,
-        bucket: spec.bucket,
-        raw_bytes,
-        file_size: buf.len() as u64,
-        series: entries,
-        bloom,
-    })
 }

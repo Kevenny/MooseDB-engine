@@ -38,6 +38,7 @@ impl SeriesIndex {
         self.tags_by_id.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup(&self, tags: &[Value]) -> Option<u64> {
         self.by_key.get(&series_key(tags)).copied()
     }
@@ -77,6 +78,10 @@ impl SeriesIndex {
         self.tags_by_id.insert(id, tags.to_vec());
         self.next_id = self.next_id.max(id + 1);
         Ok(())
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, &[Value])> {
+        self.tags_by_id.iter().map(|(id, t)| (*id, t.as_slice()))
     }
 
     pub(crate) fn clear(&mut self) {

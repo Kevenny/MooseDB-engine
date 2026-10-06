@@ -29,6 +29,15 @@ pub(crate) fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(b);
 }
 
+/// Unsigned LEB128.
+pub(crate) fn put_varint(buf: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        buf.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    buf.push(v as u8);
+}
+
 /// Bounds-checked cursor over a byte slice. Every read that would run past
 /// the end returns `Error::Corrupt` instead of panicking.
 pub(crate) struct ByteReader<'a> {
@@ -85,6 +94,22 @@ impl<'a> ByteReader<'a> {
     pub(crate) fn bytes(&mut self) -> Result<&'a [u8]> {
         let n = self.u32()? as usize;
         self.take(n)
+    }
+
+    pub(crate) fn varint(&mut self) -> Result<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.u8()?;
+            v |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Ok(v);
+            }
+        }
+        Err(corrupt("varint longer than 10 bytes"))
+    }
+
+    pub(crate) fn position(&self) -> usize {
+        self.pos
     }
 }
 

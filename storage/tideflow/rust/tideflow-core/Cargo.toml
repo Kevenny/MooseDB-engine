@@ -1,6 +1,6 @@
 [package]
 name = "tideflow-core"
-description = "TideFlow storage core: WAL, MemTable, chunks, series index"
+description = "TideFlow storage core: WAL, MemTable, chunks, compression, series index"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,17 @@ authors.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+getrandom = "0.2"
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"], optional = true }
+zstd = { version = "0.13", default-features = false, optional = true }
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+
+[features]
+default = ["compression-zstd", "compression-lz4", "encryption"]
+encryption = ["dep:aes", "dep:ctr"]
+compression-zstd = ["dep:zstd"]
+compression-lz4 = ["dep:lz4_flex"]
 
 [dev-dependencies]
 tempfile.workspace = true

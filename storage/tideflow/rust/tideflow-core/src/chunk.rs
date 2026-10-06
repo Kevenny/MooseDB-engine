@@ -1,53 +1,58 @@
-//! On-disk chunk format (`.tfl`).
+//! On-disk chunk format (`.tfl`), version 2.
 //!
 //! ```text
-//! ┌─────────────────────────── Header (64 bytes) ────────────────────────────┐
+//! ┌─────────────────────────── Header (64 bytes, plaintext) ─────────────────┐
 //! │ 0  magic "TFLW"        4  version:u16      6  flags:u16                  │
 //! │ 8  ts_min:i64          16 ts_max:i64       24 row_count:u64              │
 //! │ 32 series_count:u32    36 column_count:u32 40 chunk_id:u64               │
 //! │ 48 wal_seq:u64         56 schema_fp:u32    60 header_crc:u32 (of 0..60)  │
-//! ├──────────────────────────── Data blocks ─────────────────────────────────┤
-//! │ per series, one column block per data (non-tag) column, schema order     │
-//! ├──────────────────────────── Series index ────────────────────────────────┤
-//! │ raw_bytes:u64 bucket_start:i64 bucket_end:i64 series_count:u32           │
-//! │ per series: id:u64 rows:u32 ts_min:i64 ts_max:i64                        │
-//! │             tag_count:u16 tag values (codec)                             │
-//! │             block_count:u16 (offset:u64 len:u32) * block_count          │
-//! ├──────────────────────────── Bloom filter ────────────────────────────────┤
-//! │ hashes:u8 word_count:u32 words:u64*                                      │
-//! ├──────────────────────────── Footer (24 bytes) ───────────────────────────┤
-//! │ index_offset:u64 bloom_offset:u64 file_crc:u32 (of 0..footer) "TFLE"     │
+//! ├────────────── Encryption header (32 bytes, only if ENCRYPTED) ───────────┤
+//! │ key_id:u32 key_version:u32 iv[16] reserved:u32 crc:u32                   │
+//! ├──────────────────── Data blocks  ─┐                                      │
+//! │ column blocks (see `block`)       │ encrypted with AES-256-CTR when      │
+//! ├──────────────────── Series index ─┤ ENCRYPTED; keystream offset 0 is the │
+//! │ raw_bytes:u64 bucket:i64×2 n:u32  │ first byte after the headers         │
+//! │ entries (see below)               │                                      │
+//! ├──────────────────── Bloom filter ─┘                                      │
+//! ├──────────────────────────── Footer (24 bytes, plaintext) ────────────────┤
+//! │ index_offset:u64 bloom_offset:u64 file_crc:u32 "TFLE"                    │
 //! └──────────────────────────────────────────────────────────────────────────┘
+//! series entry := id:u64 rows:u32 ts_min:i64 ts_max:i64
+//!                 tag_count:u16 tag values (codec)
+//!                 block_count:u16 (offset:u64 len:u32)*
 //! ```
 //!
-//! Column block:
-//!
-//! ```text
-//! encoding:u8 compression:u8 raw_len:u32 payload
-//! payload (PLAIN, uncompressed) := null_bitmap[ceil(n/8)] values-of-non-null-rows
-//! ```
+//! `file_crc` covers every byte before it (as stored, i.e. ciphertext), so
+//! CHECK TABLE works without the key. Each block also has its own CRC over
+//! the plaintext, which catches both corruption and a wrong key on read.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::bytes::{put_bytes, put_i64, put_u32, put_u64, put_u8, ByteReader};
-use crate::error::{corrupt, invalid, Result};
+use crate::bytes::{put_i64, put_u32, put_u64, ByteReader};
+use crate::compression::Codec;
+use crate::crypto::{CipherParams, PARAMS_LEN};
+use crate::error::{corrupt, Result};
+use crate::fsutil::remove_if_exists;
 use crate::index::bloom::Bloom;
-use crate::schema::{ColumnType, Value};
+use crate::schema::Value;
 
 pub(crate) const MAGIC: &[u8; 4] = b"TFLW";
 pub(crate) const FOOTER_MAGIC: &[u8; 4] = b"TFLE";
-pub(crate) const VERSION: u16 = 1;
+pub(crate) const VERSION: u16 = 2;
 pub(crate) const HEADER_LEN: usize = 64;
+pub(crate) const ENC_HEADER_LEN: usize = PARAMS_LEN;
 pub(crate) const FOOTER_LEN: usize = 24;
 
 pub mod flags {
     pub const COMPRESSED: u16 = 1 << 0;
     pub const ENCRYPTED: u16 = 1 << 1;
     pub const SEALED: u16 = 1 << 2;
+    /// Bits 8-9: codec the chunk was written with (`compression::CODEC_*`).
+    pub const CODEC_SHIFT: u16 = 8;
+    pub const CODEC_MASK: u16 = 0b11 << CODEC_SHIFT;
 }
-
-const ENCODING_PLAIN: u8 = 0;
-const COMPRESSION_NONE: u8 = 0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkHeader {
@@ -109,10 +114,34 @@ impl ChunkHeader {
             schema_fingerprint: r.u32()?,
         };
         if h.version != VERSION {
-            return Err(corrupt(format!("chunk format version {} not supported", h.version)));
+            return Err(corrupt(format!("chunk format version {} not supported (expected {VERSION})", h.version)));
         }
         Ok(h)
     }
+
+    pub fn codec_id(&self) -> u8 {
+        ((self.flags & flags::CODEC_MASK) >> flags::CODEC_SHIFT) as u8
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.flags & flags::ENCRYPTED != 0
+    }
+
+    /// Offset of the first data block.
+    pub(crate) fn data_start(&self) -> u64 {
+        (HEADER_LEN + if self.is_encrypted() { ENC_HEADER_LEN } else { 0 }) as u64
+    }
+}
+
+pub(crate) fn chunk_flags(codec: Codec, encrypted: bool) -> u16 {
+    let mut f = flags::SEALED | (u16::from(codec.id()) << flags::CODEC_SHIFT);
+    if codec != Codec::None {
+        f |= flags::COMPRESSED;
+    }
+    if encrypted {
+        f |= flags::ENCRYPTED;
+    }
+    f
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,30 +162,90 @@ pub struct SeriesEntry {
     pub blocks: Vec<BlockRef>,
 }
 
+/// Owns a chunk file's lifetime. When a chunk leaves the live set (flush
+/// replaced it, retention expired it, compaction merged it, TRUNCATE) it is
+/// only *marked* obsolete; the file is deleted when the last snapshot that
+/// can still read it lets go. Scans and row positions therefore never see a
+/// file vanish underneath them.
+#[derive(Debug)]
+pub struct ChunkFile {
+    pub(crate) uid: u64,
+    pub path: PathBuf,
+    obsolete: AtomicBool,
+}
+
+impl ChunkFile {
+    pub(crate) fn new(path: PathBuf) -> Arc<ChunkFile> {
+        static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+        Arc::new(ChunkFile { uid: NEXT_UID.fetch_add(1, Ordering::Relaxed), path, obsolete: AtomicBool::new(false) })
+    }
+
+    pub(crate) fn mark_obsolete(&self) {
+        self.obsolete.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ChunkFile {
+    fn drop(&mut self) {
+        crate::cache::forget_file(self.uid);
+        if self.obsolete.load(Ordering::Acquire) {
+            if let Err(e) = remove_if_exists(&self.path) {
+                crate::log::warn(&format!("cannot delete {}: {e}", self.path.display()));
+            }
+        }
+    }
+}
+
 /// Everything about a chunk except its data blocks. Kept in memory for every
 /// live chunk.
 #[derive(Clone, Debug)]
 pub struct ChunkMeta {
     pub id: u64,
-    pub path: PathBuf,
+    pub file: Arc<ChunkFile>,
     pub header: ChunkHeader,
     /// Half-open time bucket `[start, end)` this chunk belongs to.
     pub bucket: (i64, i64),
-    /// Size of the column payloads before compression.
+    /// Size of the column data as plain arrays (before encoding/compression).
     pub raw_bytes: u64,
     pub file_size: u64,
     pub series: Vec<SeriesEntry>,
+    /// Ordinal of the first row of each series entry.
+    pub series_offsets: Vec<u64>,
     pub bloom: Bloom,
+    pub(crate) cipher: Option<CipherParams>,
 }
 
 impl ChunkMeta {
+    pub fn path(&self) -> &Path {
+        &self.file.path
+    }
+
     pub fn file_name(&self) -> String {
-        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        self.file.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     }
 
     pub fn overlaps(&self, lo: i64, hi: i64) -> bool {
         self.header.ts_min <= hi && self.header.ts_max >= lo
     }
+
+    /// Index of the series entry holding row `ordinal`.
+    pub(crate) fn series_for_ordinal(&self, ordinal: u64) -> Option<usize> {
+        let idx = self.series_offsets.partition_point(|&o| o <= ordinal).checked_sub(1)?;
+        let e = self.series.get(idx)?;
+        (ordinal < self.series_offsets[idx] + u64::from(e.row_count)).then_some(idx)
+    }
+}
+
+pub(crate) fn series_offsets(series: &[SeriesEntry]) -> Vec<u64> {
+    let mut acc = 0u64;
+    series
+        .iter()
+        .map(|e| {
+            let o = acc;
+            acc += u64::from(e.row_count);
+            o
+        })
+        .collect()
 }
 
 pub(crate) fn chunk_file_name(bucket: (i64, i64), id: u64) -> String {
@@ -197,76 +286,6 @@ pub(crate) fn decode_series_entry(r: &mut ByteReader<'_>) -> Result<SeriesEntry>
     Ok(SeriesEntry { series_id, row_count, ts_min, ts_max, tags, blocks })
 }
 
-/// Encodes one column of `values` (all of type `ty`) as a PLAIN block.
-/// Returns the block bytes and the raw payload size.
-pub(crate) fn encode_block<'a>(
-    ty: ColumnType,
-    values: impl ExactSizeIterator<Item = &'a Value>,
-) -> Result<(Vec<u8>, usize)> {
-    let n = values.len();
-    let mut nulls = vec![0u8; n.div_ceil(8)];
-    let mut data = Vec::new();
-    for (i, v) in values.enumerate() {
-        match (ty, v) {
-            (_, Value::Null) => {
-                if let Some(byte) = nulls.get_mut(i / 8) {
-                    *byte |= 1 << (i % 8);
-                }
-            }
-            (ColumnType::Timestamp, Value::Timestamp(x)) | (ColumnType::Int64, Value::Int(x)) => put_i64(&mut data, *x),
-            (ColumnType::Float64, Value::Float64(x)) => put_u64(&mut data, x.to_bits()),
-            (ColumnType::Float32, Value::Float32(x)) => put_u32(&mut data, x.to_bits()),
-            (ColumnType::Bool, Value::Bool(x)) => put_u8(&mut data, u8::from(*x)),
-            (ColumnType::Varchar | ColumnType::Decimal, Value::Bytes(b)) => put_bytes(&mut data, b),
-            (ty, v) => return Err(invalid(format!("cannot encode {v:?} in a {ty:?} block"))),
-        }
-    }
-    let raw_len = nulls.len() + data.len();
-    let raw_len_u32 = u32::try_from(raw_len).map_err(|_| invalid("column block exceeds 4GiB"))?;
-    let mut block = Vec::with_capacity(6 + raw_len);
-    put_u8(&mut block, ENCODING_PLAIN);
-    put_u8(&mut block, COMPRESSION_NONE);
-    put_u32(&mut block, raw_len_u32);
-    block.extend_from_slice(&nulls);
-    block.extend_from_slice(&data);
-    Ok((block, raw_len))
-}
-
-/// Decodes a block of `n` values of type `ty`.
-pub(crate) fn decode_block(ty: ColumnType, n: usize, block: &[u8]) -> Result<Vec<Value>> {
-    let mut r = ByteReader::new(block);
-    let encoding = r.u8()?;
-    let compression = r.u8()?;
-    let raw_len = r.u32()? as usize;
-    if encoding != ENCODING_PLAIN || compression != COMPRESSION_NONE {
-        return Err(corrupt(format!("unknown block encoding {encoding}/{compression}")));
-    }
-    if raw_len != r.remaining() {
-        return Err(corrupt("block length mismatch"));
-    }
-    let nulls = r.take(n.div_ceil(8))?;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        if nulls[i / 8] & (1 << (i % 8)) != 0 {
-            out.push(Value::Null);
-            continue;
-        }
-        out.push(match ty {
-            ColumnType::Timestamp => Value::Timestamp(r.i64()?),
-            ColumnType::Int64 => Value::Int(r.i64()?),
-            ColumnType::Float64 => Value::Float64(f64::from_bits(r.u64()?)),
-            ColumnType::Float32 => Value::Float32(f32::from_bits(r.u32()?)),
-            ColumnType::Bool => Value::Bool(r.u8()? != 0),
-            ColumnType::Varchar | ColumnType::Decimal => Value::Bytes(r.bytes()?.to_vec()),
-            ColumnType::Tag => return Err(corrupt("tag column stored as data block")),
-        });
-    }
-    if r.remaining() != 0 {
-        return Err(corrupt("trailing bytes in block"));
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,7 +294,7 @@ mod tests {
     fn header_roundtrip_and_crc() {
         let h = ChunkHeader {
             version: VERSION,
-            flags: flags::SEALED,
+            flags: chunk_flags(Codec::Zstd(3), true),
             ts_min: -5,
             ts_max: 99,
             row_count: 1234,
@@ -286,33 +305,13 @@ mod tests {
             schema_fingerprint: 0xdead_beef,
         };
         let mut b = h.encode();
-        assert_eq!(ChunkHeader::decode(&b).unwrap(), h);
+        let d = ChunkHeader::decode(&b).unwrap();
+        assert_eq!(d, h);
+        assert_eq!(d.codec_id(), crate::compression::CODEC_ZSTD);
+        assert!(d.is_encrypted());
+        assert_eq!(d.data_start(), 96);
         b[9] ^= 1;
         assert!(ChunkHeader::decode(&b).is_err());
-    }
-
-    #[test]
-    fn block_roundtrip_with_nulls() {
-        let vals = vec![Value::Float64(1.5), Value::Null, Value::Float64(-0.0), Value::Null, Value::Float64(f64::MAX)];
-        let (block, raw) = encode_block(ColumnType::Float64, vals.iter()).unwrap();
-        assert_eq!(raw, 1 + 3 * 8);
-        assert_eq!(decode_block(ColumnType::Float64, vals.len(), &block).unwrap(), vals);
-
-        let strs = vec![Value::Bytes(b"a".to_vec()), Value::Bytes(vec![]), Value::Null];
-        let (block, _) = encode_block(ColumnType::Varchar, strs.iter()).unwrap();
-        assert_eq!(decode_block(ColumnType::Varchar, 3, &block).unwrap(), strs);
-    }
-
-    #[test]
-    fn block_type_mismatch_rejected() {
-        assert!(encode_block(ColumnType::Int64, [Value::Float64(1.0)].iter()).is_err());
-    }
-
-    #[test]
-    fn truncated_block_is_corrupt() {
-        let (block, _) = encode_block(ColumnType::Int64, [Value::Int(1), Value::Int(2)].iter()).unwrap();
-        assert!(decode_block(ColumnType::Int64, 2, &block[..block.len() - 1]).is_err());
-        assert!(decode_block(ColumnType::Int64, 3, &block).is_err());
     }
 
     #[test]
@@ -322,5 +321,24 @@ mod tests {
         assert_eq!(parse_chunk_id(&name), Some(42));
         assert_eq!(parse_chunk_id("chunk_x.tfl.corrupt"), None);
         assert_eq!(parse_chunk_id("MANIFEST"), None);
+    }
+
+    #[test]
+    fn obsolete_files_are_deleted_on_last_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.tfl");
+        std::fs::write(&p, b"x").unwrap();
+        let f = ChunkFile::new(p.clone());
+        let reader = f.clone();
+        f.mark_obsolete();
+        drop(f);
+        assert!(p.exists(), "a reader still holds the file");
+        drop(reader);
+        assert!(!p.exists());
+
+        let q = dir.path().join("y.tfl");
+        std::fs::write(&q, b"y").unwrap();
+        drop(ChunkFile::new(q.clone()));
+        assert!(q.exists(), "live files are never deleted");
     }
 }

@@ -4,16 +4,24 @@ Storage engine time-series para MariaDB 11.4+ — handler em C++20, núcleo de
 storage em Rust (`#![forbid(unsafe_code)]`) exposto via C ABI.
 
 * Especificação de produto: [tideflow_engine_spec.md](tideflow_engine_spec.md)
+* Guia do usuário: [docs/user-guide.md](docs/user-guide.md)
 * Arquitetura implementada e divergências da spec: [docs/architecture.md](docs/architecture.md)
 
-## Estado atual (v0.1)
+## Estado atual (v0.2)
 
-Fases 1–9 e 11–12 da spec (§18): WAL com CRC32 e replay, MemTable, chunks
-selados por intervalo de tempo, MANIFEST atômico, recuperação de crash,
-Bloom filter por chunk, scans completos e por intervalo de timestamp
-(`index_read_map`, `ORDER BY ts DESC`), `TRUNCATE`, `CHECK TABLE`, retenção.
+Todas as fases da spec (§18) estão implementadas:
 
-Ainda não: compressão (LZ4/ZSTD), compactação, IS plugins, encryption.
+* WAL com CRC32 e replay, MemTable, chunks por intervalo de tempo, MANIFEST
+  atômico, recuperação de crash (testada com `kill -9`);
+* codificação por tipo (delta-of-delta, Simple8b, Gorilla, RLE) + LZ4 (quente)
+  / ZSTD (frio);
+* scans em streaming, *k-way merge* ordenado para o índice de timestamp,
+  pushdown de filtros por TAG respeitando a collation, Bloom filter por chunk;
+* compactação e retenção (OPTIMIZE, `CALL tideflow_*`, threads de fundo);
+* INSERT concorrente com SELECT (snapshots imutáveis);
+* `INFORMATION_SCHEMA.TIDEFLOW_TABLES` e `TIDEFLOW_CHUNKS`;
+* criptografia AES-256-CTR com chaves do key management do MariaDB;
+* replicação row-based.
 
 ## Build e testes (Docker)
 
@@ -25,7 +33,7 @@ exato do servidor da imagem `mariadb:11.4` (11.4.13).
 docker build -f docker/dev.Dockerfile  -t tideflow-dev  docker/
 docker build -f docker/test.Dockerfile -t tideflow-test docker/
 
-# Rust: testes, clippy, header C
+# Rust: testes, clippy
 docker run --rm -v "$PWD:/work" -v tideflow-cargo:/usr/local/cargo/registry \
   -v tideflow-build:/build -w /work/storage/tideflow/rust tideflow-dev \
   bash -c 'cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings'
@@ -34,14 +42,16 @@ docker run --rm -v "$PWD:/work" -v tideflow-cargo:/usr/local/cargo/registry \
 docker run --rm -v "$PWD:/work" -v tideflow-cargo:/usr/local/cargo/registry \
   -v tideflow-build:/build tideflow-dev bash /work/docker/build-plugin.sh
 
-# Suíte MTR contra o servidor oficial
+# Suíte MTR (14 testes) contra o servidor oficial
 docker run --rm -v "$PWD:/work" tideflow-test bash /work/docker/run-mtr.sh
 ```
 
 ## Instalação
 
-```sql
--- A engine se declara EXPERIMENTAL enquanto estiver em v0.x:
---   plugin_maturity = experimental   (my.cnf)
-INSTALL SONAME 'ha_tideflow';
+```ini
+[mariadb]
+plugin_maturity = experimental   # a engine se declara EXPERIMENTAL em v0.x
+plugin_load_add = ha_tideflow
 ```
+
+Procedures de manutenção (por banco): `SOURCE storage/tideflow/sql/tideflow_install.sql`.

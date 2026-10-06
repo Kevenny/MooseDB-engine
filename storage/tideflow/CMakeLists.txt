@@ -22,6 +22,7 @@ SET(TIDEFLOW_RUST_LIB ${TIDEFLOW_CARGO_TARGET_DIR}/release/libtideflow.a)
 FILE(GLOB_RECURSE TIDEFLOW_RUST_SOURCES CONFIGURE_DEPENDS
   ${TIDEFLOW_RUST_DIR}/tideflow-core/*.rs
   ${TIDEFLOW_RUST_DIR}/tideflow-ffi/src/*.rs
+  ${TIDEFLOW_RUST_DIR}/tideflow-core/src/*/*.rs
   ${TIDEFLOW_RUST_DIR}/*/Cargo.toml)
 
 ADD_CUSTOM_COMMAND(
@@ -59,4 +60,11 @@ IF(TARGET tideflow)
   ENDIF()
   SET_TARGET_PROPERTIES(tideflow PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  # Keep the symbols of the static Rust library (std, zstd, ...) private to
+  # the plugin, so they never interpose with other libraries in mysqld.
+  # Only that library: the server patches the plugin-service pointers from
+  # libmysqlservices.a (my_print_error_service, ...) through dlsym().
+  IF(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    TARGET_LINK_OPTIONS(tideflow PRIVATE "LINKER:--exclude-libs,libtideflow.a")
+  ENDIF()
 ENDIF()

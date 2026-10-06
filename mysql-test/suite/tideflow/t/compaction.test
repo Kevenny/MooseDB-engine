@@ -1,0 +1,71 @@
+#
+# Compaction: OPTIMIZE TABLE, CALL tideflow_compact(), background trigger.
+#
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+--exec $MYSQL test < $TIDEFLOW_INSTALL_SQL
+
+CREATE TABLE c (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts))
+  ENGINE=TideFlow CHUNK_INTERVAL='1 DAY';
+
+--echo # 5 flushes x 3 days: 15 chunks, 5 per day
+--disable_query_log
+let $f= 0;
+while ($f < 5)
+{
+  eval INSERT INTO c SELECT '2025-01-01' + INTERVAL d.seq DAY + INTERVAL ($f * 100 + s.seq) SECOND,
+                            CONCAT('h', s.seq MOD 3), $f * 100 + s.seq
+       FROM seq_0_to_2 d, seq_0_to_99 s;
+  FLUSH TABLES c;
+  inc $f;
+}
+--enable_query_log
+let $chunks= SELECT CHUNKS, COLD_CHUNKS FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'c';
+eval $chunks;
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM c;
+
+--echo # CALL tideflow_compact on one day only
+CALL tideflow_compact('c', '2025-01-02 00:00:00', '2025-01-02 23:59:59');
+eval $chunks;
+SELECT DATE(TS_MIN) AS day, COUNT(*) AS chunks, SUM(`ROWS`) AS row_count
+  FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'c' GROUP BY day ORDER BY day;
+
+--echo # OPTIMIZE TABLE compacts everything
+OPTIMIZE TABLE c;
+eval $chunks;
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM c;
+SELECT host, COUNT(*), MIN(ts), MAX(ts) FROM c WHERE ts < '2025-01-02' GROUP BY host ORDER BY host;
+
+--echo # Background compaction once a bucket reaches the trigger
+SET @old_trigger = @@GLOBAL.tideflow_compaction_trigger_chunks;
+SET GLOBAL tideflow_compaction_trigger_chunks = 3;
+--disable_query_log
+let $f= 0;
+while ($f < 3)
+{
+  eval INSERT INTO c VALUES ('2025-02-01' + INTERVAL $f HOUR, 'h0', $f);
+  FLUSH TABLES c;
+  inc $f;
+}
+--enable_query_log
+--echo # background maintenance works on open tables
+SELECT COUNT(*) FROM c;
+let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.TIDEFLOW_CHUNKS
+                     WHERE TABLE_NAME = 'c' AND TS_MIN >= '2025-02-01';
+--source include/wait_condition.inc
+SELECT COUNT(*) FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'c' AND TS_MIN >= '2025-02-01';
+SET GLOBAL tideflow_compaction_trigger_chunks = @old_trigger;
+SELECT COUNT(*), SUM(v) FROM c;
+
+--echo # Errors
+--error ER_TRUNCATED_WRONG_VALUE
+CALL tideflow_compact('c', 'not a date', NULL);
+--error ER_NO_SUCH_TABLE
+CALL tideflow_compact('no_such_table', NULL, NULL);
+
+DROP TABLE c;
+DROP PROCEDURE tideflow_compact;
+DROP PROCEDURE tideflow_apply_retention;
+DROP FUNCTION tideflow_compact_impl;
+DROP FUNCTION tideflow_retention_impl;

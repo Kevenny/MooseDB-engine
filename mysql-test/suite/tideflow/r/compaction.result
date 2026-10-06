@@ -1,0 +1,59 @@
+CREATE TABLE c (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts))
+ENGINE=TideFlow CHUNK_INTERVAL='1 DAY';
+# 5 flushes x 3 days: 15 chunks, 5 per day
+SELECT CHUNKS, COLD_CHUNKS FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'c';
+CHUNKS	COLD_CHUNKS
+15	15
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM c;
+COUNT(*)	SUM(v)	COUNT(DISTINCT host)
+1500	374250	3
+# CALL tideflow_compact on one day only
+CALL tideflow_compact('c', '2025-01-02 00:00:00', '2025-01-02 23:59:59');
+SELECT CHUNKS, COLD_CHUNKS FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'c';
+CHUNKS	COLD_CHUNKS
+11	11
+SELECT DATE(TS_MIN) AS day, COUNT(*) AS chunks, SUM(`ROWS`) AS row_count
+FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'c' GROUP BY day ORDER BY day;
+day	chunks	row_count
+2025-01-01	5	500
+2025-01-02	1	500
+2025-01-03	5	500
+# OPTIMIZE TABLE compacts everything
+OPTIMIZE TABLE c;
+Table	Op	Msg_type	Msg_text
+test.c	optimize	status	OK
+SELECT CHUNKS, COLD_CHUNKS FROM information_schema.TIDEFLOW_TABLES WHERE TABLE_NAME = 'c';
+CHUNKS	COLD_CHUNKS
+3	3
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM c;
+COUNT(*)	SUM(v)	COUNT(DISTINCT host)
+1500	374250	3
+SELECT host, COUNT(*), MIN(ts), MAX(ts) FROM c WHERE ts < '2025-01-02' GROUP BY host ORDER BY host;
+host	COUNT(*)	MIN(ts)	MAX(ts)
+h0	170	2025-01-01 00:00:00	2025-01-01 00:08:19
+h1	165	2025-01-01 00:00:01	2025-01-01 00:08:17
+h2	165	2025-01-01 00:00:02	2025-01-01 00:08:18
+# Background compaction once a bucket reaches the trigger
+SET @old_trigger = @@GLOBAL.tideflow_compaction_trigger_chunks;
+SET GLOBAL tideflow_compaction_trigger_chunks = 3;
+# background maintenance works on open tables
+SELECT COUNT(*) FROM c;
+COUNT(*)
+1503
+SELECT COUNT(*) FROM information_schema.TIDEFLOW_CHUNKS WHERE TABLE_NAME = 'c' AND TS_MIN >= '2025-02-01';
+COUNT(*)
+1
+SET GLOBAL tideflow_compaction_trigger_chunks = @old_trigger;
+SELECT COUNT(*), SUM(v) FROM c;
+COUNT(*)	SUM(v)
+1503	374253
+# Errors
+CALL tideflow_compact('c', 'not a date', NULL);
+ERROR 22007: Incorrect datetime value: 'not a date' for column ``.``.`ts_from` at row 1504
+CALL tideflow_compact('no_such_table', NULL, NULL);
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+DROP TABLE c;
+DROP PROCEDURE tideflow_compact;
+DROP PROCEDURE tideflow_apply_retention;
+DROP FUNCTION tideflow_compact_impl;
+DROP FUNCTION tideflow_retention_impl;

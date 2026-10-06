@@ -51,6 +51,9 @@ struct tf_layout
   std::vector<tf_column> columns;  /* stored (non-virtual) fields only  */
   uint ts_column= 0;               /* index into `columns`              */
   uint ts_key= MAX_KEY;            /* key on the timestamp column       */
+
+  /* Position of a field among the TAG columns, or -1. */
+  int tag_position(uint field_index) const;
 };
 
 struct tf_table_closer
@@ -61,8 +64,25 @@ struct tf_scan_closer
 {
   void operator()(TideFlowScan *s) const noexcept { tideflow_scan_close(s); }
 };
+struct tf_snapshot_closer
+{
+  void operator()(TideFlowSnapshot *s) const noexcept
+  { tideflow_snapshot_close(s); }
+};
 using tf_table_ptr= std::unique_ptr<TideFlowTable, tf_table_closer>;
 using tf_scan_ptr= std::unique_ptr<TideFlowScan, tf_scan_closer>;
+using tf_snapshot_ptr= std::unique_ptr<TideFlowSnapshot, tf_snapshot_closer>;
+
+/*
+  An equality/IN predicate on a TAG column, pushed down from the WHERE
+  clause: the column must equal one of `values` under collation `cs`.
+*/
+struct tf_tag_predicate
+{
+  int tag_pos;
+  CHARSET_INFO *cs;
+  std::vector<std::string> values;   /* already in cs's character set */
+};
 
 /*
   Per-table state shared by every handler instance of one TABLE_SHARE.
@@ -74,7 +94,6 @@ public:
   THR_LOCK lock;
   tf_table_ptr table;
   tf_layout layout;
-  std::atomic<time_t> last_retention_check{0};
 
   TideFlow_share();
   ~TideFlow_share() override;
@@ -105,6 +124,7 @@ public:
   { return HA_ERR_WRONG_COMMAND; }   /* use RETENTION_PERIOD or TRUNCATE  */
   int delete_all_rows() override;
   int truncate() override;
+  void start_bulk_insert(ha_rows rows, uint flags) override;
   int end_bulk_insert() override;
 
   /* ── Full scans ───────────────────────────────────────────────────── */
@@ -123,6 +143,11 @@ public:
   int index_first(uchar *buf) override;
   int index_last(uchar *buf) override;
   int index_end() override;
+
+  /* ── Condition pushdown (TAG equality / IN) ───────────────────────── */
+  const COND *cond_push(const COND *cond) override;
+  void cond_pop() override;
+  int reset() override;
 
   /* ── Info ─────────────────────────────────────────────────────────── */
   int info(uint flag) override;
@@ -145,7 +170,8 @@ public:
   {
     return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ |
            HA_STATS_RECORDS_IS_EXACT | HA_NO_AUTO_INCREMENT |
-           HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE;
+           HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE |
+           HA_CAN_TABLE_CONDITION_PUSHDOWN;
   }
   ulong index_flags(uint, uint, bool) const override
   {
@@ -158,21 +184,37 @@ public:
   /* ── TideFlow specific ────────────────────────────────────────────── */
   bool tideflow_is_timestamp_column(const Field *field) const;
   int tideflow_force_flush();
+  int tideflow_compact_chunks(longlong from_us, longlong to_us);
 
 private:
   TideFlow_share *get_share();
+  int open_scan(longlong lo, longlong hi, bool sorted);
   int open_range_scan(longlong lo, longlong hi, bool backward, uchar *buf,
                       int not_found_error);
   int read_from_scan(uchar *buf, bool backward, int end_error);
   int fill_record(uchar *buf, const TFRow &row);
   longlong key_to_ts(uint idx, const uchar *key);
   int map_status(TFStatus status);
+  int sync_wal();
+
+  void collect_tag_predicates(const Item *cond,
+                              std::vector<tf_tag_predicate> *out);
+  bool pushed_series(const std::vector<uint64_t> **ids);
 
   THR_LOCK_DATA lock_data_;
   TideFlow_share *share_= nullptr;
   tf_scan_ptr scan_;
+  bool scan_snapshot_saved_= false; /* snapshot of scan_ kept for rnd_pos */
+  std::vector<tf_snapshot_ptr> snapshots_;  /* resolve positions in rnd_pos */
   bool wrote_rows_= false;     /* rows appended since the last WAL sync  */
+  bool in_bulk_insert_= false;
   std::string last_error_;     /* message for get_error_message()        */
   std::vector<String> str_bufs_;
   std::vector<TFValue> values_;
+
+  /* Pushed-down TAG predicates: one entry per cond_push() call. */
+  std::vector<std::vector<tf_tag_predicate>> pushed_;
+  bool pushed_valid_= false;            /* pushed_ids_ is up to date      */
+  bool pushed_filter_= false;           /* some predicate restricts rows  */
+  std::vector<uint64_t> pushed_ids_;    /* series matching all predicates */
 };

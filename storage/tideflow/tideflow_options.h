@@ -28,6 +28,8 @@ struct ha_table_option_struct
   const char *hot_threshold;    /* 'N DAYS' ...                    (default '7 DAYS')  */
   ulonglong memtable_size;      /* bytes; 0 = tideflow_memtable_flush_threshold       */
   const char *timestamp_column; /* NULL = the column of the timestamp index           */
+  bool encryption;              /* ENCRYPTION = YES: AES-256-CTR at rest              */
+  ulonglong encryption_key_id;  /* key id in the key management plugin (default 1)  */
 };
 
 extern ha_create_table_option tideflow_table_option_list[];

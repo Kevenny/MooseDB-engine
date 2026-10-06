@@ -8,10 +8,12 @@
 //! * records a human-readable message retrievable with `tideflow_last_error`.
 //!
 //! Threading: a `TideFlowTable` may be used from many threads concurrently.
-//! A `TideFlowScan` must be used by one thread at a time.
+//! Scans, snapshots, series lists and info handles must be used by one thread
+//! at a time.
 //!
 //! Lifetimes: values returned through `TFRow` (including string pointers) are
-//! owned by the scan and stay valid until the next call on that scan.
+//! owned by the handle that produced them and stay valid until the next call
+//! on that handle.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -21,9 +23,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
+use tideflow_core::compression::Codec;
+use tideflow_core::inspect::{ChunkStatus, TableInfo};
 use tideflow_core::{
-    Column, ColumnType, Error, Position, RawOptions, Row, Scan, ScanFilter, Schema, Table, TableConfig, Value,
-    POSITION_LEN,
+    crypto, maintenance, settings, Column, ColumnType, Error, Position, RawOptions, Row, Scan, ScanFilter, Schema,
+    Snapshot, Table, TableConfig, Value, POSITION_LEN,
 };
 
 /// Size in bytes of a row position (`handler::ref_length`).
@@ -45,7 +49,7 @@ pub enum TFStatus {
     TF_ERR_READONLY = 7,
     /// A Rust panic was caught at the boundary.
     TF_ERR_INTERNAL = 8,
-    /// The operation is declared but not implemented yet.
+    /// The operation or feature is not available.
     TF_ERR_UNSUPPORTED = 9,
 }
 
@@ -119,6 +123,65 @@ pub struct TFTableConfig {
     pub column_names: *const *const c_char,
     /// `column_count` `TFColumnType` codes.
     pub column_types: *const u8,
+    /// Key id for encryption at rest; 0 = not encrypted.
+    pub encryption_key_id: u32,
+}
+
+/// Process-wide tunables (the `tideflow_*` system variables).
+#[repr(C)]
+pub struct TFGlobalSettings {
+    pub retention_check_interval_secs: u64,
+    pub compaction_trigger_chunks: u32,
+    pub bloom_filter_false_positive_rate: f64,
+    pub chunk_cache_bytes: u64,
+    pub max_open_chunks: u32,
+}
+
+/// Fetches an encryption key from the server. `version == 0` asks for the
+/// latest version. Writes the version used to `*out_version` and the 32-byte
+/// key to `out_key`. Returns 0 on success.
+pub type TFKeyCallback =
+    Option<unsafe extern "C" fn(key_id: u32, version: u32, out_version: *mut u32, out_key: *mut u8) -> i32>;
+
+/// Table-level diagnostics (INFORMATION_SCHEMA.TIDEFLOW_TABLES). Strings are
+/// owned by the `TideFlowInfo` handle.
+#[repr(C)]
+pub struct TFTableInfo {
+    pub is_open: bool,
+    pub encrypted: bool,
+    pub row_count: u64,
+    pub pending_rows: u64,
+    pub series_count: u64,
+    pub data_bytes: u64,
+    pub compressed_bytes: u64,
+    pub chunk_count: u32,
+    pub hot_chunks: u32,
+    pub warm_chunks: u32,
+    pub cold_chunks: u32,
+    pub compacting_chunks: u32,
+    pub expired_chunks: u32,
+    pub chunk_interval: *const c_char,
+    pub retention_period: *const c_char,
+    pub compression: *const c_char,
+}
+
+/// One chunk (INFORMATION_SCHEMA.TIDEFLOW_CHUNKS).
+#[repr(C)]
+pub struct TFChunkInfo {
+    pub chunk_id: u64,
+    pub ts_min_us: i64,
+    pub ts_max_us: i64,
+    pub rows: u64,
+    pub series: u32,
+    pub data_bytes: u64,
+    pub compressed_bytes: u64,
+    pub sealed_at_us: i64,
+    pub encrypted: bool,
+    /// "HOT", "WARM", "COLD", "COMPACTING" or "EXPIRED".
+    pub status: *const c_char,
+    /// "NONE", "LZ4" or "ZSTD".
+    pub compression: *const c_char,
+    pub file_name: *const c_char,
 }
 
 /// Opaque table handle.
@@ -126,13 +189,56 @@ pub struct TideFlowTable {
     table: Arc<Table>,
 }
 
+/// Buffers that keep a `TFRow` valid between calls.
+struct RowOut {
+    current: Row,
+    out: Vec<TFValue>,
+}
+
+impl RowOut {
+    fn new() -> RowOut {
+        RowOut { current: Vec::new(), out: Vec::new() }
+    }
+
+    fn publish(&mut self, row: Row, types: impl Iterator<Item = ColumnType>, dst: &mut TFRow) {
+        self.current = row;
+        self.out = self.current.iter().zip(types).map(|(v, t)| value_to_c(v, t)).collect();
+        dst.col_count = self.out.len() as u32;
+        dst.values = self.out.as_mut_ptr();
+    }
+}
+
+fn clear_row(dst: &mut TFRow) {
+    dst.col_count = 0;
+    dst.values = ptr::null_mut();
+}
+
 /// Opaque scan handle.
 pub struct TideFlowScan {
-    table: Arc<Table>,
     scan: Scan,
-    current: Row,
+    types: Vec<ColumnType>,
     position: Option<Position>,
-    out: Vec<TFValue>,
+    row: RowOut,
+}
+
+/// Opaque snapshot handle: resolves row positions (`rnd_pos`).
+pub struct TideFlowSnapshot {
+    snap: Arc<Snapshot>,
+    types: Vec<ColumnType>,
+    row: RowOut,
+}
+
+/// Opaque list of the series of a table.
+pub struct TideFlowSeriesList {
+    items: Vec<(u64, Vec<Value>)>,
+    row: RowOut,
+}
+
+/// Opaque diagnostics handle.
+pub struct TideFlowInfo {
+    table: TFTableInfo,
+    chunks: Vec<TFChunkInfo>,
+    _strings: Vec<CString>,
 }
 
 // ─── error plumbing ──────────────────────────────────────────────────────────
@@ -160,6 +266,14 @@ fn status_of(e: &Error) -> TFStatus {
     }
 }
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
 fn guard(f: impl FnOnce() -> Result<(), Error>) -> TFStatus {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => TFStatus::TF_OK,
@@ -168,12 +282,7 @@ fn guard(f: impl FnOnce() -> Result<(), Error>) -> TFStatus {
             status_of(&e)
         }
         Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".into());
-            set_last_error(&format!("internal error (panic): {msg}"));
+            set_last_error(&format!("internal error (panic): {}", panic_message(payload.as_ref())));
             TFStatus::TF_ERR_INTERNAL
         }
     }
@@ -254,6 +363,7 @@ unsafe fn config_from_c(name: *const c_char, config: *const TFTableConfig) -> Re
             compression_level: cfg.compression_level,
             hot_threshold: opt_str(cfg.hot_threshold, "hot_threshold")?,
             memtable_size_bytes: cfg.memtable_size_bytes,
+            encryption_key_id: (cfg.encryption_key_id != 0).then_some(cfg.encryption_key_id),
         };
         TableConfig::new(dir, schema, &raw)
     }
@@ -298,47 +408,99 @@ fn value_to_c(v: &Value, ty: ColumnType) -> TFValue {
     TFValue { kind, is_null, data }
 }
 
-impl TideFlowScan {
-    fn new(table: Arc<Table>, scan: Scan) -> TideFlowScan {
-        TideFlowScan { table, scan, current: Vec::new(), position: None, out: Vec::new() }
-    }
-
-    /// Publishes `next` through `out`, keeping the backing storage alive in `self`.
-    fn emit(&mut self, next: Option<(Position, Row)>, out: &mut TFRow, end: &mut bool) {
-        match next {
-            None => {
-                *end = true;
-                self.position = None;
-                out.col_count = 0;
-                out.values = ptr::null_mut();
-            }
-            Some((pos, row)) => {
-                *end = false;
-                self.current = row;
-                self.position = Some(pos);
-                let cols = self.table.schema().columns();
-                self.out = self.current.iter().zip(cols).map(|(v, c)| value_to_c(v, c.ty)).collect();
-                out.col_count = self.out.len() as u32;
-                out.values = self.out.as_mut_ptr();
-            }
-        }
-    }
-}
-
 fn table_ref<'a>(t: *const TideFlowTable) -> Result<&'a TideFlowTable, Error> {
-    // SAFETY: handles come from `tideflow_table_open` and stay valid until
-    // `tideflow_table_close`, per the API contract.
+    // SAFETY: handles come from `tideflow_table_open`/`_lookup` and stay valid
+    // until `tideflow_table_close`, per the API contract.
     unsafe { t.as_ref() }.ok_or_else(|| invalid("table handle is NULL"))
 }
 
-fn scan_mut<'a>(s: *mut TideFlowScan) -> Result<&'a mut TideFlowScan, Error> {
-    // SAFETY: as `table_ref`; scans are used by one thread at a time.
-    unsafe { s.as_mut() }.ok_or_else(|| invalid("scan handle is NULL"))
+fn handle_mut<'a, T>(p: *mut T, what: &str) -> Result<&'a mut T, Error> {
+    // SAFETY: the caller passes a valid handle or out-parameter, or NULL.
+    unsafe { p.as_mut() }.ok_or_else(|| invalid(&format!("{what} is NULL")))
 }
 
-fn out_mut<'a, T>(p: *mut T, what: &str) -> Result<&'a mut T, Error> {
-    // SAFETY: the caller passes a valid, writable out-parameter or NULL.
-    unsafe { p.as_mut() }.ok_or_else(|| invalid(&format!("{what} is NULL")))
+fn handle_ref<'a, T>(p: *const T, what: &str) -> Result<&'a T, Error> {
+    // SAFETY: as `handle_mut`, read-only.
+    unsafe { p.as_ref() }.ok_or_else(|| invalid(&format!("{what} is NULL")))
+}
+
+fn read_position(pos: *const u8) -> Result<Position, Error> {
+    let bytes = handle_ref(pos.cast::<[u8; POSITION_LEN]>(), "pos")?;
+    Ok(Position::from_bytes(bytes))
+}
+
+/// Takes back ownership of a boxed handle and drops it. NULL is ignored.
+fn release<T>(p: *mut T) {
+    if !p.is_null() {
+        // SAFETY: produced by `Box::into_raw` in this library, released once.
+        drop(unsafe { Box::from_raw(p) });
+    }
+}
+
+// ─── global configuration ────────────────────────────────────────────────────
+
+/// Applies the `tideflow_*` system variables. Safe to call at any time.
+///
+/// # Safety
+/// `s` must point to a valid `TFGlobalSettings`.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_set_globals(s: *const TFGlobalSettings) -> TFStatus {
+    guard(|| {
+        let s = handle_ref(s, "settings")?;
+        let g = settings::get();
+        g.set_retention_check_interval_secs(s.retention_check_interval_secs);
+        g.set_compaction_trigger_chunks(s.compaction_trigger_chunks);
+        g.set_bloom_fpr(s.bloom_filter_false_positive_rate);
+        g.set_chunk_cache_bytes(s.chunk_cache_bytes);
+        g.set_max_open_chunks(s.max_open_chunks);
+        Ok(())
+    })
+}
+
+/// Installs (or, with NULL, removes) the encryption key provider.
+#[no_mangle]
+pub extern "C" fn tideflow_set_key_callback(cb: TFKeyCallback) -> TFStatus {
+    guard(|| {
+        let provider: Option<Arc<crypto::KeyProvider>> = cb.map(|f| {
+            let p: Arc<crypto::KeyProvider> = Arc::new(move |key_id: u32, version: Option<u32>| {
+                let mut out_version = 0u32;
+                let mut key = [0u8; crypto::KEY_LEN];
+                // SAFETY: the callback contract: writes one u32 and KEY_LEN bytes.
+                let rc = unsafe { f(key_id, version.unwrap_or(0), &mut out_version, key.as_mut_ptr()) };
+                if rc == 2 {
+                    return Err(Error::InvalidArg(format!("encryption key {key_id} is not a 256-bit key")));
+                }
+                if rc != 0 {
+                    return Err(Error::NotFound(format!(
+                        "encryption key {key_id} (version {}) is not available",
+                        version.map_or("latest".to_string(), |v| v.to_string())
+                    )));
+                }
+                Ok((out_version, key))
+            });
+            p
+        });
+        crypto::set_key_provider(provider);
+        Ok(())
+    })
+}
+
+/// Starts the background maintenance pool (retention, compaction).
+#[no_mangle]
+pub extern "C" fn tideflow_maintenance_start(threads: u32) -> TFStatus {
+    guard(|| {
+        maintenance::start(threads as usize);
+        Ok(())
+    })
+}
+
+/// Stops the background maintenance pool, waiting for running jobs.
+#[no_mangle]
+pub extern "C" fn tideflow_maintenance_stop() -> TFStatus {
+    guard(|| {
+        maintenance::stop();
+        Ok(())
+    })
 }
 
 // ─── table lifecycle ─────────────────────────────────────────────────────────
@@ -356,8 +518,8 @@ pub unsafe extern "C" fn tideflow_table_create(name: *const c_char, config: *con
     })
 }
 
-/// Opens a table (running crash recovery). On success `*out_table` receives a
-/// handle to release with `tideflow_table_close`.
+/// Opens a table (running crash recovery) or attaches to the instance already
+/// open in this process. Release the handle with `tideflow_table_close`.
 ///
 /// # Safety
 /// As `tideflow_table_create`; `out_table` must be writable.
@@ -368,21 +530,39 @@ pub unsafe extern "C" fn tideflow_table_open(
     out_table: *mut *mut TideFlowTable,
 ) -> TFStatus {
     guard(|| {
-        let out = out_mut(out_table, "out_table")?;
+        let out = handle_mut(out_table, "out_table")?;
         *out = ptr::null_mut();
         // SAFETY: caller contract.
         let cfg = unsafe { config_from_c(name, config) }?;
-        let table = Table::open(cfg)?;
-        *out = Box::into_raw(Box::new(TideFlowTable { table: Arc::new(table) }));
+        let table = maintenance::open_shared(cfg)?;
+        *out = Box::into_raw(Box::new(TideFlowTable { table }));
         Ok(())
     })
 }
 
-/// Releases a table handle. Pending WAL data is flushed to the OS.
+/// Handle to the table at `path` if it is open in this process
+/// (`TF_ERR_NOT_FOUND` otherwise). Release with `tideflow_table_close`.
 ///
 /// # Safety
-/// `table` must come from `tideflow_table_open` and not be used afterwards.
-/// Every scan opened on it should be closed first.
+/// `path` must be NUL-terminated; `out_table` writable.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_table_lookup(path: *const c_char, out_table: *mut *mut TideFlowTable) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_table, "out_table")?;
+        *out = ptr::null_mut();
+        // SAFETY: caller contract.
+        let p = unsafe { req_str(path, "path") }?;
+        let table = maintenance::lookup(p.as_ref()).ok_or_else(|| Error::NotFound(format!("{p} is not open")))?;
+        *out = Box::into_raw(Box::new(TideFlowTable { table }));
+        Ok(())
+    })
+}
+
+/// Releases a table handle; pending WAL data is flushed to the OS. The table
+/// itself closes when its last handle (and background job) is gone.
+///
+/// # Safety
+/// `table` must come from `tideflow_table_open`/`_lookup` and not be used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn tideflow_table_close(table: *mut TideFlowTable) -> TFStatus {
     guard(|| {
@@ -427,8 +607,7 @@ pub unsafe extern "C" fn tideflow_table_rename(from: *const c_char, to: *const c
 pub unsafe extern "C" fn tideflow_write_row(table: *mut TideFlowTable, row: *const TFRow) -> TFStatus {
     guard(|| {
         let t = table_ref(table)?;
-        // SAFETY: caller contract.
-        let row = unsafe { row.as_ref() }.ok_or_else(|| invalid("row is NULL"))?;
+        let row = handle_ref(row, "row")?;
         // SAFETY: caller contract.
         let values = unsafe { slice(row.values, row.col_count as usize, "row values") }?;
         let cols = t.table.schema().columns();
@@ -482,11 +661,12 @@ fn open_scan(
     out_scan: *mut *mut TideFlowScan,
 ) -> TFStatus {
     guard(|| {
-        let out = out_mut(out_scan, "out_scan")?;
+        let out = handle_mut(out_scan, "out_scan")?;
         *out = ptr::null_mut();
         let t = table_ref(table)?;
         let scan = t.table.scan(filter, sorted)?;
-        *out = Box::into_raw(Box::new(TideFlowScan::new(t.table.clone(), scan)));
+        let types = t.table.schema().columns().iter().map(|c| c.ty).collect();
+        *out = Box::into_raw(Box::new(TideFlowScan { scan, types, position: None, row: RowOut::new() }));
         Ok(())
     })
 }
@@ -533,6 +713,53 @@ pub unsafe extern "C" fn tideflow_range_scan_open(
     open_scan(table, &filter, true, out_scan)
 }
 
+/// General scan: timestamp range, optional series restriction
+/// (`series_count < 0` = all series), unordered or timestamp-ordered.
+///
+/// # Safety
+/// `series_ids` must hold `series_count` elements when `series_count > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_scan_open_filtered(
+    table: *mut TideFlowTable,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    series_ids: *const u64,
+    series_count: i64,
+    sorted: bool,
+    out_scan: *mut *mut TideFlowScan,
+) -> TFStatus {
+    let mut filter = ScanFilter::range(ts_start_us, ts_end_us);
+    if series_count >= 0 {
+        // SAFETY: caller contract.
+        match unsafe { slice(series_ids, series_count as usize, "series_ids") } {
+            Ok(ids) => filter.series = Some(ids.to_vec()),
+            Err(e) => return guard(|| Err(e)),
+        }
+    }
+    open_scan(table, &filter, sorted, out_scan)
+}
+
+fn step(scan: *mut TideFlowScan, out_row: *mut TFRow, out_end: *mut bool, backward: bool) -> TFStatus {
+    guard(|| {
+        let s = handle_mut(scan, "scan")?;
+        let (row, end) = (handle_mut(out_row, "out_row")?, handle_mut(out_end, "out_end")?);
+        let next = if backward { s.scan.prev_row()? } else { s.scan.next_row()? };
+        match next {
+            None => {
+                *end = true;
+                s.position = None;
+                clear_row(row);
+            }
+            Some((pos, r)) => {
+                *end = false;
+                s.position = Some(pos);
+                s.row.publish(r, s.types.iter().copied(), row);
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Advances the scan. At the end, `*out_eof` is set and `out_row` emptied.
 ///
 /// # Safety
@@ -543,16 +770,10 @@ pub unsafe extern "C" fn tideflow_scan_next(
     out_row: *mut TFRow,
     out_eof: *mut bool,
 ) -> TFStatus {
-    guard(|| {
-        let s = scan_mut(scan)?;
-        let (row, eof) = (out_mut(out_row, "out_row")?, out_mut(out_eof, "out_eof")?);
-        let next = s.scan.next_row()?;
-        s.emit(next, row, eof);
-        Ok(())
-    })
+    step(scan, out_row, out_eof, false)
 }
 
-/// Steps backwards (range scans only). Before the first row, `*out_bof` is set.
+/// Steps backwards (sorted scans only). Before the first row, `*out_bof` is set.
 ///
 /// # Safety
 /// As `tideflow_scan_next`.
@@ -562,22 +783,16 @@ pub unsafe extern "C" fn tideflow_scan_prev(
     out_row: *mut TFRow,
     out_bof: *mut bool,
 ) -> TFStatus {
-    guard(|| {
-        let s = scan_mut(scan)?;
-        let (row, bof) = (out_mut(out_row, "out_row")?, out_mut(out_bof, "out_bof")?);
-        let prev = s.scan.prev_row()?;
-        s.emit(prev, row, bof);
-        Ok(())
-    })
+    step(scan, out_row, out_bof, true)
 }
 
-/// Positions a range scan after its last row (for `index_last`).
+/// Positions a sorted scan after its last row (for `index_last`).
 ///
 /// # Safety
 /// `scan` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn tideflow_scan_seek_end(scan: *mut TideFlowScan) -> TFStatus {
-    guard(|| scan_mut(scan)?.scan.seek_end())
+    guard(|| handle_mut(scan, "scan")?.scan.seek_end())
 }
 
 /// Writes the `TF_POSITION_LEN`-byte position of the row last returned.
@@ -587,58 +802,158 @@ pub unsafe extern "C" fn tideflow_scan_seek_end(scan: *mut TideFlowScan) -> TFSt
 #[no_mangle]
 pub unsafe extern "C" fn tideflow_scan_position(scan: *mut TideFlowScan, out_pos: *mut u8) -> TFStatus {
     guard(|| {
-        let s = scan_mut(scan)?;
+        let s = handle_mut(scan, "scan")?;
         let pos = s.position.ok_or_else(|| invalid("no current row"))?;
-        let out = out_mut(out_pos.cast::<[u8; POSITION_LEN]>(), "out_pos")?;
-        *out = pos.to_bytes();
+        *handle_mut(out_pos.cast::<[u8; POSITION_LEN]>(), "out_pos")? = pos.to_bytes();
         Ok(())
     })
 }
 
-/// Re-reads the row at `pos` into `out_row` (handler `rnd_pos`). The scan's
-/// current row becomes that row.
+/// Returns a handle on the snapshot the scan reads, which resolves the
+/// positions of its rows even after the scan is closed.
 ///
 /// # Safety
-/// `pos` must point to `TF_POSITION_LEN` readable bytes.
+/// `scan` must be valid; `out_snapshot` writable.
 #[no_mangle]
-pub unsafe extern "C" fn tideflow_scan_fetch(scan: *mut TideFlowScan, pos: *const u8, out_row: *mut TFRow) -> TFStatus {
+pub unsafe extern "C" fn tideflow_scan_snapshot(
+    scan: *mut TideFlowScan,
+    out_snapshot: *mut *mut TideFlowSnapshot,
+) -> TFStatus {
     guard(|| {
-        let s = scan_mut(scan)?;
-        // SAFETY: caller contract.
-        let pos = unsafe { pos.cast::<[u8; POSITION_LEN]>().as_ref() }.ok_or_else(|| invalid("pos is NULL"))?;
-        let pos = Position::from_bytes(pos);
-        let row = s.table.fetch(pos)?;
-        let out = out_mut(out_row, "out_row")?;
-        let mut end = false;
-        s.emit(Some((pos, row)), out, &mut end);
+        let out = handle_mut(out_snapshot, "out_snapshot")?;
+        *out = ptr::null_mut();
+        let s = handle_mut(scan, "scan")?;
+        let snap = s.scan.snapshot().clone();
+        *out = Box::into_raw(Box::new(TideFlowSnapshot { snap, types: s.types.clone(), row: RowOut::new() }));
         Ok(())
     })
 }
 
 /// # Safety
-/// `scan` must come from a `*_scan_open` call and not be used afterwards.
+/// `scan` must come from a `*_scan_open*` call and not be used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn tideflow_scan_close(scan: *mut TideFlowScan) -> TFStatus {
     guard(|| {
-        if !scan.is_null() {
-            // SAFETY: ownership is transferred back from C, exactly once.
-            drop(unsafe { Box::from_raw(scan) });
-        }
+        release(scan);
+        Ok(())
+    })
+}
+
+/// Identifies the table contents the snapshot shows: equal versions mean
+/// identical snapshots.
+///
+/// # Safety
+/// `snapshot` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_snapshot_version(snapshot: *const TideFlowSnapshot) -> u64 {
+    handle_ref(snapshot, "snapshot").map_or(0, |s| s.snap.version())
+}
+
+/// Re-reads the row at `pos` (handler `rnd_pos`). `TF_ERR_NOT_FOUND` if the
+/// snapshot does not cover that position.
+///
+/// # Safety
+/// `pos` must point to `TF_POSITION_LEN` readable bytes; `out_row` writable.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_snapshot_fetch(
+    snapshot: *mut TideFlowSnapshot,
+    pos: *const u8,
+    out_row: *mut TFRow,
+) -> TFStatus {
+    guard(|| {
+        let s = handle_mut(snapshot, "snapshot")?;
+        let row = s.snap.fetch(read_position(pos)?)?;
+        s.row.publish(row, s.types.iter().copied(), handle_mut(out_row, "out_row")?);
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `snapshot` must come from `tideflow_scan_snapshot` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_snapshot_close(snapshot: *mut TideFlowSnapshot) -> TFStatus {
+    guard(|| {
+        release(snapshot);
+        Ok(())
+    })
+}
+
+// ─── series ──────────────────────────────────────────────────────────────────
+
+/// Lists every series of the table (for TAG predicate pushdown).
+///
+/// # Safety
+/// `table` must be valid; `out_list` writable.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_series_list(
+    table: *mut TideFlowTable,
+    out_list: *mut *mut TideFlowSeriesList,
+) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_list, "out_list")?;
+        *out = ptr::null_mut();
+        let items = table_ref(table)?.table.series()?;
+        *out = Box::into_raw(Box::new(TideFlowSeriesList { items, row: RowOut::new() }));
+        Ok(())
+    })
+}
+
+/// Number of series in the list.
+///
+/// # Safety
+/// `list` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_series_list_len(list: *const TideFlowSeriesList) -> u64 {
+    handle_ref(list, "list").map_or(0, |l| l.items.len() as u64)
+}
+
+/// Series `index`: its id and its TAG values (in table TAG-column order).
+///
+/// # Safety
+/// `list` must be valid; `out_id`, `out_tags` writable.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_series_list_get(
+    list: *mut TideFlowSeriesList,
+    index: u64,
+    out_id: *mut u64,
+    out_tags: *mut TFRow,
+) -> TFStatus {
+    guard(|| {
+        let l = handle_mut(list, "list")?;
+        let (id, tags) = l
+            .items
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .cloned()
+            .ok_or_else(|| invalid("series index out of range"))?;
+        *handle_mut(out_id, "out_id")? = id;
+        let n = tags.len();
+        l.row.publish(tags, std::iter::repeat(ColumnType::Tag).take(n), handle_mut(out_tags, "out_tags")?);
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `list` must come from `tideflow_series_list` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_series_list_close(list: *mut TideFlowSeriesList) -> TFStatus {
+    guard(|| {
+        release(list);
         Ok(())
     })
 }
 
 // ─── maintenance ─────────────────────────────────────────────────────────────
 
-/// Merges chunks in a time range. Not implemented yet: returns `TF_ERR_UNSUPPORTED`.
+/// Merges the chunks of every time bucket overlapping `[ts_start_us,
+/// ts_end_us]` and re-encodes cold chunks with the cold codec.
 ///
 /// # Safety
 /// `table` must be a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn tideflow_compact(table: *mut TideFlowTable, ts_start_us: i64, ts_end_us: i64) -> TFStatus {
     guard(|| {
-        table_ref(table)?;
-        Err(Error::Unsupported(format!("compaction of [{ts_start_us}, {ts_end_us}] is not implemented yet")))
+        table_ref(table)?.table.compact(ts_start_us, ts_end_us, tideflow_core::time::now_micros())?;
+        Ok(())
     })
 }
 
@@ -659,7 +974,7 @@ pub unsafe extern "C" fn tideflow_apply_retention(table: *mut TideFlowTable) -> 
 #[no_mangle]
 pub unsafe extern "C" fn tideflow_check(table: *mut TideFlowTable, out_bad_chunks: *mut u32) -> TFStatus {
     guard(|| {
-        let out = out_mut(out_bad_chunks, "out_bad_chunks")?;
+        let out = handle_mut(out_bad_chunks, "out_bad_chunks")?;
         let problems = table_ref(table)?.table.check()?;
         *out = problems.len() as u32;
         if !problems.is_empty() {
@@ -717,10 +1032,108 @@ pub unsafe extern "C" fn tideflow_estimate_rows(
     out_rows: *mut u64,
 ) -> TFStatus {
     guard(|| {
-        let out = out_mut(out_rows, "out_rows")?;
+        let out = handle_mut(out_rows, "out_rows")?;
         *out = table_ref(table)?.table.estimate_rows(ts_start_us, ts_end_us)?;
         Ok(())
     })
+}
+
+fn build_info(info: TableInfo) -> Result<TideFlowInfo, Error> {
+    let mut strings = Vec::new();
+    let mut keep = |s: &str| -> *const c_char {
+        let c = CString::new(s.replace('\0', " ")).unwrap_or_default();
+        let p = c.as_ptr();
+        strings.push(c);
+        p
+    };
+    let opts = info.options.as_ref();
+    let table = TFTableInfo {
+        is_open: info.is_open,
+        encrypted: opts.is_some_and(|o| o.encryption_key_id.is_some()),
+        row_count: info.row_count,
+        pending_rows: info.pending_rows,
+        series_count: info.series_count,
+        data_bytes: info.data_bytes,
+        compressed_bytes: info.file_bytes,
+        chunk_count: info.chunks.len() as u32,
+        hot_chunks: info.count(ChunkStatus::Hot),
+        warm_chunks: info.count(ChunkStatus::Warm),
+        cold_chunks: info.count(ChunkStatus::Cold),
+        compacting_chunks: info.count(ChunkStatus::Compacting),
+        expired_chunks: info.count(ChunkStatus::Expired),
+        chunk_interval: keep(opts.map_or("", |o| o.chunk_interval_text.as_str())),
+        retention_period: keep(opts.map_or("", |o| o.retention_text.as_str())),
+        compression: keep(opts.map_or("", |o| o.compression_name())),
+    };
+    let chunks = info
+        .chunks
+        .iter()
+        .map(|c| TFChunkInfo {
+            chunk_id: c.id,
+            ts_min_us: c.ts_min,
+            ts_max_us: c.ts_max,
+            rows: c.rows,
+            series: c.series,
+            data_bytes: c.data_bytes,
+            compressed_bytes: c.file_bytes,
+            sealed_at_us: c.sealed_at,
+            encrypted: c.encrypted,
+            status: keep(c.status.name()),
+            compression: keep(Codec::name_of(c.codec)),
+            file_name: keep(&c.file_name),
+        })
+        .collect();
+    Ok(TideFlowInfo { table, chunks, _strings: strings })
+}
+
+/// Describes the table stored at `path` (open or not) for diagnostics.
+///
+/// # Safety
+/// `path` must be NUL-terminated; `out_info` writable.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_inspect(path: *const c_char, out_info: *mut *mut TideFlowInfo) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_info, "out_info")?;
+        *out = ptr::null_mut();
+        // SAFETY: caller contract.
+        let p = unsafe { req_str(path, "path") }?;
+        let info = tideflow_core::inspect::inspect(p.as_ref(), tideflow_core::time::now_micros())?;
+        *out = Box::into_raw(Box::new(build_info(info)?));
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `info` must be valid. The result lives as long as `info`.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_info_table(info: *const TideFlowInfo) -> *const TFTableInfo {
+    handle_ref(info, "info").map_or(ptr::null(), |i| &i.table as *const TFTableInfo)
+}
+
+/// # Safety
+/// `info` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_info_chunk_count(info: *const TideFlowInfo) -> u32 {
+    handle_ref(info, "info").map_or(0, |i| i.chunks.len() as u32)
+}
+
+/// Chunk `index`, or NULL when out of range. The result lives as long as `info`.
+///
+/// # Safety
+/// `info` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_info_chunk(info: *const TideFlowInfo, index: u32) -> *const TFChunkInfo {
+    handle_ref(info, "info")
+        .ok()
+        .and_then(|i| i.chunks.get(index as usize))
+        .map_or(ptr::null(), |c| c as *const TFChunkInfo)
+}
+
+/// # Safety
+/// `info` must come from `tideflow_inspect` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn tideflow_info_close(info: *mut TideFlowInfo) {
+    release(info);
 }
 
 // ─── memory ──────────────────────────────────────────────────────────────────

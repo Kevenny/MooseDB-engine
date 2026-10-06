@@ -1,0 +1,31 @@
+include/master-slave.inc
+[connection master]
+CREATE TABLE r (ts DATETIME(6) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v DOUBLE, INDEX(ts))
+ENGINE=TideFlow CHUNK_INTERVAL='1 HOUR';
+INSERT INTO r SELECT '2026-01-01' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq / 4 FROM seq_0_to_299;
+INSERT INTO r VALUES ('2026-01-02 00:00:00.123456', 'h9', NULL);
+TRUNCATE TABLE r;
+INSERT INTO r SELECT '2026-01-01' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq / 4 FROM seq_0_to_99;
+SELECT COUNT(*), SUM(v) FROM r;
+COUNT(*)	SUM(v)
+100	1237.5
+connection slave;
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM r;
+COUNT(*)	SUM(v)	COUNT(DISTINCT host)
+100	1237.5	3
+SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_NAME = 'r';
+ENGINE
+TideFlow
+# Row-level UPDATE/DELETE are refused on the master and never replicate
+connection master;
+UPDATE r SET v = 0;
+ERROR HY000: Storage engine TideFlow of the table `test`.`r` doesn't have this option
+DELETE FROM r WHERE host = 'h1';
+ERROR HY000: Storage engine TideFlow of the table `test`.`r` doesn't have this option
+connection slave;
+SELECT COUNT(*) FROM r;
+COUNT(*)
+100
+connection master;
+DROP TABLE r;
+include/rpl_end.inc

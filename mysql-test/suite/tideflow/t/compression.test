@@ -1,0 +1,56 @@
+#
+# Type-aware encoding + LZ4 (hot) / ZSTD (cold) compression.
+# Acceptance: numeric data compressed to < 15% of its plain size.
+#
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE TABLE m (
+    ts       DATETIME(6) NOT NULL,
+    host     VARCHAR(16) NOT NULL COMMENT 'TAG',
+    value    DOUBLE,
+    counter  BIGINT,
+    ok       TINYINT(1),
+    INDEX(ts)
+) ENGINE=TideFlow CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 DAY';
+
+--echo # 20 hosts x 1 day at 10 s resolution, in 2020: cold data
+INSERT INTO m
+  SELECT '2020-01-01' + INTERVAL (s.seq DIV 20) * 10 SECOND,
+         CONCAT('srv', LPAD(s.seq MOD 20, 2, '0')),
+         40 + ((s.seq DIV 600 + s.seq MOD 20) MOD 25) * 0.5,
+         (s.seq MOD 20) * 1000000 + (s.seq DIV 20) * 17,
+         (s.seq DIV 20) MOD 360 = 0
+  FROM seq_0_to_172799 s;
+OPTIMIZE TABLE m;
+
+SELECT COUNT(*), COUNT(DISTINCT host), MIN(ts), MAX(ts), ROUND(SUM(value), 1), SUM(counter), SUM(ok) FROM m;
+
+SELECT CHUNKS, COLD_CHUNKS, COMPRESSION, ROW_COUNT,
+       COMPRESSED_BYTES / DATA_BYTES < 0.15 AS under_15_percent
+  FROM information_schema.TIDEFLOW_TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'm';
+SELECT STATUS, COMPRESSION, `ROWS`, SERIES, RATIO < 0.15 AS under_15_percent
+  FROM information_schema.TIDEFLOW_CHUNKS
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'm';
+
+--echo # Values survive the round trip exactly
+SELECT ts, host, value, counter, ok FROM m
+  WHERE ts BETWEEN '2020-01-01 12:00:00' AND '2020-01-01 12:00:10' ORDER BY ts, host LIMIT 4;
+
+--echo # Recent data stays HOT and uses LZ4
+CREATE TABLE h (ts DATETIME NOT NULL, v DOUBLE, INDEX(ts)) ENGINE=TideFlow;
+INSERT INTO h SELECT NOW() - INTERVAL seq SECOND, seq FROM seq_1_to_1000;
+FLUSH TABLES h;
+SELECT STATUS, COMPRESSION, `ROWS` FROM information_schema.TIDEFLOW_CHUNKS
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'h' ORDER BY CHUNK_ID LIMIT 1;
+
+--echo # COMPRESSION='NONE' stores plain encoded blocks
+CREATE TABLE n (ts DATETIME NOT NULL, v DOUBLE, INDEX(ts)) ENGINE=TideFlow COMPRESSION='NONE';
+INSERT INTO n SELECT '2020-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_1000;
+FLUSH TABLES n;
+SELECT DISTINCT COMPRESSION FROM information_schema.TIDEFLOW_CHUNKS
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'n';
+SELECT COUNT(*), SUM(v) FROM n;
+
+DROP TABLE m, h, n;

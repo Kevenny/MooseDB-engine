@@ -194,11 +194,15 @@ mod table_tests {
         for (p, r) in &seen {
             assert_eq!(&t.fetch(*p).unwrap(), r);
         }
-        // MemTable positions go stale after a flush; chunk positions survive.
+        // After a flush the *current* contents no longer cover MemTable
+        // positions, but the scan's snapshot still resolves every position.
         t.flush().unwrap();
         let mem_pos = seen.iter().find(|(p, _)| p.source >> 63 == 1).unwrap().0;
         assert!(matches!(t.fetch(mem_pos), Err(Error::NotFound(_))));
         assert_eq!(t.fetch(seen[0].0).unwrap(), seen[0].1);
+        for (p, r) in &seen {
+            assert_eq!(&s.snapshot().fetch(*p).unwrap(), r);
+        }
     }
 
     #[test]
@@ -251,7 +255,7 @@ mod table_tests {
         t.write(row(1, "a", 1.0)).unwrap();
         t.flush().unwrap();
         assert!(t.check().unwrap().is_empty());
-        let path = t.chunks().unwrap()[0].path.clone();
+        let path = t.chunks().unwrap()[0].path().to_path_buf();
         let mut data = std::fs::read(&path).unwrap();
         data[70] ^= 0xff;
         std::fs::write(&path, data).unwrap();
@@ -435,5 +439,518 @@ mod recovery_tests {
         drop(t);
         // The MANIFEST was rewritten, so the next open is clean.
         assert_eq!(all_rows(&reopen(&path)).len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::helpers::*;
+    use tideflow_core::compression::{CODEC_LZ4, CODEC_ZSTD};
+    use tideflow_core::time::{days_from_civil, MICROS_PER_DAY, MICROS_PER_SEC};
+    use tideflow_core::{RawOptions, Value};
+
+    /// Realistic metrics: 10 s interval, 20 hosts, slowly moving gauges and
+    /// monotonic counters.
+    fn metric_row(i: i64, host: usize, base: i64) -> tideflow_core::Row {
+        vec![
+            Value::Timestamp(base + i * 10 * MICROS_PER_SEC),
+            Value::Bytes(format!("srv{host:02}").into_bytes()),
+            Value::Bytes(b"cpu".to_vec()),
+            Value::Float64(40.0 + ((i / 30 + host as i64) % 25) as f64 * 0.5),
+            Value::Int(1_000_000 * host as i64 + i * 17),
+            Value::Null,
+        ]
+    }
+
+    #[test]
+    fn cold_numeric_data_is_under_15_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions { hot_threshold: Some("1 DAY"), ..Default::default() });
+        let base = days_from_civil(2020, 1, 1) * MICROS_PER_DAY; // long cold
+        for i in 0..8640 {
+            for h in 0..20 {
+                t.write(metric_row(i, h, base)).unwrap();
+            }
+        }
+        t.flush().unwrap();
+        let s = t.stats().unwrap();
+        let ratio = s.compressed_bytes as f64 / s.data_bytes as f64;
+        assert!(ratio < 0.15, "ratio {ratio:.3} ({} of {} bytes)", s.compressed_bytes, s.data_bytes);
+        assert!(t.chunks().unwrap().iter().all(|c| c.header.codec_id() == CODEC_ZSTD));
+        assert_eq!(all_rows(&t).len(), 8640 * 20);
+    }
+
+    #[test]
+    fn hot_data_uses_lz4() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions::default());
+        let now = tideflow_core::time::now_micros();
+        for i in 0..100 {
+            t.write(metric_row(i, 0, now - MICROS_PER_DAY)).unwrap();
+        }
+        t.flush().unwrap();
+        assert!(t.chunks().unwrap().iter().all(|c| c.header.codec_id() == CODEC_LZ4));
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::helpers::*;
+    use tideflow_core::compression::{CODEC_LZ4, CODEC_ZSTD};
+    use tideflow_core::time::{MICROS_PER_DAY, MICROS_PER_SEC};
+    use tideflow_core::{maintenance, settings, RawOptions, ScanFilter, Table, Value};
+
+    #[test]
+    fn merges_each_bucket_into_one_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions::default());
+        let mut expected = Vec::new();
+        // 6 flushes, each touching two days, written out of order.
+        for f in 0..6 {
+            for i in (0..50).rev() {
+                for day in 0..2 {
+                    let r = row(day * 86_400 + f * 1000 + i, ["a", "b", "c"][(i % 3) as usize], i as f64);
+                    t.write(r.clone()).unwrap();
+                    expected.push(r);
+                }
+            }
+            t.flush().unwrap();
+        }
+        assert_eq!(t.chunks().unwrap().len(), 12);
+        let now = base_ts() + 365 * MICROS_PER_DAY;
+        let rep = t.compact(i64::MIN, i64::MAX, now).unwrap();
+        assert_eq!((rep.groups, rep.chunks_in, rep.chunks_out), (2, 12, 2));
+        let chunks = t.chunks().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.header.codec_id() == CODEC_ZSTD), "old data re-encoded cold");
+        for c in &chunks {
+            assert_eq!(c.series.len(), 3, "each series is contiguous after the merge");
+        }
+        assert_eq!(sorted(all_rows(&t)), sorted(expected.clone()));
+        // Sorted scans still come out in timestamp order.
+        let mut s = t.scan(&ScanFilter::default(), true).unwrap();
+        let mut last = i64::MIN;
+        while let Some((_, r)) = s.next_row().unwrap() {
+            let Value::Timestamp(ts) = r[0] else { panic!() };
+            assert!(ts >= last);
+            last = ts;
+        }
+        // Nothing left to do; and the result survives a reopen.
+        assert_eq!(t.compact(i64::MIN, i64::MAX, now).unwrap().groups, 0);
+        drop(t);
+        let t = Table::open(config(&dir.path().join("t"), RawOptions::default())).unwrap();
+        assert_eq!(sorted(all_rows(&t)), sorted(expected));
+    }
+
+    #[test]
+    fn range_limits_the_buckets_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions::default());
+        for f in 0..3 {
+            for day in 0..3 {
+                t.write(row(day * 86_400 + f, "a", 1.0)).unwrap();
+            }
+            t.flush().unwrap();
+        }
+        let now = base_ts();
+        let rep = t.compact(base_ts() + MICROS_PER_DAY, base_ts() + MICROS_PER_DAY + 5 * MICROS_PER_SEC, now).unwrap();
+        assert_eq!(rep.groups, 1);
+        assert_eq!(t.chunks().unwrap().len(), 9 - 3 + 1, "only day 1 merged");
+    }
+
+    #[test]
+    fn readers_keep_old_files_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let t = create_open(&path, RawOptions::default());
+        for f in 0..3 {
+            for i in 0..10 {
+                t.write(row(f * 100 + i, "a", 1.0)).unwrap();
+            }
+            t.flush().unwrap();
+        }
+        let old_files: Vec<_> = t.chunks().unwrap().iter().map(|c| c.path().to_path_buf()).collect();
+        let mut scan = t.scan(&ScanFilter::default(), false).unwrap();
+        t.compact(i64::MIN, i64::MAX, base_ts()).unwrap();
+        assert!(old_files.iter().all(|p| p.exists()), "an open scan still needs them");
+        let mut n = 0;
+        while scan.next_row().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 30);
+        drop(scan);
+        assert!(old_files.iter().all(|p| !p.exists()), "deleted once the last reader is gone");
+    }
+
+    #[test]
+    fn cold_reencoding_and_background_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&dir.path().join("t"), RawOptions { hot_threshold: Some("1 DAY"), ..Default::default() });
+        Table::create(&cfg).unwrap();
+        let t = maintenance::open_shared(cfg).unwrap();
+        let now = tideflow_core::time::now_micros();
+        for i in 0..10 {
+            t.write(vec![
+                Value::Timestamp(now - 3 * MICROS_PER_DAY + i),
+                Value::Bytes(b"h".to_vec()),
+                Value::Bytes(b"m".to_vec()),
+                Value::Float64(1.0),
+                Value::Int(i),
+                Value::Null,
+            ])
+            .unwrap();
+        }
+        t.flush().unwrap();
+        // Old data flushed late: written cold right away.
+        assert_eq!(t.chunks().unwrap()[0].header.codec_id(), CODEC_ZSTD);
+
+        // Background trigger: 4 chunks in one hot bucket with trigger=3.
+        settings::get().set_compaction_trigger_chunks(3);
+        let shared = {
+            let cfg = config(&dir.path().join("v"), RawOptions::default());
+            Table::create(&cfg).unwrap();
+            maintenance::open_shared(cfg).unwrap()
+        };
+        let hot = tideflow_core::time::now_micros();
+        for f in 0..4 {
+            shared
+                .write(vec![
+                    Value::Timestamp(hot + f),
+                    Value::Bytes(b"h".to_vec()),
+                    Value::Bytes(b"m".to_vec()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ])
+                .unwrap();
+            shared.flush().unwrap();
+        }
+        assert_eq!(shared.chunks().unwrap().len(), 4);
+        maintenance::run_once();
+        let chunks = shared.chunks().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].header.codec_id(), CODEC_LZ4, "hot bucket keeps the hot codec");
+        settings::get().set_compaction_trigger_chunks(10);
+        assert_eq!(all_rows(&shared).len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::helpers::*;
+    use tideflow_core::{Position, RawOptions, ScanFilter, Value};
+
+    /// Deterministic pseudo-random sequence (no extra dependencies).
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        *seed >> 33
+    }
+
+    fn ts(r: &[Value]) -> i64 {
+        match r[0] {
+            Value::Timestamp(t) => t,
+            _ => panic!("no timestamp"),
+        }
+    }
+
+    #[test]
+    fn merge_matches_a_naive_sort_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions { chunk_interval: Some("1 HOUR"), ..Default::default() });
+        let mut seed = 7;
+        for batch in 0..5 {
+            for _ in 0..400 {
+                let sec = (lcg(&mut seed) % 20_000) as i64; // duplicates included
+                let host = ["a", "b", "c", "d"][(lcg(&mut seed) % 4) as usize];
+                t.write(row(sec, host, batch as f64)).unwrap();
+            }
+            if batch < 4 {
+                t.flush().unwrap();
+            }
+        }
+        let collect = |f: &ScanFilter, desc: bool| {
+            let mut s = t.scan(f, true).unwrap();
+            let mut out = Vec::new();
+            if desc {
+                s.seek_end().unwrap();
+                while let Some(r) = s.prev_row().unwrap() {
+                    out.push(r);
+                }
+            } else {
+                while let Some(r) = s.next_row().unwrap() {
+                    out.push(r);
+                }
+            }
+            out
+        };
+        let lo = base_ts() + 3_000 * 1_000_000;
+        let hi = base_ts() + 15_000 * 1_000_000;
+        let mut f = ScanFilter::range(lo, hi);
+        f.tags.push((1, Value::Bytes(b"b".to_vec())));
+        let asc = collect(&f, false);
+        let desc = collect(&f, true);
+        let naive: Vec<_> = all_rows(&t)
+            .into_iter()
+            .filter(|r| (lo..=hi).contains(&ts(r)) && r[1] == Value::Bytes(b"b".to_vec()))
+            .collect();
+        assert!(asc.windows(2).all(|w| ts(&w[0].1) <= ts(&w[1].1)));
+        assert_eq!(asc.len(), naive.len());
+        let a: Vec<_> = asc.iter().map(|(_, r)| r.clone()).collect();
+        assert_eq!(sorted(a), sorted(naive));
+        let rev: Vec<Position> = desc.iter().map(|(p, _)| *p).collect();
+        let fwd: Vec<Position> = asc.iter().rev().map(|(p, _)| *p).collect();
+        assert_eq!(rev, fwd, "descending is exactly the reverse of ascending");
+    }
+
+    #[test]
+    fn direction_change_mid_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions::default());
+        for i in 0..20 {
+            t.write(row(i, "a", i as f64)).unwrap();
+            if i == 9 {
+                t.flush().unwrap();
+            }
+        }
+        let sec = |r: Option<(Position, tideflow_core::Row)>| r.map(|(_, r)| (ts(&r) - base_ts()) / 1_000_000);
+        let mut s = t.scan(&ScanFilter::default(), true).unwrap();
+        for i in 0..6 {
+            assert_eq!(sec(s.next_row().unwrap()), Some(i));
+        }
+        assert_eq!(sec(s.prev_row().unwrap()), Some(4));
+        assert_eq!(sec(s.prev_row().unwrap()), Some(3));
+        assert_eq!(sec(s.next_row().unwrap()), Some(4));
+        s.seek_end().unwrap();
+        assert_eq!(sec(s.prev_row().unwrap()), Some(19));
+        assert_eq!(sec(s.prev_row().unwrap()), Some(18));
+        assert_eq!(sec(s.next_row().unwrap()), Some(19));
+        assert_eq!(sec(s.next_row().unwrap()), None);
+    }
+
+    #[test]
+    fn series_filter_and_empty_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions::default());
+        for i in 0..30 {
+            t.write(row(i, ["a", "b", "c"][(i % 3) as usize], 1.0)).unwrap();
+        }
+        t.flush().unwrap();
+        let series = t.series().unwrap();
+        assert_eq!(series.len(), 3);
+        let b = series.iter().find(|(_, tags)| tags[0] == Value::Bytes(b"b".to_vec())).unwrap().0;
+        let f = ScanFilter { series: Some(vec![b]), ..ScanFilter::default() };
+        let first = t.scan(&f, false).unwrap().next_row().unwrap().map(|(_, r)| r[1].clone());
+        assert_eq!(first, Some(Value::Bytes(b"b".to_vec())));
+        let mut n = 0;
+        let mut s = t.scan(&f, true).unwrap();
+        while s.next_row().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 10);
+        let none = ScanFilter { series: Some(vec![]), ..ScanFilter::default() };
+        assert!(t.scan(&none, true).unwrap().next_row().unwrap().is_none());
+        assert!(t.scan(&none, false).unwrap().next_row().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod encryption_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Once};
+
+    use super::helpers::*;
+    use tideflow_core::crypto::{set_key_provider, KEY_LEN};
+    use tideflow_core::{Error, RawOptions, Table};
+
+    static LATEST: AtomicU32 = AtomicU32::new(1);
+
+    fn install() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            set_key_provider(Some(Arc::new(|id: u32, version: Option<u32>| {
+                if id == 404 {
+                    return Err(Error::NotFound("no such key".into()));
+                }
+                let v = version.unwrap_or_else(|| LATEST.load(Ordering::SeqCst));
+                Ok((v, [(id as u8).wrapping_mul(31) ^ v as u8; KEY_LEN]))
+            })));
+        });
+    }
+
+    fn enc(key: u32) -> RawOptions<'static> {
+        RawOptions { encryption_key_id: Some(key), ..Default::default() }
+    }
+
+    fn contains(dir: &std::path::Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|e| {
+            let data = std::fs::read(e.unwrap().path()).unwrap();
+            data.windows(needle.len()).any(|w| w == needle)
+        })
+    }
+
+    #[test]
+    fn files_are_unreadable_without_the_key_and_survive_rotation() {
+        install();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let t = create_open(&path, enc(7));
+        let secret = |i| row(i, "TOPSECRETHOST", 1.0);
+        for i in 0..50 {
+            t.write(secret(i)).unwrap();
+        }
+        t.sync_wal(true).unwrap();
+        assert!(!contains(&path, b"TOPSECRETHOST"), "WAL leaks plaintext");
+        t.flush().unwrap();
+        LATEST.store(2, Ordering::SeqCst); // key rotation
+        for i in 50..60 {
+            t.write(secret(i)).unwrap();
+        }
+        t.flush().unwrap();
+        assert!(!contains(&path, b"TOPSECRETHOST"), "chunks leak plaintext");
+        assert!(!contains(&path, b"n17"), "non-tag values leak");
+        assert!(t.chunks().unwrap().iter().all(|c| c.header.is_encrypted()));
+        assert!(t.check().unwrap().is_empty(), "CHECK works on ciphertext");
+        // Both key versions decrypt after a reopen, and compaction re-encrypts.
+        t.write(secret(99)).unwrap();
+        t.sync_wal(true).unwrap();
+        drop(t);
+        let t = Table::open(config(&path, enc(7))).unwrap();
+        assert_eq!(all_rows(&t).len(), 61);
+        assert_eq!(t.compact(i64::MIN, i64::MAX, base_ts()).unwrap().groups, 1);
+        assert_eq!(all_rows(&t).len(), 61);
+        assert!(!contains(&path, b"TOPSECRETHOST"));
+    }
+
+    #[test]
+    fn missing_key_is_rejected_at_create() {
+        install();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&dir.path().join("t"), enc(404));
+        assert!(matches!(Table::create(&cfg), Err(Error::InvalidArg(_))));
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use std::sync::Arc;
+
+    use super::helpers::*;
+    use tideflow_core::inspect::{inspect, ChunkStatus};
+    use tideflow_core::time::MICROS_PER_DAY;
+    use tideflow_core::{maintenance, RawOptions, Table};
+
+    #[test]
+    fn one_instance_per_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&dir.path().join("t"), RawOptions::default());
+        Table::create(&cfg).unwrap();
+        let a = maintenance::open_shared(cfg.clone()).unwrap();
+        let b = maintenance::open_shared(cfg.clone()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(maintenance::lookup(&dir.path().join("t")).is_some());
+        drop((a, b));
+        assert!(maintenance::lookup(&dir.path().join("t")).is_none());
+    }
+
+    #[test]
+    fn inspect_open_and_closed_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let raw = RawOptions { retention_period: Some("400 DAYS"), hot_threshold: Some("1 DAY"), ..Default::default() };
+        let cfg = config(&path, raw);
+        Table::create(&cfg).unwrap();
+        let t = maintenance::open_shared(cfg.clone()).unwrap();
+        for i in 0..10 {
+            t.write(row(i, "a", 1.0)).unwrap();
+        }
+        t.flush().unwrap();
+        for i in 10..15 {
+            t.write(row(i, "b", 1.0)).unwrap();
+        }
+        t.sync_wal(true).unwrap();
+        let now = base_ts() + 2 * MICROS_PER_DAY;
+        let open = inspect(&path, now).unwrap();
+        assert!(open.is_open);
+        assert_eq!((open.row_count, open.pending_rows, open.series_count), (15, 5, 2));
+        assert_eq!(open.chunks[0].status, ChunkStatus::Cold);
+        assert_eq!(open.options.as_ref().unwrap().retention_text, "400 DAYS");
+        drop(t);
+
+        let closed = inspect(&path, now).unwrap();
+        assert!(!closed.is_open);
+        assert_eq!((closed.row_count, closed.pending_rows), (15, 5));
+        let far = base_ts() + 500 * MICROS_PER_DAY;
+        assert_eq!(inspect(&path, far).unwrap().count(ChunkStatus::Expired), 1);
+        let early = base_ts();
+        assert_eq!(inspect(&path, early).unwrap().count(ChunkStatus::Hot), 1);
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    use super::helpers::*;
+    use tideflow_core::{maintenance, RawOptions, ScanFilter, Table};
+
+    #[test]
+    fn readers_writers_and_compaction_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&dir.path().join("t"), RawOptions { memtable_size_bytes: 16 * 1024, ..Default::default() });
+        Table::create(&cfg).unwrap();
+        let t = maintenance::open_shared(cfg).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let t = t.clone();
+            thread::spawn(move || {
+                for i in 0..5000 {
+                    t.write(row(i, ["a", "b"][(i % 2) as usize], i as f64)).unwrap();
+                }
+                t.sync_wal(true).unwrap();
+            })
+        };
+        let compactor = {
+            let (t, done) = (t.clone(), done.clone());
+            thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    t.compact(i64::MIN, i64::MAX, base_ts()).unwrap();
+                }
+            })
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|k| {
+                let (t, done) = (t.clone(), done.clone());
+                thread::spawn(move || {
+                    let mut last = 0usize;
+                    while !done.load(Ordering::Acquire) {
+                        let mut s = t.scan(&ScanFilter::default(), k == 0).unwrap();
+                        let mut rows = Vec::new();
+                        while let Some(r) = s.next_row().unwrap() {
+                            rows.push(r);
+                        }
+                        assert!(rows.len() >= last, "a later snapshot never sees fewer rows");
+                        last = rows.len();
+                        // Every position resolves through the scan's snapshot,
+                        // whatever flushes/compactions happened meanwhile.
+                        for (p, r) in rows.iter().step_by(97) {
+                            assert_eq!(&s.snapshot().fetch(*p).unwrap(), r);
+                        }
+                    }
+                })
+            })
+            .collect();
+        writer.join().unwrap();
+        done.store(true, Ordering::Release);
+        compactor.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert_eq!(all_rows(&t).len(), 5000);
+        t.compact(i64::MIN, i64::MAX, base_ts()).unwrap();
+        assert_eq!(t.chunks().unwrap().len(), 1, "one bucket, fully merged");
+        assert_eq!(all_rows(&t).len(), 5000);
     }
 }

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::compression::Codec;
 use crate::error::{invalid, Result};
 use crate::schema::Schema;
 use crate::time::{add_months, month_ordinal, month_start, MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_WEEK};
@@ -158,19 +159,6 @@ pub const DEFAULT_MEMTABLE_SIZE: u64 = 64 << 20;
 pub const MIN_MEMTABLE_SIZE: u64 = 4 << 10;
 pub const DEFAULT_COMPRESSION_LEVEL: u8 = 3;
 
-/// Fully validated configuration of one table.
-#[derive(Clone, Debug)]
-pub struct TableConfig {
-    pub dir: PathBuf,
-    pub schema: Schema,
-    pub chunk_interval: ChunkInterval,
-    pub retention: Retention,
-    pub compression: Compression,
-    pub compression_level: u8,
-    pub hot_threshold: Period,
-    pub memtable_size_bytes: u64,
-}
-
 /// Raw, unvalidated option strings as they arrive from SQL. `None` selects the default.
 #[derive(Clone, Debug, Default)]
 pub struct RawOptions<'a> {
@@ -180,10 +168,32 @@ pub struct RawOptions<'a> {
     pub compression_level: u8,
     pub hot_threshold: Option<&'a str>,
     pub memtable_size_bytes: u64,
+    /// Key id of the server's key management plugin; `None` = not encrypted.
+    pub encryption_key_id: Option<u32>,
 }
 
-impl TableConfig {
-    pub fn new(dir: impl Into<PathBuf>, schema: Schema, raw: &RawOptions<'_>) -> Result<TableConfig> {
+fn normalize(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_uppercase()
+}
+
+/// Validated TABLE OPTIONS, independent of the column layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableOptions {
+    pub chunk_interval: ChunkInterval,
+    pub retention: Retention,
+    pub compression: Compression,
+    pub compression_level: u8,
+    pub hot_threshold: Period,
+    pub memtable_size_bytes: u64,
+    pub encryption_key_id: Option<u32>,
+    /// Normalized option texts, for display (INFORMATION_SCHEMA).
+    pub chunk_interval_text: String,
+    pub retention_text: String,
+    pub hot_threshold_text: String,
+}
+
+impl TableOptions {
+    pub fn parse(raw: &RawOptions<'_>) -> Result<TableOptions> {
         let compression_level = match raw.compression_level {
             0 => DEFAULT_COMPRESSION_LEVEL,
             l @ 1..=19 => l,
@@ -196,16 +206,114 @@ impl TableConfig {
             }
             s => s,
         };
-        Ok(TableConfig {
-            dir: dir.into(),
-            schema,
-            chunk_interval: ChunkInterval::parse(raw.chunk_interval.unwrap_or(ChunkInterval::DEFAULT))?,
-            retention: Retention::parse(raw.retention_period.unwrap_or("FOREVER"))?,
+        let ci = raw.chunk_interval.unwrap_or(ChunkInterval::DEFAULT);
+        let rp = raw.retention_period.unwrap_or("FOREVER");
+        let ht = raw.hot_threshold.unwrap_or("7 DAYS");
+        Ok(TableOptions {
+            chunk_interval: ChunkInterval::parse(ci)?,
+            retention: Retention::parse(rp)?,
             compression: Compression::parse(raw.compression.unwrap_or("ZSTD"))?,
             compression_level,
-            hot_threshold: Period::parse(raw.hot_threshold.unwrap_or("7 DAYS"))?,
+            hot_threshold: Period::parse(ht)?,
             memtable_size_bytes,
+            encryption_key_id: raw.encryption_key_id,
+            chunk_interval_text: normalize(ci),
+            retention_text: normalize(rp),
+            hot_threshold_text: normalize(ht),
         })
+    }
+
+    pub fn compression_name(&self) -> &'static str {
+        match self.compression {
+            Compression::None => "NONE",
+            Compression::Lz4 => "LZ4",
+            Compression::Zstd => "ZSTD",
+        }
+    }
+
+    /// Codec for chunks older than HOT_THRESHOLD.
+    pub fn cold_codec(&self) -> Codec {
+        match self.compression {
+            Compression::None => Codec::None,
+            Compression::Lz4 => Codec::Lz4,
+            Compression::Zstd => Codec::Zstd(i32::from(self.compression_level)),
+        }
+    }
+
+    /// Codec for recent chunks: cheap LZ4 unless compression is disabled.
+    pub fn hot_codec(&self) -> Codec {
+        match self.compression {
+            Compression::None => Codec::None,
+            _ => Codec::Lz4,
+        }
+    }
+
+    /// Whether a bucket ending at `bucket_end` is still "hot" at `now`.
+    pub fn is_hot(&self, bucket_end: i64, now: i64) -> bool {
+        bucket_end > self.hot_threshold.before(now)
+    }
+
+    pub fn codec_for(&self, bucket_end: i64, now: i64) -> Codec {
+        if self.is_hot(bucket_end, now) {
+            self.hot_codec()
+        } else {
+            self.cold_codec()
+        }
+    }
+
+    /// `key=value` text persisted in the table's OPTIONS file.
+    pub fn to_text(&self) -> String {
+        let mut s = format!(
+            "chunk_interval={}\nretention_period={}\ncompression={}\ncompression_level={}\nhot_threshold={}\nmemtable_size={}\n",
+            self.chunk_interval_text,
+            self.retention_text,
+            self.compression_name(),
+            self.compression_level,
+            self.hot_threshold_text,
+            self.memtable_size_bytes
+        );
+        if let Some(k) = self.encryption_key_id {
+            s.push_str(&format!("encryption_key_id={k}\n"));
+        }
+        s
+    }
+
+    pub fn from_text(text: &str) -> Result<TableOptions> {
+        let mut map = std::collections::HashMap::new();
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim(), v.trim());
+            }
+        }
+        let num = |k: &str| -> Result<u64> {
+            map.get(k).map_or(Ok(0), |v| v.parse().map_err(|_| invalid(format!("OPTIONS: bad {k}"))))
+        };
+        TableOptions::parse(&RawOptions {
+            chunk_interval: map.get("chunk_interval").copied(),
+            retention_period: map.get("retention_period").copied(),
+            compression: map.get("compression").copied(),
+            compression_level: u8::try_from(num("compression_level")?).unwrap_or(0),
+            hot_threshold: map.get("hot_threshold").copied(),
+            memtable_size_bytes: num("memtable_size")?,
+            encryption_key_id: match map.get("encryption_key_id") {
+                Some(v) => Some(v.parse().map_err(|_| invalid("OPTIONS: bad encryption_key_id"))?),
+                None => None,
+            },
+        })
+    }
+}
+
+/// Fully validated configuration of one table.
+#[derive(Clone, Debug)]
+pub struct TableConfig {
+    pub dir: PathBuf,
+    pub schema: Schema,
+    pub opts: TableOptions,
+}
+
+impl TableConfig {
+    pub fn new(dir: impl Into<PathBuf>, schema: Schema, raw: &RawOptions<'_>) -> Result<TableConfig> {
+        Ok(TableConfig { dir: dir.into(), schema, opts: TableOptions::parse(raw)? })
     }
 }
 
@@ -259,9 +367,14 @@ mod tests {
             Schema::new(vec![crate::schema::Column { name: "ts".into(), ty: crate::schema::ColumnType::Timestamp }], 0)
                 .unwrap();
         let c = TableConfig::new("/tmp/x", schema.clone(), &RawOptions::default()).unwrap();
-        assert_eq!(c.memtable_size_bytes, DEFAULT_MEMTABLE_SIZE);
-        assert_eq!(c.compression, Compression::Zstd);
-        assert_eq!(c.retention, Retention::Forever);
+        assert_eq!(c.opts.memtable_size_bytes, DEFAULT_MEMTABLE_SIZE);
+        assert_eq!(c.opts.compression, Compression::Zstd);
+        assert_eq!(c.opts.retention, Retention::Forever);
+        assert_eq!(TableOptions::from_text(&c.opts.to_text()).unwrap(), c.opts);
+        let hot = TableOptions::parse(&RawOptions { hot_threshold: Some("1 day"), ..Default::default() }).unwrap();
+        assert_eq!(hot.codec_for(10 * MICROS_PER_DAY, 10 * MICROS_PER_DAY), Codec::Lz4);
+        assert_eq!(hot.codec_for(MICROS_PER_DAY, 10 * MICROS_PER_DAY), Codec::Zstd(3));
+        assert_eq!(hot.hot_threshold_text, "1 DAY");
         let bad = RawOptions { compression_level: 20, ..Default::default() };
         assert!(TableConfig::new("/tmp/x", schema, &bad).is_err());
     }

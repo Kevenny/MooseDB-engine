@@ -24,7 +24,7 @@ typedef enum {
   TF_ERR_READONLY = 7,
   // A Rust panic was caught at the boundary.
   TF_ERR_INTERNAL = 8,
-  // The operation is declared but not implemented yet.
+  // The operation or feature is not available.
   TF_ERR_UNSUPPORTED = 9,
 } TFStatus;
 
@@ -40,11 +40,37 @@ typedef enum {
   TF_COL_DECIMAL = 7,
 } TFColumnType;
 
+// Opaque diagnostics handle.
+typedef struct TideFlowInfo TideFlowInfo;
+
 // Opaque scan handle.
 typedef struct TideFlowScan TideFlowScan;
 
+// Opaque list of the series of a table.
+typedef struct TideFlowSeriesList TideFlowSeriesList;
+
+// Opaque snapshot handle: resolves row positions (`rnd_pos`).
+typedef struct TideFlowSnapshot TideFlowSnapshot;
+
 // Opaque table handle.
 typedef struct TideFlowTable TideFlowTable;
+
+// Process-wide tunables (the `tideflow_*` system variables).
+typedef struct {
+  uint64_t retention_check_interval_secs;
+  uint32_t compaction_trigger_chunks;
+  double bloom_filter_false_positive_rate;
+  uint64_t chunk_cache_bytes;
+  uint32_t max_open_chunks;
+} TFGlobalSettings;
+
+// Fetches an encryption key from the server. `version == 0` asks for the
+// latest version. Writes the version used to `*out_version` and the 32-byte
+// key to `out_key`. Returns 0 on success.
+typedef int32_t (*TFKeyCallback)(uint32_t key_id,
+                                 uint32_t version,
+                                 uint32_t *out_version,
+                                 uint8_t *out_key);
 
 // Table configuration. String options may be NULL to select defaults.
 typedef struct {
@@ -64,6 +90,8 @@ typedef struct {
   const char *const *column_names;
   // `column_count` `TFColumnType` codes.
   const uint8_t *column_types;
+  // Key id for encryption at rest; 0 = not encrypted.
+  uint32_t encryption_key_id;
 } TFTableConfig;
 
 typedef struct {
@@ -95,9 +123,63 @@ typedef struct {
   TFValue *values;
 } TFRow;
 
+// Table-level diagnostics (INFORMATION_SCHEMA.TIDEFLOW_TABLES). Strings are
+// owned by the `TideFlowInfo` handle.
+typedef struct {
+  bool is_open;
+  bool encrypted;
+  uint64_t row_count;
+  uint64_t pending_rows;
+  uint64_t series_count;
+  uint64_t data_bytes;
+  uint64_t compressed_bytes;
+  uint32_t chunk_count;
+  uint32_t hot_chunks;
+  uint32_t warm_chunks;
+  uint32_t cold_chunks;
+  uint32_t compacting_chunks;
+  uint32_t expired_chunks;
+  const char *chunk_interval;
+  const char *retention_period;
+  const char *compression;
+} TFTableInfo;
+
+// One chunk (INFORMATION_SCHEMA.TIDEFLOW_CHUNKS).
+typedef struct {
+  uint64_t chunk_id;
+  int64_t ts_min_us;
+  int64_t ts_max_us;
+  uint64_t rows;
+  uint32_t series;
+  uint64_t data_bytes;
+  uint64_t compressed_bytes;
+  int64_t sealed_at_us;
+  bool encrypted;
+  // "HOT", "WARM", "COLD", "COMPACTING" or "EXPIRED".
+  const char *status;
+  // "NONE", "LZ4" or "ZSTD".
+  const char *compression;
+  const char *file_name;
+} TFChunkInfo;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+// Applies the `tideflow_*` system variables. Safe to call at any time.
+//
+// # Safety
+// `s` must point to a valid `TFGlobalSettings`.
+TFStatus tideflow_set_globals(const TFGlobalSettings *s);
+
+// Installs (or, with NULL, removes) the encryption key provider.
+TFStatus tideflow_set_key_callback(TFKeyCallback cb);
+
+// Starts the background maintenance pool (retention, compaction).
+TFStatus tideflow_maintenance_start(uint32_t threads);
+
+// Stops the background maintenance pool, waiting for running jobs.
+TFStatus tideflow_maintenance_stop(void);
 
 // Creates the on-disk structure of a new table.
 //
@@ -105,8 +187,8 @@ extern "C" {
 // `name` must be a NUL-terminated path; `config` must be valid.
 TFStatus tideflow_table_create(const char *name, const TFTableConfig *config);
 
-// Opens a table (running crash recovery). On success `*out_table` receives a
-// handle to release with `tideflow_table_close`.
+// Opens a table (running crash recovery) or attaches to the instance already
+// open in this process. Release the handle with `tideflow_table_close`.
 //
 // # Safety
 // As `tideflow_table_create`; `out_table` must be writable.
@@ -114,11 +196,18 @@ TFStatus tideflow_table_open(const char *name,
                              const TFTableConfig *config,
                              TideFlowTable **out_table);
 
-// Releases a table handle. Pending WAL data is flushed to the OS.
+// Handle to the table at `path` if it is open in this process
+// (`TF_ERR_NOT_FOUND` otherwise). Release with `tideflow_table_close`.
 //
 // # Safety
-// `table` must come from `tideflow_table_open` and not be used afterwards.
-// Every scan opened on it should be closed first.
+// `path` must be NUL-terminated; `out_table` writable.
+TFStatus tideflow_table_lookup(const char *path, TideFlowTable **out_table);
+
+// Releases a table handle; pending WAL data is flushed to the OS. The table
+// itself closes when its last handle (and background job) is gone.
+//
+// # Safety
+// `table` must come from `tideflow_table_open`/`_lookup` and not be used afterwards.
 TFStatus tideflow_table_close(TideFlowTable *table);
 
 // # Safety
@@ -173,19 +262,32 @@ TFStatus tideflow_range_scan_open(TideFlowTable *table,
                                   uint32_t tag_count,
                                   TideFlowScan **out_scan);
 
+// General scan: timestamp range, optional series restriction
+// (`series_count < 0` = all series), unordered or timestamp-ordered.
+//
+// # Safety
+// `series_ids` must hold `series_count` elements when `series_count > 0`.
+TFStatus tideflow_scan_open_filtered(TideFlowTable *table,
+                                     int64_t ts_start_us,
+                                     int64_t ts_end_us,
+                                     const uint64_t *series_ids,
+                                     int64_t series_count,
+                                     bool sorted,
+                                     TideFlowScan **out_scan);
+
 // Advances the scan. At the end, `*out_eof` is set and `out_row` emptied.
 //
 // # Safety
 // `scan` must be valid; `out_row` and `out_eof` writable.
 TFStatus tideflow_scan_next(TideFlowScan *scan, TFRow *out_row, bool *out_eof);
 
-// Steps backwards (range scans only). Before the first row, `*out_bof` is set.
+// Steps backwards (sorted scans only). Before the first row, `*out_bof` is set.
 //
 // # Safety
 // As `tideflow_scan_next`.
 TFStatus tideflow_scan_prev(TideFlowScan *scan, TFRow *out_row, bool *out_bof);
 
-// Positions a range scan after its last row (for `index_last`).
+// Positions a sorted scan after its last row (for `index_last`).
 //
 // # Safety
 // `scan` must be valid.
@@ -197,18 +299,62 @@ TFStatus tideflow_scan_seek_end(TideFlowScan *scan);
 // `out_pos` must have room for `TF_POSITION_LEN` bytes.
 TFStatus tideflow_scan_position(TideFlowScan *scan, uint8_t *out_pos);
 
-// Re-reads the row at `pos` into `out_row` (handler `rnd_pos`). The scan's
-// current row becomes that row.
+// Returns a handle on the snapshot the scan reads, which resolves the
+// positions of its rows even after the scan is closed.
 //
 // # Safety
-// `pos` must point to `TF_POSITION_LEN` readable bytes.
-TFStatus tideflow_scan_fetch(TideFlowScan *scan, const uint8_t *pos, TFRow *out_row);
+// `scan` must be valid; `out_snapshot` writable.
+TFStatus tideflow_scan_snapshot(TideFlowScan *scan, TideFlowSnapshot **out_snapshot);
 
 // # Safety
-// `scan` must come from a `*_scan_open` call and not be used afterwards.
+// `scan` must come from a `*_scan_open*` call and not be used afterwards.
 TFStatus tideflow_scan_close(TideFlowScan *scan);
 
-// Merges chunks in a time range. Not implemented yet: returns `TF_ERR_UNSUPPORTED`.
+// Identifies the table contents the snapshot shows: equal versions mean
+// identical snapshots.
+//
+// # Safety
+// `snapshot` must be valid.
+uint64_t tideflow_snapshot_version(const TideFlowSnapshot *snapshot);
+
+// Re-reads the row at `pos` (handler `rnd_pos`). `TF_ERR_NOT_FOUND` if the
+// snapshot does not cover that position.
+//
+// # Safety
+// `pos` must point to `TF_POSITION_LEN` readable bytes; `out_row` writable.
+TFStatus tideflow_snapshot_fetch(TideFlowSnapshot *snapshot, const uint8_t *pos, TFRow *out_row);
+
+// # Safety
+// `snapshot` must come from `tideflow_scan_snapshot` and not be used afterwards.
+TFStatus tideflow_snapshot_close(TideFlowSnapshot *snapshot);
+
+// Lists every series of the table (for TAG predicate pushdown).
+//
+// # Safety
+// `table` must be valid; `out_list` writable.
+TFStatus tideflow_series_list(TideFlowTable *table, TideFlowSeriesList **out_list);
+
+// Number of series in the list.
+//
+// # Safety
+// `list` must be valid.
+uint64_t tideflow_series_list_len(const TideFlowSeriesList *list);
+
+// Series `index`: its id and its TAG values (in table TAG-column order).
+//
+// # Safety
+// `list` must be valid; `out_id`, `out_tags` writable.
+TFStatus tideflow_series_list_get(TideFlowSeriesList *list,
+                                  uint64_t index,
+                                  uint64_t *out_id,
+                                  TFRow *out_tags);
+
+// # Safety
+// `list` must come from `tideflow_series_list` and not be used afterwards.
+TFStatus tideflow_series_list_close(TideFlowSeriesList *list);
+
+// Merges the chunks of every time bucket overlapping `[ts_start_us,
+// ts_end_us]` and re-encodes cold chunks with the cold codec.
 //
 // # Safety
 // `table` must be a valid handle.
@@ -245,6 +391,30 @@ TFStatus tideflow_estimate_rows(TideFlowTable *table,
                                 int64_t ts_start_us,
                                 int64_t ts_end_us,
                                 uint64_t *out_rows);
+
+// Describes the table stored at `path` (open or not) for diagnostics.
+//
+// # Safety
+// `path` must be NUL-terminated; `out_info` writable.
+TFStatus tideflow_inspect(const char *path, TideFlowInfo **out_info);
+
+// # Safety
+// `info` must be valid. The result lives as long as `info`.
+const TFTableInfo *tideflow_info_table(const TideFlowInfo *info);
+
+// # Safety
+// `info` must be valid.
+uint32_t tideflow_info_chunk_count(const TideFlowInfo *info);
+
+// Chunk `index`, or NULL when out of range. The result lives as long as `info`.
+//
+// # Safety
+// `info` must be valid.
+const TFChunkInfo *tideflow_info_chunk(const TideFlowInfo *info, uint32_t index);
+
+// # Safety
+// `info` must come from `tideflow_inspect` and not be used afterwards.
+void tideflow_info_close(TideFlowInfo *info);
 
 // Message of the last error raised on the calling thread, or NULL. The
 // caller owns the result and must release it with `tideflow_free_str`.

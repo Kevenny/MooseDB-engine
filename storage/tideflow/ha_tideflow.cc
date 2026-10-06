@@ -14,100 +14,21 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstring>
-#include <ctime>
+#include <filesystem>
 
 #include "my_global.h"
 #include "sql_class.h"
+#include "item_cmpfunc.h"
 #include "key.h"
 #include "log.h"
+#include "sql_acl.h"
+#include "sql_i_s.h"
+#include "sql_table.h"
+#include <mysql/service_encryption.h>
 
 static handlerton *tideflow_hton;
-
-/* ── System variables ─────────────────────────────────────────────────── */
-
-static const char *wal_sync_mode_names[]= {"fsync", "write", NullS};
-static TYPELIB wal_sync_mode_typelib= CREATE_TYPELIB_FOR(wal_sync_mode_names);
-enum { WAL_SYNC_FSYNC= 0, WAL_SYNC_WRITE= 1 };
-
-static ulong srv_wal_sync_mode= WAL_SYNC_FSYNC;
-static ulonglong srv_memtable_flush_threshold= 64ULL << 20;
-static uint srv_compaction_trigger_chunks= 10;
-static uint srv_compaction_threads= 2;
-static uint srv_retention_check_interval= 3600;
-static double srv_bloom_fpr= 0.01;
-static ulonglong srv_chunk_cache_size= 128ULL << 20;
-static uint srv_max_open_chunks= 100;
-
-static MYSQL_SYSVAR_ENUM(wal_sync_mode, srv_wal_sync_mode, PLUGIN_VAR_RQCMDARG,
-  "WAL durability at statement end: fsync (every committed row survives an "
-  "OS crash) or write (rows survive a mysqld crash, not an OS crash)",
-  NULL, NULL, WAL_SYNC_FSYNC, &wal_sync_mode_typelib);
-
-static MYSQL_SYSVAR_ULONGLONG(memtable_flush_threshold,
-  srv_memtable_flush_threshold, PLUGIN_VAR_RQCMDARG,
-  "MemTable size in bytes that triggers a flush to a chunk, for tables "
-  "without an explicit MEMTABLE_SIZE. Applies to tables opened afterwards",
-  NULL, NULL, 64ULL << 20, 4096, 1ULL << 40, 0);
-
-static MYSQL_SYSVAR_UINT(compaction_trigger_chunks,
-  srv_compaction_trigger_chunks, PLUGIN_VAR_RQCMDARG,
-  "Number of chunks in one time bucket that triggers compaction "
-  "(reserved: compaction is not implemented yet)",
-  NULL, NULL, 10, 2, 10000, 0);
-
-static MYSQL_SYSVAR_UINT(compaction_threads, srv_compaction_threads,
-  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
-  "Background compaction threads (reserved: compaction is not implemented yet)",
-  NULL, NULL, 2, 1, 64, 0);
-
-static MYSQL_SYSVAR_UINT(retention_check_interval,
-  srv_retention_check_interval, PLUGIN_VAR_RQCMDARG,
-  "Minimum seconds between two RETENTION_PERIOD sweeps of the same table. "
-  "Sweeps run after write statements and on OPTIMIZE TABLE; 0 disables them",
-  NULL, NULL, 3600, 0, UINT_MAX, 0);
-
-static MYSQL_SYSVAR_DOUBLE(bloom_filter_false_positive_rate, srv_bloom_fpr,
-  PLUGIN_VAR_RQCMDARG,
-  "Target false-positive rate of per-chunk series Bloom filters "
-  "(reserved: chunks currently use 0.01)",
-  NULL, NULL, 0.01, 0.000001, 0.5, 0);
-
-static MYSQL_SYSVAR_ULONGLONG(chunk_cache_size, srv_chunk_cache_size,
-  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
-  "Bytes of decompressed chunk data to cache (reserved: no cache yet)",
-  NULL, NULL, 128ULL << 20, 0, ULONGLONG_MAX, 0);
-
-static MYSQL_SYSVAR_UINT(max_open_chunks, srv_max_open_chunks,
-  PLUGIN_VAR_RQCMDARG,
-  "Maximum chunk files kept open (reserved: chunks are opened per scan)",
-  NULL, NULL, 100, 1, 1000000, 0);
-
-static struct st_mysql_sys_var *tideflow_system_variables[]= {
-  MYSQL_SYSVAR(wal_sync_mode),
-  MYSQL_SYSVAR(memtable_flush_threshold),
-  MYSQL_SYSVAR(compaction_trigger_chunks),
-  MYSQL_SYSVAR(compaction_threads),
-  MYSQL_SYSVAR(retention_check_interval),
-  MYSQL_SYSVAR(bloom_filter_false_positive_rate),
-  MYSQL_SYSVAR(chunk_cache_size),
-  MYSQL_SYSVAR(max_open_chunks),
-  NULL
-};
-
-/* ── Table options ────────────────────────────────────────────────────── */
-
-ha_create_table_option tideflow_table_option_list[]=
-{
-  HA_TOPTION_STRING("CHUNK_INTERVAL", chunk_interval),
-  HA_TOPTION_STRING("RETENTION_PERIOD", retention_period),
-  HA_TOPTION_STRING("COMPRESSION", compression),
-  HA_TOPTION_NUMBER("COMPRESSION_LEVEL", compression_level, 3, 1, 19, 1),
-  HA_TOPTION_STRING("HOT_THRESHOLD", hot_threshold),
-  HA_TOPTION_NUMBER("MEMTABLE_SIZE", memtable_size, 0, 0, 1ULL << 40, 1),
-  HA_TOPTION_STRING("TIMESTAMP_COLUMN", timestamp_column),
-  HA_TOPTION_END
-};
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
@@ -146,6 +67,31 @@ longlong floor_div(longlong a, longlong b)
   return a / b - ((a % b != 0) && ((a < 0) != (b < 0)));
 }
 
+longlong time_to_micros(const MYSQL_TIME &lt)
+{
+  const longlong days= days_from_civil(lt.year, lt.month, lt.day);
+  return (((days * 24 + lt.hour) * 60 + lt.minute) * 60 + lt.second) *
+         MICROS_PER_SEC + (longlong) lt.second_part;
+}
+
+void micros_to_time(longlong us, MYSQL_TIME *lt)
+{
+  const longlong days= floor_div(us, MICROS_PER_DAY);
+  const longlong tod= us - days * MICROS_PER_DAY;
+  longlong y;
+  unsigned m, d;
+  civil_from_days(days, &y, &m, &d);
+  memset(lt, 0, sizeof(*lt));
+  lt->year= (uint) y;
+  lt->month= m;
+  lt->day= d;
+  lt->hour= (uint) (tod / (3600 * MICROS_PER_SEC));
+  lt->minute= (uint) (tod / (60 * MICROS_PER_SEC) % 60);
+  lt->second= (uint) (tod / MICROS_PER_SEC % 60);
+  lt->second_part= (ulong) (tod % MICROS_PER_SEC);
+  lt->time_type= MYSQL_TIMESTAMP_DATETIME;
+}
+
 bool is_tag_comment(const LEX_CSTRING &c)
 {
   const char *s= c.str, *e= c.str + c.length;
@@ -169,6 +115,165 @@ bool is_temporal(const Field *f)
   }
 }
 
+/* Message of the last Rust error on this thread ("" if none). */
+std::string take_last_error()
+{
+  char *msg= tideflow_last_error();
+  std::string s= msg ? msg : "";
+  tideflow_free_str(msg);
+  return s;
+}
+
+/* Engine-private error codes, reported through get_error_message(). */
+constexpr int HA_ERR_TIDEFLOW_BASE= HA_ERR_LAST + 1000;
+
+} // namespace
+
+/* ── System variables ─────────────────────────────────────────────────── */
+
+static const char *wal_sync_mode_names[]= {"fsync", "write", NullS};
+static TYPELIB wal_sync_mode_typelib= CREATE_TYPELIB_FOR(wal_sync_mode_names);
+enum { WAL_SYNC_FSYNC= 0, WAL_SYNC_WRITE= 1 };
+
+static ulong srv_wal_sync_mode= WAL_SYNC_FSYNC;
+static ulonglong srv_memtable_flush_threshold= 64ULL << 20;
+static uint srv_compaction_trigger_chunks= 10;
+static uint srv_compaction_threads= 2;
+static uint srv_retention_check_interval= 3600;
+static double srv_bloom_fpr= 0.01;
+static ulonglong srv_chunk_cache_size= 128ULL << 20;
+static uint srv_max_open_chunks= 100;
+
+/* Mirrors the current values into the Rust core. */
+static void push_globals()
+{
+  TFGlobalSettings s;
+  s.retention_check_interval_secs= srv_retention_check_interval;
+  s.compaction_trigger_chunks= srv_compaction_trigger_chunks;
+  s.bloom_filter_false_positive_rate= srv_bloom_fpr;
+  s.chunk_cache_bytes= srv_chunk_cache_size;
+  s.max_open_chunks= srv_max_open_chunks;
+  if (tideflow_set_globals(&s) != TF_OK)
+    sql_print_warning("TideFlow: cannot apply settings: %s",
+                      take_last_error().c_str());
+}
+
+template <typename T>
+static void update_global(THD *, struct st_mysql_sys_var *, void *var,
+                          const void *save)
+{
+  *static_cast<T *>(var)= *static_cast<const T *>(save);
+  push_globals();
+}
+
+static MYSQL_SYSVAR_ENUM(wal_sync_mode, srv_wal_sync_mode, PLUGIN_VAR_RQCMDARG,
+  "WAL durability at statement end: fsync (every committed row survives an "
+  "OS crash) or write (rows survive a mysqld crash, not an OS crash)",
+  NULL, NULL, WAL_SYNC_FSYNC, &wal_sync_mode_typelib);
+
+static MYSQL_SYSVAR_ULONGLONG(memtable_flush_threshold,
+  srv_memtable_flush_threshold, PLUGIN_VAR_RQCMDARG,
+  "MemTable size in bytes that triggers a flush to a chunk, for tables "
+  "without an explicit MEMTABLE_SIZE. Applies to tables opened afterwards",
+  NULL, NULL, 64ULL << 20, 4096, 1ULL << 40, 0);
+
+static MYSQL_SYSVAR_UINT(compaction_trigger_chunks,
+  srv_compaction_trigger_chunks, PLUGIN_VAR_RQCMDARG,
+  "Number of chunks in one time bucket that triggers background compaction",
+  NULL, update_global<uint>, 10, 2, 10000, 0);
+
+static MYSQL_SYSVAR_UINT(compaction_threads, srv_compaction_threads,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+  "Background maintenance threads (compaction and retention)",
+  NULL, NULL, 2, 1, 64, 0);
+
+static MYSQL_SYSVAR_UINT(retention_check_interval,
+  srv_retention_check_interval, PLUGIN_VAR_RQCMDARG,
+  "Seconds between two RETENTION_PERIOD sweeps of the same table by the "
+  "background threads; 0 disables background sweeps",
+  NULL, update_global<uint>, 3600, 0, UINT_MAX, 0);
+
+static MYSQL_SYSVAR_DOUBLE(bloom_filter_false_positive_rate, srv_bloom_fpr,
+  PLUGIN_VAR_RQCMDARG,
+  "Target false-positive rate of the per-chunk series Bloom filters "
+  "(applies to chunks written afterwards)",
+  NULL, update_global<double>, 0.01, 0.000001, 0.5, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(chunk_cache_size, srv_chunk_cache_size,
+  PLUGIN_VAR_RQCMDARG,
+  "Bytes of decoded chunk blocks cached in memory (0 disables the cache)",
+  NULL, update_global<ulonglong>, 128ULL << 20, 0, ULONGLONG_MAX, 0);
+
+static MYSQL_SYSVAR_UINT(max_open_chunks, srv_max_open_chunks,
+  PLUGIN_VAR_RQCMDARG,
+  "Maximum chunk files kept open between reads",
+  NULL, update_global<uint>, 100, 1, 1000000, 0);
+
+static struct st_mysql_sys_var *tideflow_system_variables[]= {
+  MYSQL_SYSVAR(wal_sync_mode),
+  MYSQL_SYSVAR(memtable_flush_threshold),
+  MYSQL_SYSVAR(compaction_trigger_chunks),
+  MYSQL_SYSVAR(compaction_threads),
+  MYSQL_SYSVAR(retention_check_interval),
+  MYSQL_SYSVAR(bloom_filter_false_positive_rate),
+  MYSQL_SYSVAR(chunk_cache_size),
+  MYSQL_SYSVAR(max_open_chunks),
+  NULL
+};
+
+/* ── Table options ────────────────────────────────────────────────────── */
+
+ha_create_table_option tideflow_table_option_list[]=
+{
+  HA_TOPTION_STRING("CHUNK_INTERVAL", chunk_interval),
+  HA_TOPTION_STRING("RETENTION_PERIOD", retention_period),
+  HA_TOPTION_STRING("COMPRESSION", compression),
+  HA_TOPTION_NUMBER("COMPRESSION_LEVEL", compression_level, 3, 1, 19, 1),
+  HA_TOPTION_STRING("HOT_THRESHOLD", hot_threshold),
+  HA_TOPTION_NUMBER("MEMTABLE_SIZE", memtable_size, 0, 0, 1ULL << 40, 1),
+  HA_TOPTION_STRING("TIMESTAMP_COLUMN", timestamp_column),
+  HA_TOPTION_BOOL("ENCRYPTION", encryption, 0),
+  HA_TOPTION_NUMBER("ENCRYPTION_KEY_ID", encryption_key_id, 1, 1, UINT_MAX32, 1),
+  HA_TOPTION_END
+};
+
+/* ── Encryption keys ──────────────────────────────────────────────────── */
+
+/* Called by the Rust core (any thread) to fetch keys from the server's key
+   management plugin. version 0 = latest. */
+static int32_t tideflow_key_callback(uint32_t key_id, uint32_t version,
+                                     uint32_t *out_version, uint8_t *out_key)
+{
+  uint v= version ? version : encryption_key_get_latest_version(key_id);
+  if (v == ENCRYPTION_KEY_VERSION_INVALID)
+    return 1;
+  uint len= 32;
+  if (encryption_key_get(key_id, v, out_key, &len))
+    return 1;
+  if (len != 32)
+    return 2;                 /* AES-256 needs a 256-bit key */
+  *out_version= v;
+  return 0;
+}
+
+/* ── Layout ───────────────────────────────────────────────────────────── */
+
+int tf_layout::tag_position(uint field_index) const
+{
+  int pos= 0;
+  for (const tf_column &c : columns)
+  {
+    if (c.conv != tf_conv::TAG)
+      continue;
+    if (c.field_index == field_index)
+      return pos;
+    pos++;
+  }
+  return -1;
+}
+
+namespace {
+
 /*
   Builds the column layout of a table and validates that its definition is
   something TideFlow can store. On error, a message is written to `err`.
@@ -178,7 +283,6 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
   tf_layout l;
   const ha_table_option_struct *opt= s->option_struct;
 
-  /* Resolve the timestamp column. */
   Field *ts_field= nullptr;
   if (opt && opt->timestamp_column && opt->timestamp_column[0])
   {
@@ -338,20 +442,10 @@ struct tf_config_holder
     cfg.column_count= (uint32_t) l.columns.size();
     cfg.column_names= names.data();
     cfg.column_types= types.data();
+    cfg.encryption_key_id= opt && opt->encryption
+                             ? (uint32_t) opt->encryption_key_id : 0;
   }
 };
-
-/* Message of the last Rust error on this thread ("" if none). */
-std::string take_last_error()
-{
-  char *msg= tideflow_last_error();
-  std::string s= msg ? msg : "";
-  tideflow_free_str(msg);
-  return s;
-}
-
-/* Engine-private error codes, reported through get_error_message(). */
-constexpr int HA_ERR_TIDEFLOW_BASE= HA_ERR_LAST + 1000;
 
 } // namespace
 
@@ -498,6 +592,7 @@ int ha_tideflow::close()
 {
   DBUG_ENTER("ha_tideflow::close");
   scan_.reset();
+  snapshots_.clear();
   DBUG_RETURN(0);
 }
 
@@ -560,10 +655,7 @@ int ha_tideflow::write_row(const uchar *buf)
           error= HA_ERR_TIDEFLOW_BASE + TF_ERR_INVALID_ARG;
           break;
         }
-        const longlong days= days_from_civil(lt.year, lt.month, lt.day);
-        const longlong secs= ((days * 24 + lt.hour) * 60 + lt.minute) * 60 +
-                             lt.second;
-        v.data.ts_us= secs * MICROS_PER_SEC + (longlong) lt.second_part;
+        v.data.ts_us= time_to_micros(lt);
         break;
       }
       case tf_conv::TIMESTAMP:
@@ -600,9 +692,16 @@ int ha_tideflow::write_row(const uchar *buf)
     DBUG_RETURN(error);
 
   TFRow row{(uint32_t) values_.size(), values_.data()};
-  error= map_status(tideflow_write_row(share_->table.get(), &row));
-  if (!error)
-    wrote_rows_= true;
+  if ((error= map_status(tideflow_write_row(share_->table.get(), &row))))
+    DBUG_RETURN(error);
+  wrote_rows_= true;
+  /*
+    Under LOCK TABLES the statement end is not signalled to the engine
+    (external_lock runs at UNLOCK TABLES): make each single-row INSERT
+    durable on its own. Multi-row inserts sync in end_bulk_insert().
+  */
+  if (!in_bulk_insert_ && ha_thd()->locked_tables_mode != LTM_NONE)
+    error= sync_wal();
   DBUG_RETURN(error);
 }
 
@@ -635,19 +734,8 @@ int ha_tideflow::fill_record(uchar *buf, const TFRow &row)
       switch (c.conv) {
       case tf_conv::DATETIME:
       {
-        const longlong us= v.data.ts_us;
-        const longlong days= floor_div(us, MICROS_PER_DAY);
-        const longlong tod= us - days * MICROS_PER_DAY;
-        longlong y; unsigned m, d;
-        civil_from_days(days, &y, &m, &d);
         MYSQL_TIME lt;
-        memset(&lt, 0, sizeof(lt));
-        lt.year= (uint) y; lt.month= m; lt.day= d;
-        lt.hour= (uint) (tod / (3600 * MICROS_PER_SEC));
-        lt.minute= (uint) (tod / (60 * MICROS_PER_SEC) % 60);
-        lt.second= (uint) (tod / MICROS_PER_SEC % 60);
-        lt.second_part= (ulong) (tod % MICROS_PER_SEC);
-        lt.time_type= MYSQL_TIMESTAMP_DATETIME;
+        micros_to_time(v.data.ts_us, &lt);
         f->store_time_dec(&lt, f->decimals());
         break;
       }
@@ -683,7 +771,7 @@ int ha_tideflow::fill_record(uchar *buf, const TFRow &row)
 
 /* ── Statement end / durability ───────────────────────────────────────── */
 
-int ha_tideflow::end_bulk_insert()
+int ha_tideflow::sync_wal()
 {
   if (!wrote_rows_ || !share_ || !share_->table)
     return 0;
@@ -692,43 +780,49 @@ int ha_tideflow::end_bulk_insert()
                                       srv_wal_sync_mode == WAL_SYNC_FSYNC));
 }
 
+void ha_tideflow::start_bulk_insert(ha_rows, uint)
+{
+  in_bulk_insert_= true;
+}
+
+int ha_tideflow::end_bulk_insert()
+{
+  in_bulk_insert_= false;
+  return sync_wal();
+}
+
 int ha_tideflow::external_lock(THD *, int lock_type)
 {
   DBUG_ENTER("ha_tideflow::external_lock");
-  if (lock_type != F_UNLCK || !share_ || !share_->table)
-    DBUG_RETURN(0);
-
   /*
-    Statement end. TideFlow is non-transactional, so this is the point where
-    the client's OK is about to be sent: make appended rows durable.
+    F_UNLCK = statement end. TideFlow is non-transactional, so this is the
+    point where the client's OK is about to be sent: make rows durable.
   */
-  int error= end_bulk_insert();
-
-  if (srv_retention_check_interval > 0)
-  {
-    const time_t now= time(nullptr);
-    time_t last= share_->last_retention_check.load();
-    if (now - last >= (time_t) srv_retention_check_interval &&
-        share_->last_retention_check.compare_exchange_strong(last, now))
-    {
-      if (tideflow_apply_retention(share_->table.get()) != TF_OK)
-        sql_print_warning("TideFlow: retention sweep of %s failed: %s",
-                          table->s->path.str, take_last_error().c_str());
-    }
-  }
-  DBUG_RETURN(error);
+  DBUG_RETURN(lock_type == F_UNLCK ? sync_wal() : 0);
 }
 
-THR_LOCK_DATA **ha_tideflow::store_lock(THD *, THR_LOCK_DATA **to,
+THR_LOCK_DATA **ha_tideflow::store_lock(THD *thd, THR_LOCK_DATA **to,
                                         enum thr_lock_type lock_type)
 {
-  /*
-    Plain table locks: writers are exclusive. Scans take snapshots in the
-    core, but MemTable row positions (rnd_pos) are only stable while no
-    concurrent flush can happen, which exclusive writes guarantee.
-  */
   if (lock_type != TL_IGNORE && lock_data_.type == TL_UNLOCK)
+  {
+    /*
+      Like InnoDB: let INSERTs run concurrently with each other and with
+      SELECTs. The core serializes appends internally, and scans read
+      immutable snapshots, so row positions stay valid under concurrent
+      flushes and compactions. Statements that rebuild or empty the table
+      keep the exclusive lock.
+    */
+    const int cmd= thd_sql_command(thd);
+    if (lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE &&
+        !thd_in_lock_tables(thd) && cmd != SQLCOM_TRUNCATE &&
+        cmd != SQLCOM_OPTIMIZE && cmd != SQLCOM_DELETE &&
+        cmd != SQLCOM_CREATE_TABLE && cmd != SQLCOM_ALTER_TABLE)
+      lock_type= TL_WRITE_ALLOW_WRITE;
+    else if (lock_type == TL_READ_NO_INSERT && !thd_in_lock_tables(thd))
+      lock_type= TL_READ;
     lock_data_.type= lock_type;
+  }
   *to++= &lock_data_;
   return to;
 }
@@ -756,6 +850,13 @@ int ha_tideflow::tideflow_force_flush()
   return map_status(tideflow_flush(share_->table.get()));
 }
 
+int ha_tideflow::tideflow_compact_chunks(longlong from_us, longlong to_us)
+{
+  if (!share_ || !share_->table)
+    return HA_ERR_INTERNAL_ERROR;
+  return map_status(tideflow_compact(share_->table.get(), from_us, to_us));
+}
+
 int ha_tideflow::check(THD *thd, HA_CHECK_OPT *)
 {
   DBUG_ENTER("ha_tideflow::check");
@@ -774,33 +875,276 @@ int ha_tideflow::check(THD *thd, HA_CHECK_OPT *)
   DBUG_RETURN(HA_ADMIN_OK);
 }
 
-int ha_tideflow::optimize(THD *, HA_CHECK_OPT *)
+int ha_tideflow::optimize(THD *thd, HA_CHECK_OPT *)
 {
   DBUG_ENTER("ha_tideflow::optimize");
-  /* Seal the MemTable and expire old chunks. Chunk merging (compaction)
-     will be added here once implemented in the core. */
-  if (tideflow_force_flush() ||
-      map_status(tideflow_apply_retention(share_->table.get())))
+  /* Seal the MemTable, expire old chunks, merge and re-encode the rest. */
+  int error= tideflow_force_flush();
+  if (!error)
+    error= map_status(tideflow_apply_retention(share_->table.get()));
+  if (!error)
+    error= tideflow_compact_chunks(LONGLONG_MIN, LONGLONG_MAX);
+  if (error)
+  {
+    push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN, ER_UNKNOWN_ERROR,
+                        "TideFlow: %s", last_error_.c_str());
     DBUG_RETURN(HA_ADMIN_FAILED);
+  }
   DBUG_RETURN(HA_ADMIN_OK);
 }
 
-/* ── Full scans ───────────────────────────────────────────────────────── */
+/* ── Condition pushdown ───────────────────────────────────────────────── */
+
+namespace {
+
+const Item_field *field_of(Item *item, TABLE *table)
+{
+  Item *r= item->real_item();
+  if (r->type() != Item::FIELD_ITEM)
+    return nullptr;
+  auto *f= static_cast<const Item_field *>(r);
+  return f->field && f->field->table == table ? f : nullptr;
+}
+
+/*
+  Evaluates a constant string operand into `cs`'s character set. Returns
+  false when the item is not a cheap string constant (not pushable).
+*/
+bool const_string(Item *item, CHARSET_INFO *cs, std::string *out,
+                  bool *is_null)
+{
+  if (!item->const_item() || item->is_expensive() ||
+      item->cmp_type() != STRING_RESULT)
+    return false;
+  StringBuffer<MAX_FIELD_WIDTH> buf;
+  String *s= item->val_str(&buf);
+  if (!s || item->null_value)
+  {
+    *is_null= true;
+    return true;
+  }
+  if (my_charset_same(s->charset(), cs))
+    out->assign(s->ptr(), s->length());
+  else
+  {
+    String conv;
+    uint errors;
+    if (conv.copy(s->ptr(), s->length(), s->charset(), cs, &errors))
+      return false;
+    out->assign(conv.ptr(), conv.length());
+  }
+  return true;
+}
+
+} // namespace
+
+void ha_tideflow::collect_tag_predicates(const Item *cond,
+                                         std::vector<tf_tag_predicate> *out)
+{
+  Item *item= const_cast<Item *>(cond);
+  if (item->type() == Item::COND_ITEM)
+  {
+    auto *c= static_cast<Item_cond *>(item);
+    if (c->functype() != Item_func::COND_AND_FUNC)
+      return;
+    List_iterator_fast<Item> it(*c->argument_list());
+    while (Item *arg= it++)
+      collect_tag_predicates(arg, out);
+    return;
+  }
+  if (item->type() != Item::FUNC_ITEM)
+    return;
+  auto *fn= static_cast<Item_func *>(item);
+
+  /* column = one of `consts`, compared under `cmp_cs` */
+  auto add= [&](const Item_field *f, CHARSET_INFO *cmp_cs, Item **consts,
+                uint n) {
+    const int pos= share_->layout.tag_position(f->field->field_index);
+    if (pos < 0 || f->field->cmp_type() != STRING_RESULT)
+      return;
+    tf_tag_predicate p{pos, cmp_cs ? cmp_cs : f->field->charset(), {}};
+    for (uint i= 0; i < n; i++)
+    {
+      std::string v;
+      bool is_null= false;
+      if (!const_string(consts[i], p.cs, &v, &is_null))
+        return;
+      if (!is_null)            /* "col = NULL" never matches */
+        p.values.push_back(std::move(v));
+    }
+    out->push_back(std::move(p));
+  };
+
+  switch (fn->functype()) {
+  case Item_func::EQ_FUNC:
+  {
+    if (fn->argument_count() != 2)
+      return;
+    Item **a= fn->arguments();
+    for (int side= 0; side < 2; side++)
+      if (const Item_field *f= field_of(a[side], table))
+        add(f, static_cast<Item_bool_rowready_func2 *>(fn)->compare_collation(),
+            &a[1 - side], 1);
+    return;
+  }
+  case Item_func::MULT_EQUAL_FUNC:
+  {
+    auto *eq= static_cast<Item_equal *>(fn);
+    Item *c= eq->get_const();
+    if (!c)
+      return;
+    Item_equal_fields_iterator it(*eq);
+    while (Item *fi= it++)
+      if (const Item_field *f= field_of(fi, table))
+        add(f, eq->compare_collation(), &c, 1);
+    return;
+  }
+  case Item_func::IN_FUNC:
+  {
+    auto *in= static_cast<Item_func_in *>(fn);
+    if (in->negated || fn->argument_count() < 2)
+      return;
+    if (const Item_field *f= field_of(fn->arguments()[0], table))
+      add(f, in->compare_collation(), fn->arguments() + 1,
+          fn->argument_count() - 1);
+    return;
+  }
+  default:
+    return;
+  }
+}
+
+const COND *ha_tideflow::cond_push(const COND *cond)
+{
+  std::vector<tf_tag_predicate> preds;
+  if (share_ && cond)
+    collect_tag_predicates(cond, &preds);
+  pushed_.push_back(std::move(preds));
+  pushed_valid_= false;
+  /* The server keeps evaluating the full condition: we only prune series. */
+  return cond;
+}
+
+void ha_tideflow::cond_pop()
+{
+  if (!pushed_.empty())
+    pushed_.pop_back();
+  pushed_valid_= false;
+}
+
+int ha_tideflow::reset()
+{
+  pushed_.clear();
+  pushed_valid_= false;
+  scan_.reset();
+  snapshots_.clear();
+  scan_snapshot_saved_= false;
+  return 0;
+}
+
+/*
+  Series matching every pushed TAG predicate. Returns false when nothing
+  was pushed (no series restriction).
+*/
+bool ha_tideflow::pushed_series(const std::vector<uint64_t> **ids)
+{
+  *ids= &pushed_ids_;
+  if (pushed_valid_)
+    return pushed_filter_;
+  pushed_valid_= true;
+  pushed_ids_.clear();
+  std::vector<const tf_tag_predicate *> preds;
+  for (const auto &level : pushed_)
+    for (const tf_tag_predicate &p : level)
+      preds.push_back(&p);
+  pushed_filter_= !preds.empty();
+  if (!pushed_filter_)
+    return false;
+
+  TideFlowSeriesList *list= nullptr;
+  if (tideflow_series_list(share_->table.get(), &list) != TF_OK)
+  {
+    sql_print_warning("TideFlow: TAG pushdown disabled: %s",
+                      take_last_error().c_str());
+    pushed_filter_= false;
+    return false;
+  }
+  /* Character sets of the TAG columns, in TAG order. */
+  std::vector<CHARSET_INFO *> tag_cs;
+  for (const tf_column &c : share_->layout.columns)
+    if (c.conv == tf_conv::TAG)
+      tag_cs.push_back(table->field[c.field_index]->charset());
+
+  const uint64_t n= tideflow_series_list_len(list);
+  String conv;
+  for (uint64_t i= 0; i < n; i++)
+  {
+    uint64_t id= 0;
+    TFRow tags{0, nullptr};
+    if (tideflow_series_list_get(list, i, &id, &tags) != TF_OK)
+      continue;
+    bool match= true;
+    for (const tf_tag_predicate *p : preds)
+    {
+      if ((uint) p->tag_pos >= tags.col_count || tags.values[p->tag_pos].is_null)
+      {
+        match= false;
+        break;
+      }
+      const TFStr s= tags.values[p->tag_pos].data.str_val;
+      const char *ptr= s.ptr ? s.ptr : "";
+      size_t len= s.len;
+      CHARSET_INFO *from= tag_cs[p->tag_pos];
+      uint errors;
+      if (!my_charset_same(from, p->cs) &&
+          !conv.copy(ptr, len, from, p->cs, &errors))
+      {
+        ptr= conv.ptr();
+        len= conv.length();
+      }
+      bool any= false;
+      for (const std::string &v : p->values)
+        if (!p->cs->strnncollsp((const uchar *) ptr, len,
+                                (const uchar *) v.data(), v.size()))
+        {
+          any= true;
+          break;
+        }
+      if (!any)
+      {
+        match= false;
+        break;
+      }
+    }
+    if (match)
+      pushed_ids_.push_back(id);
+  }
+  tideflow_series_list_close(list);
+  return true;
+}
+
+/* ── Scans ────────────────────────────────────────────────────────────── */
+
+int ha_tideflow::open_scan(longlong lo, longlong hi, bool sorted)
+{
+  scan_.reset();
+  scan_snapshot_saved_= false;
+  const std::vector<uint64_t> *ids= nullptr;
+  const bool filtered= pushed_series(&ids);
+  TideFlowScan *s= nullptr;
+  int error= map_status(tideflow_scan_open_filtered(
+      share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
+      filtered ? (int64_t) ids->size() : -1, sorted, &s));
+  scan_.reset(s);
+  return error;
+}
 
 int ha_tideflow::rnd_init(bool scan)
 {
   DBUG_ENTER("ha_tideflow::rnd_init");
-  scan_.reset();
-  TideFlowScan *s= nullptr;
-  TFStatus st;
-  if (scan)
-    st= tideflow_scan_open(share_->table.get(), &s);
-  else
-    /* rnd_pos() only: an empty range opens a handle without copying data. */
-    st= tideflow_range_scan_open(share_->table.get(), 1, 0, nullptr, nullptr,
-                                 0, &s);
-  scan_.reset(s);
-  DBUG_RETURN(map_status(st));
+  /* scan == false: only rnd_pos() follows; positions resolve through the
+     snapshots kept by position(). */
+  DBUG_RETURN(scan ? open_scan(LONGLONG_MIN, LONGLONG_MAX, false) : 0);
 }
 
 int ha_tideflow::read_from_scan(uchar *buf, bool backward, int end_error)
@@ -838,6 +1182,25 @@ void ha_tideflow::position(const uchar *)
   {
     take_last_error();
     memset(ref, 0xff, ref_length);
+    DBUG_VOID_RETURN;
+  }
+  if (!scan_snapshot_saved_)
+  {
+    /* Keep the scan's snapshot so rnd_pos() can resolve this position even
+       after the scan is closed and the table has changed. Consecutive
+       scans over unchanged data share one snapshot. */
+    TideFlowSnapshot *snap= nullptr;
+    if (tideflow_scan_snapshot(scan_.get(), &snap) == TF_OK)
+    {
+      tf_snapshot_ptr p(snap);
+      if (snapshots_.empty() ||
+          tideflow_snapshot_version(snapshots_.back().get()) !=
+          tideflow_snapshot_version(snap))
+        snapshots_.push_back(std::move(p));
+    }
+    else
+      take_last_error();
+    scan_snapshot_saved_= true;
   }
   DBUG_VOID_RETURN;
 }
@@ -845,11 +1208,35 @@ void ha_tideflow::position(const uchar *)
 int ha_tideflow::rnd_pos(uchar *buf, uchar *pos)
 {
   DBUG_ENTER("ha_tideflow::rnd_pos");
-  if (!scan_)
-    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   TFRow row{0, nullptr};
-  if (int error= map_status(tideflow_scan_fetch(scan_.get(), pos, &row)))
-    DBUG_RETURN(error == HA_ERR_NO_SUCH_TABLE ? HA_ERR_RECORD_DELETED : error);
+  for (auto it= snapshots_.rbegin(); it != snapshots_.rend(); ++it)
+  {
+    TFStatus st= tideflow_snapshot_fetch(it->get(), pos, &row);
+    if (st == TF_OK)
+      DBUG_RETURN(fill_record(buf, row));
+    if (st != TF_ERR_NOT_FOUND)
+      DBUG_RETURN(map_status(st));
+    take_last_error();
+  }
+  /* Position produced elsewhere (e.g. by a cloned handler): resolve it
+     against the current contents. */
+  TideFlowScan *s= nullptr;
+  if (int error= map_status(tideflow_scan_open_filtered(
+          share_->table.get(), 1, 0, nullptr, -1, false, &s)))
+    DBUG_RETURN(error);
+  tf_scan_ptr tmp(s);
+  TideFlowSnapshot *snap= nullptr;
+  if (int error= map_status(tideflow_scan_snapshot(tmp.get(), &snap)))
+    DBUG_RETURN(error);
+  snapshots_.emplace_back(snap);
+  TFStatus st= tideflow_snapshot_fetch(snap, pos, &row);
+  if (st == TF_ERR_NOT_FOUND)
+  {
+    take_last_error();
+    DBUG_RETURN(HA_ERR_RECORD_DELETED);
+  }
+  if (int error= map_status(st))
+    DBUG_RETURN(error);
   DBUG_RETURN(fill_record(buf, row));
 }
 
@@ -892,9 +1279,7 @@ longlong ha_tideflow::key_to_ts(uint idx, const uchar *key)
     if (f->get_date(&lt, date_mode_t(0)) || lt.month == 0 || lt.day == 0)
       ts= LONGLONG_MIN;   /* zero date sorts before everything */
     else
-      ts= (((days_from_civil(lt.year, lt.month, lt.day) * 24 + lt.hour) * 60 +
-            lt.minute) * 60 + lt.second) * MICROS_PER_SEC +
-          (longlong) lt.second_part;
+      ts= time_to_micros(lt);
   }
   f->move_field_offset(-diff);
   return ts;
@@ -903,15 +1288,11 @@ longlong ha_tideflow::key_to_ts(uint idx, const uchar *key)
 int ha_tideflow::open_range_scan(longlong lo, longlong hi, bool backward,
                                  uchar *buf, int not_found_error)
 {
-  scan_.reset();
-  TideFlowScan *s= nullptr;
-  int error= map_status(tideflow_range_scan_open(share_->table.get(), lo, hi,
-                                                 nullptr, nullptr, 0, &s));
-  scan_.reset(s);
-  if (error)
+  if (int error= open_scan(lo, hi, true))
     return error;
-  if (backward && (error= map_status(tideflow_scan_seek_end(scan_.get()))))
-    return error;
+  if (backward)
+    if (int error= map_status(tideflow_scan_seek_end(scan_.get())))
+      return error;
   return read_from_scan(buf, backward, not_found_error);
 }
 
@@ -953,8 +1334,8 @@ int ha_tideflow::index_read_map(uchar *buf, const uchar *key,
   /*
     For forward range reads the server has already set end_range (see
     handler::read_range_first) and stops at it; bounding the scan with it
-    avoids materializing rows past the end of the range. Bounding by the end
-    key inclusively is always a superset, the server re-checks the bound.
+    lets the merge skip runs past the end. Bounding by the end key
+    inclusively is always a superset, the server re-checks the bound.
   */
   if (!backward && end_range && end_range->key)
     hi= std::min(hi, key_to_ts(active_index, end_range->key));
@@ -1038,6 +1419,367 @@ ha_rows ha_tideflow::records_in_range(uint inx, const key_range *min_key,
   DBUG_RETURN((ha_rows) std::max<uint64_t>(rows, 1));
 }
 
+/* ── INFORMATION_SCHEMA ───────────────────────────────────────────────── */
+
+namespace {
+
+/*
+  Calls f(db, table, path) for every TideFlow table directory in the data
+  directory: <datadir>/<db>/<table>/MANIFEST next to <db>/<table>.frm.
+  f returns true to stop.
+*/
+template <typename F> void for_each_tideflow_table(F f)
+{
+  namespace fs= std::filesystem;
+  try
+  {
+    for (const fs::directory_entry &db : fs::directory_iterator(mysql_real_data_home))
+    {
+      std::error_code ec;
+      if (!db.is_directory(ec))
+        continue;
+      const std::string db_file= db.path().filename().string();
+      if (db_file.empty() || db_file[0] == '#' || db_file[0] == '.')
+        continue;
+      for (const fs::directory_entry &t : fs::directory_iterator(db.path()))
+      {
+        if (!t.is_directory(ec))
+          continue;
+        const std::string t_file= t.path().filename().string();
+        if (t_file.rfind("#sql", 0) == 0 ||
+            !fs::exists(t.path() / "MANIFEST", ec) ||
+            !fs::exists(db.path() / (t_file + ".frm"), ec))
+          continue;
+        char db_name[NAME_LEN + 1], t_name[NAME_LEN + 1];
+        filename_to_tablename(db_file.c_str(), db_name, sizeof(db_name));
+        filename_to_tablename(t_file.c_str(), t_name, sizeof(t_name));
+        if (f(db_name, t_name, t.path().string()))
+          return;
+      }
+    }
+  }
+  catch (const std::exception &e)
+  {
+    sql_print_warning("TideFlow: cannot scan the data directory: %s", e.what());
+  }
+}
+
+struct tf_info_closer
+{
+  void operator()(TideFlowInfo *i) const noexcept { tideflow_info_close(i); }
+};
+
+void store_str(Field *f, const char *s)
+{
+  f->store(s ? s : "", s ? strlen(s) : 0, system_charset_info);
+}
+
+void store_micros(Field *f, longlong us)
+{
+  MYSQL_TIME lt;
+  micros_to_time(us, &lt);
+  f->store_time_dec(&lt, 6);
+}
+
+/* Visits every TideFlow table the user may see; f(db, table, info). */
+template <typename F> int fill_tideflow_is(THD *thd, F f)
+{
+  /* Like InnoDB's I_S tables: storage internals need PROCESS. */
+  if (check_global_access(thd, PROCESS_ACL, true))
+    return 0;
+  int result= 0;
+  for_each_tideflow_table([&](const char *db, const char *tbl,
+                              const std::string &path) {
+    TideFlowInfo *raw= nullptr;
+    if (tideflow_inspect(path.c_str(), &raw) != TF_OK)
+    {
+      push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+                          ER_UNKNOWN_ERROR, "TideFlow: %s.%s: %s", db, tbl,
+                          take_last_error().c_str());
+      return false;
+    }
+    std::unique_ptr<TideFlowInfo, tf_info_closer> info(raw);
+    result= f(db, tbl, info.get());
+    return result != 0;
+  });
+  return result;
+}
+
+namespace tf_show {
+
+ST_FIELD_INFO tables_fields[]=
+{
+  Show::Column("TABLE_SCHEMA",      Show::Varchar(NAME_CHAR_LEN), NOT_NULL),
+  Show::Column("TABLE_NAME",        Show::Varchar(NAME_CHAR_LEN), NOT_NULL),
+  Show::Column("ROW_COUNT",         Show::ULonglong(),            NOT_NULL),
+  Show::Column("PENDING_ROWS",      Show::ULonglong(),            NOT_NULL),
+  Show::Column("SERIES",            Show::ULonglong(),            NOT_NULL),
+  Show::Column("DATA_BYTES",        Show::ULonglong(),            NOT_NULL),
+  Show::Column("COMPRESSED_BYTES",  Show::ULonglong(),            NOT_NULL),
+  Show::Column("CHUNKS",            Show::ULong(),                NOT_NULL),
+  Show::Column("HOT_CHUNKS",        Show::ULong(),                NOT_NULL),
+  Show::Column("WARM_CHUNKS",       Show::ULong(),                NOT_NULL),
+  Show::Column("COLD_CHUNKS",       Show::ULong(),                NOT_NULL),
+  Show::Column("COMPACTING_CHUNKS", Show::ULong(),                NOT_NULL),
+  Show::Column("EXPIRED_CHUNKS",    Show::ULong(),                NOT_NULL),
+  Show::Column("RETENTION",         Show::Varchar(32),            NOT_NULL),
+  Show::Column("CHUNK_INTERVAL",    Show::Varchar(32),            NOT_NULL),
+  Show::Column("COMPRESSION",       Show::Varchar(8),             NOT_NULL),
+  Show::Column("ENCRYPTED",         Show::Varchar(3),             NOT_NULL),
+  Show::Column("IS_OPEN",           Show::Varchar(3),             NOT_NULL),
+  Show::CEnd()
+};
+
+ST_FIELD_INFO chunks_fields[]=
+{
+  Show::Column("TABLE_SCHEMA",      Show::Varchar(NAME_CHAR_LEN), NOT_NULL),
+  Show::Column("TABLE_NAME",        Show::Varchar(NAME_CHAR_LEN), NOT_NULL),
+  Show::Column("CHUNK_ID",          Show::ULonglong(),            NOT_NULL),
+  Show::Column("TS_MIN",            Show::Datetime(6),            NOT_NULL),
+  Show::Column("TS_MAX",            Show::Datetime(6),            NOT_NULL),
+  Show::Column("ROWS",              Show::ULonglong(),            NOT_NULL),
+  Show::Column("SERIES",            Show::ULong(),                NOT_NULL),
+  Show::Column("DATA_MB",           Show::Double(20),             NOT_NULL),
+  Show::Column("COMPRESSED_MB",     Show::Double(20),             NOT_NULL),
+  Show::Column("RATIO",             Show::Double(20),             NOT_NULL),
+  Show::Column("STATUS",            Show::Varchar(16),            NOT_NULL),
+  Show::Column("COMPRESSION",       Show::Varchar(8),             NOT_NULL),
+  Show::Column("ENCRYPTED",         Show::Varchar(3),             NOT_NULL),
+  Show::Column("SEALED_AT",         Show::Datetime(6),            NOT_NULL),
+  Show::Column("CHUNK_FILE",        Show::Varchar(255),           NOT_NULL),
+  Show::CEnd()
+};
+
+} // namespace tf_show
+
+int tables_fill(THD *thd, TABLE_LIST *tables, Item *)
+{
+  TABLE *t= tables->table;
+  return fill_tideflow_is(thd, [&](const char *db, const char *tbl,
+                                   const TideFlowInfo *info) {
+    const TFTableInfo *ti= tideflow_info_table(info);
+    if (!ti)
+      return 0;
+    restore_record(t, s->default_values);
+    Field **f= t->field;
+    store_str(f[0], db);
+    store_str(f[1], tbl);
+    f[2]->store((longlong) ti->row_count, true);
+    f[3]->store((longlong) ti->pending_rows, true);
+    f[4]->store((longlong) ti->series_count, true);
+    f[5]->store((longlong) ti->data_bytes, true);
+    f[6]->store((longlong) ti->compressed_bytes, true);
+    f[7]->store((longlong) ti->chunk_count, true);
+    f[8]->store((longlong) ti->hot_chunks, true);
+    f[9]->store((longlong) ti->warm_chunks, true);
+    f[10]->store((longlong) ti->cold_chunks, true);
+    f[11]->store((longlong) ti->compacting_chunks, true);
+    f[12]->store((longlong) ti->expired_chunks, true);
+    store_str(f[13], ti->retention_period);
+    store_str(f[14], ti->chunk_interval);
+    store_str(f[15], ti->compression);
+    store_str(f[16], ti->encrypted ? "YES" : "NO");
+    store_str(f[17], ti->is_open ? "YES" : "NO");
+    return schema_table_store_record(thd, t) ? 1 : 0;
+  });
+}
+
+int chunks_fill(THD *thd, TABLE_LIST *tables, Item *)
+{
+  TABLE *t= tables->table;
+  return fill_tideflow_is(thd, [&](const char *db, const char *tbl,
+                                   const TideFlowInfo *info) {
+    const uint32_t n= tideflow_info_chunk_count(info);
+    for (uint32_t i= 0; i < n; i++)
+    {
+      const TFChunkInfo *c= tideflow_info_chunk(info, i);
+      if (!c)
+        continue;
+      restore_record(t, s->default_values);
+      Field **f= t->field;
+      constexpr double MB= 1024.0 * 1024.0;
+      store_str(f[0], db);
+      store_str(f[1], tbl);
+      f[2]->store((longlong) c->chunk_id, true);
+      store_micros(f[3], c->ts_min_us);
+      store_micros(f[4], c->ts_max_us);
+      f[5]->store((longlong) c->rows, true);
+      f[6]->store((longlong) c->series, true);
+      f[7]->store((double) c->data_bytes / MB);
+      f[8]->store((double) c->compressed_bytes / MB);
+      f[9]->store(c->data_bytes ? (double) c->compressed_bytes /
+                                  (double) c->data_bytes : 0.0);
+      store_str(f[10], c->status);
+      store_str(f[11], c->compression);
+      store_str(f[12], c->encrypted ? "YES" : "NO");
+      store_micros(f[13], c->sealed_at_us);
+      store_str(f[14], c->file_name);
+      if (schema_table_store_record(thd, t))
+        return 1;
+    }
+    return 0;
+  });
+}
+
+int tables_init(void *p)
+{
+  auto *schema= static_cast<ST_SCHEMA_TABLE *>(p);
+  schema->fields_info= tf_show::tables_fields;
+  schema->fill_table= tables_fill;
+  return 0;
+}
+
+int chunks_init(void *p)
+{
+  auto *schema= static_cast<ST_SCHEMA_TABLE *>(p);
+  schema->fields_info= tf_show::chunks_fields;
+  schema->fill_table= chunks_fill;
+  return 0;
+}
+
+struct st_mysql_information_schema tideflow_is_info=
+{ MYSQL_INFORMATION_SCHEMA_INTERFACE_VERSION };
+
+} // namespace
+
+/* ── UDFs behind CALL tideflow_compact / tideflow_apply_retention ─────── */
+
+namespace {
+
+/* 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]' (UTC wall clock) → µs; '' → `dflt`. */
+bool parse_bound(const char *s, size_t len, longlong dflt, longlong *out)
+{
+  std::string str(s ? s : "", s ? len : 0);
+  if (str.empty())
+  {
+    *out= dflt;
+    return false;
+  }
+  MYSQL_TIME lt;
+  memset(&lt, 0, sizeof(lt));
+  char frac[8]= "";
+  int n= sscanf(str.c_str(), "%4u-%2u-%2u %2u:%2u:%2u.%6[0-9]", &lt.year,
+                &lt.month, &lt.day, &lt.hour, &lt.minute, &lt.second, frac);
+  if (n < 3 || lt.month < 1 || lt.month > 12 || lt.day < 1 || lt.day > 31 ||
+      lt.hour > 23 || lt.minute > 59 || lt.second > 59)
+    return true;
+  if (n == 7)
+  {
+    std::string digits(frac);
+    digits.resize(6, '0');
+    lt.second_part= strtoul(digits.c_str(), nullptr, 10);
+  }
+  *out= time_to_micros(lt);
+  return false;
+}
+
+/* Handle to an open TideFlow table, or NULL with an error raised. */
+TideFlowTable *lookup_open_table(UDF_ARGS *args)
+{
+  if (!args->args[0] || !args->args[1])
+  {
+    my_printf_error(ER_UNKNOWN_ERROR, "TideFlow: database and table are required", MYF(0));
+    return nullptr;
+  }
+  std::string db(args->args[0], args->lengths[0]);
+  std::string tbl(args->args[1], args->lengths[1]);
+  char path[FN_REFLEN + 1];
+  build_table_filename(path, sizeof(path) - 1, db.c_str(), tbl.c_str(), "", 0);
+  TideFlowTable *t= nullptr;
+  if (tideflow_table_lookup(path, &t) != TF_OK)
+  {
+    take_last_error();
+    my_printf_error(ER_UNKNOWN_ERROR,
+                    "TideFlow: %s.%s is not an open TideFlow table (use the "
+                    "tideflow_compact / tideflow_apply_retention procedures, "
+                    "which open it)", MYF(0), db.c_str(), tbl.c_str());
+    return nullptr;
+  }
+  return t;
+}
+
+bool init_string_args(UDF_INIT *initid, UDF_ARGS *args, uint n,
+                      const char *usage, char *message)
+{
+  if (args->arg_count != n)
+  {
+    snprintf(message, MYSQL_ERRMSG_SIZE, "usage: %s", usage);
+    return true;
+  }
+  for (uint i= 0; i < n; i++)
+    args->arg_type[i]= STRING_RESULT;
+  initid->maybe_null= false;
+  return false;
+}
+
+} // namespace
+
+extern "C" {
+
+my_bool tideflow_compact_impl_init(UDF_INIT *initid, UDF_ARGS *args,
+                                char *message)
+{
+  return init_string_args(initid, args, 4,
+                          "tideflow_compact_impl(db, table, from, to)", message);
+}
+
+long long tideflow_compact_impl(UDF_INIT *, UDF_ARGS *args, char *,
+                                char *error)
+{
+  longlong lo, hi;
+  if (parse_bound(args->args[2], args->lengths[2], LONGLONG_MIN, &lo) ||
+      parse_bound(args->args[3], args->lengths[3], LONGLONG_MAX, &hi))
+  {
+    my_printf_error(ER_UNKNOWN_ERROR,
+                    "TideFlow: bounds must be 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]'",
+                    MYF(0));
+    *error= 1;
+    return 0;
+  }
+  tf_table_ptr t(lookup_open_table(args));
+  if (!t)
+  {
+    *error= 1;
+    return 0;
+  }
+  if (tideflow_compact(t.get(), lo, hi) != TF_OK)
+  {
+    my_printf_error(ER_UNKNOWN_ERROR, "TideFlow: %s", MYF(0),
+                    take_last_error().c_str());
+    *error= 1;
+    return 0;
+  }
+  return 1;
+}
+
+my_bool tideflow_retention_impl_init(UDF_INIT *initid, UDF_ARGS *args,
+                                  char *message)
+{
+  return init_string_args(initid, args, 2,
+                          "tideflow_retention_impl(db, table)", message);
+}
+
+long long tideflow_retention_impl(UDF_INIT *, UDF_ARGS *args, char *,
+                                  char *error)
+{
+  tf_table_ptr t(lookup_open_table(args));
+  if (!t)
+  {
+    *error= 1;
+    return 0;
+  }
+  if (tideflow_apply_retention(t.get()) != TF_OK)
+  {
+    my_printf_error(ER_UNKNOWN_ERROR, "TideFlow: %s", MYF(0),
+                    take_last_error().c_str());
+    *error= 1;
+    return 0;
+  }
+  return 1;
+}
+
+} // extern "C"
+
 /* ── Plugin registration ──────────────────────────────────────────────── */
 
 static handler *tideflow_create_handler(handlerton *hton, TABLE_SHARE *table,
@@ -1057,7 +1799,17 @@ static int tideflow_init_func(void *p)
   tideflow_hton->flags= HTON_NO_FLAGS;
   tideflow_hton->table_options= tideflow_table_option_list;
   tideflow_hton->tablefile_extensions= tideflow_exts;
+  push_globals();
+  tideflow_set_key_callback(tideflow_key_callback);
+  tideflow_maintenance_start(srv_compaction_threads);
   DBUG_RETURN(0);
+}
+
+static int tideflow_deinit_func(void *)
+{
+  tideflow_maintenance_stop();
+  tideflow_set_key_callback(nullptr);
+  return 0;
 }
 
 static struct st_mysql_storage_engine tideflow_storage_engine=
@@ -1069,14 +1821,44 @@ maria_declare_plugin(tideflow)
   &tideflow_storage_engine,
   "TideFlow",
   "Kevenny / Rech Informatica",
-  "Time-series storage engine: append-only, chunked by time, WAL-backed",
+  "Time-series storage engine: append-only, chunked by time, compressed, WAL-backed",
   PLUGIN_LICENSE_GPL,
   tideflow_init_func,                    /* Plugin Init   */
-  NULL,                                  /* Plugin Deinit */
-  0x0001,                                /* version 0.1   */
+  tideflow_deinit_func,                  /* Plugin Deinit */
+  0x0002,                                /* version 0.2   */
   NULL,                                  /* status vars   */
   tideflow_system_variables,             /* system vars   */
-  "0.1.0",                               /* string version */
+  "0.2.0",                               /* string version */
   MariaDB_PLUGIN_MATURITY_EXPERIMENTAL   /* maturity      */
+},
+{
+  MYSQL_INFORMATION_SCHEMA_PLUGIN,
+  &tideflow_is_info,
+  "TIDEFLOW_TABLES",
+  "Kevenny / Rech Informatica",
+  "TideFlow tables: rows, sizes, chunk states",
+  PLUGIN_LICENSE_GPL,
+  tables_init,
+  NULL,
+  0x0002,
+  NULL,
+  NULL,
+  "0.2.0",
+  MariaDB_PLUGIN_MATURITY_EXPERIMENTAL
+},
+{
+  MYSQL_INFORMATION_SCHEMA_PLUGIN,
+  &tideflow_is_info,
+  "TIDEFLOW_CHUNKS",
+  "Kevenny / Rech Informatica",
+  "TideFlow chunks: time range, size, compression, status",
+  PLUGIN_LICENSE_GPL,
+  chunks_init,
+  NULL,
+  0x0002,
+  NULL,
+  NULL,
+  "0.2.0",
+  MariaDB_PLUGIN_MATURITY_EXPERIMENTAL
 }
 maria_declare_plugin_end;

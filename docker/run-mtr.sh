@@ -12,6 +12,8 @@ PLUGIN_DIR=$(dirname "$(find /usr/lib -name ha_archive.so -path '*plugin*' | hea
 cp /work/build/ha_tideflow.so "$PLUGIN_DIR/"
 ln -sfn /work/mysql-test/suite/tideflow "$MTR_DIR/suite/tideflow"
 
+export TIDEFLOW_INSTALL_SQL=/work/storage/tideflow/sql/tideflow_install.sql
+
 cd "$MTR_DIR"
 exec ./mariadb-test-run --suite=tideflow --force --max-test-fail=0 \
   --vardir=/tmp/mtr-var "$@"

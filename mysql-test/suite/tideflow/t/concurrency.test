@@ -1,0 +1,57 @@
+#
+# INSERTs run concurrently with SELECTs and with each other; LOCK TABLES
+# inserts are durable statement by statement.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/tideflow/include/have_tideflow.inc
+
+CREATE TABLE c (ts DATETIME(6) NOT NULL, w INT, INDEX(ts)) ENGINE=TideFlow MEMTABLE_SIZE=65536;
+INSERT INTO c SELECT '2026-01-01' + INTERVAL seq SECOND, 0 FROM seq_1_to_200;
+
+--echo # A slow reader holds the table...
+connect (reader, localhost, root,,);
+send SELECT COUNT(*), SLEEP(3) FROM c WHERE w = 0 AND SLEEP(0.01) = 0;
+
+--echo # ... while two writers insert (and flush, the MemTable is tiny)
+connect (w1, localhost, root,,);
+send INSERT INTO c SELECT '2026-02-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_3000;
+connect (w2, localhost, root,,);
+INSERT INTO c SELECT '2026-03-01' + INTERVAL seq SECOND, 2 FROM seq_1_to_3000;
+connection w1;
+reap;
+
+--echo # The reader is still running: the writers were not blocked
+connection default;
+SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE 'SELECT COUNT(*), SLEEP(3)%';
+SELECT w, COUNT(*) FROM c GROUP BY w ORDER BY w;
+
+--echo # The reader saw its snapshot
+connection reader;
+--replace_column 2 #
+reap;
+disconnect reader;
+disconnect w1;
+disconnect w2;
+connection default;
+
+--echo # Filesort (rnd_pos) while another session flushes and compacts
+connect (w3, localhost, root,,);
+send INSERT INTO c SELECT '2026-04-01' + INTERVAL seq SECOND, 3 FROM seq_1_to_5000;
+connection default;
+SELECT w, v FROM (SELECT w, ts AS v FROM c WHERE w IN (1, 2) ORDER BY w DESC, ts DESC LIMIT 2) x ORDER BY w;
+connection w3;
+reap;
+disconnect w3;
+connection default;
+SELECT COUNT(*) FROM c;
+
+--echo # LOCK TABLES: every single-row INSERT is durable right away
+LOCK TABLES c WRITE;
+INSERT INTO c VALUES ('2026-05-01', 5);
+INSERT INTO c VALUES ('2026-05-02', 5);
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*) FROM c WHERE w = 5;
+
+DROP TABLE c;

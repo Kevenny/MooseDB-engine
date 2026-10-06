@@ -1,0 +1,110 @@
+//! Delta and delta-of-delta encoding of signed integers (timestamps, counters).
+//!
+//! ```text
+//! stream := first:i64 simple8b(zigzag(d1), zigzag(d2), ...)
+//! ```
+//!
+//! With delta-of-delta, regular intervals (every 10 s, every 1 min) encode to
+//! runs of zeros that Simple8b packs 240 per word. All arithmetic wraps, so
+//! any i64 sequence round-trips.
+
+use super::simple8b;
+use crate::bytes::{put_i64, ByteReader};
+use crate::error::Result;
+
+fn zigzag(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
+fn unzigzag(u: u64) -> i64 {
+    ((u >> 1) as i64) ^ -((u & 1) as i64)
+}
+
+/// `order` 1 = delta, 2 = delta-of-delta.
+fn encode(values: &[i64], order: u8, out: &mut Vec<u8>) {
+    let Some(&first) = values.first() else { return };
+    put_i64(out, first);
+    let mut prev_delta = 0i64;
+    let residuals: Vec<u64> = values
+        .windows(2)
+        .map(|w| {
+            let d = w[1].wrapping_sub(w[0]);
+            let r = if order == 2 { d.wrapping_sub(prev_delta) } else { d };
+            prev_delta = d;
+            zigzag(r)
+        })
+        .collect();
+    simple8b::encode(&residuals, out);
+}
+
+fn decode(r: &mut ByteReader<'_>, count: usize, order: u8) -> Result<Vec<i64>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let first = r.i64()?;
+    let residuals = simple8b::decode(r, count - 1)?;
+    let mut out = Vec::with_capacity(count);
+    out.push(first);
+    let (mut prev, mut prev_delta) = (first, 0i64);
+    for z in residuals {
+        let res = unzigzag(z);
+        let d = if order == 2 { prev_delta.wrapping_add(res) } else { res };
+        prev = prev.wrapping_add(d);
+        prev_delta = d;
+        out.push(prev);
+    }
+    Ok(out)
+}
+
+pub(crate) fn encode_delta(values: &[i64], out: &mut Vec<u8>) {
+    encode(values, 1, out);
+}
+
+pub(crate) fn decode_delta(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<i64>> {
+    decode(r, count, 1)
+}
+
+pub(crate) fn encode_delta_of_delta(values: &[i64], out: &mut Vec<u8>) {
+    encode(values, 2, out);
+}
+
+pub(crate) fn decode_delta_of_delta(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<i64>> {
+    decode(r, count, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zigzag_roundtrip() {
+        for v in [0, 1, -1, 63, -64, i64::MAX, i64::MIN] {
+            assert_eq!(unzigzag(zigzag(v)), v);
+        }
+    }
+
+    #[test]
+    fn regular_timestamps_compress_to_almost_nothing() {
+        let ts: Vec<i64> = (0..10_000).map(|i| 1_700_000_000_000_000 + i * 10_000_000).collect();
+        let mut buf = Vec::new();
+        encode_delta_of_delta(&ts, &mut buf);
+        assert!(buf.len() < 400, "{} bytes", buf.len());
+        assert_eq!(decode_delta_of_delta(&mut ByteReader::new(&buf), ts.len()).unwrap(), ts);
+    }
+
+    #[test]
+    fn extremes_roundtrip() {
+        let vals = vec![i64::MIN, i64::MAX, 0, -1, i64::MIN, 5, 5, 5];
+        for order in [1, 2] {
+            let mut buf = Vec::new();
+            encode(&vals, order, &mut buf);
+            assert_eq!(decode(&mut ByteReader::new(&buf), vals.len(), order).unwrap(), vals);
+        }
+        let mut buf = Vec::new();
+        encode_delta(&[], &mut buf);
+        assert!(buf.is_empty());
+        assert!(decode_delta(&mut ByteReader::new(&buf), 0).unwrap().is_empty());
+        encode_delta(&[42], &mut buf);
+        assert_eq!(decode_delta(&mut ByteReader::new(&buf), 1).unwrap(), vec![42]);
+    }
+}
