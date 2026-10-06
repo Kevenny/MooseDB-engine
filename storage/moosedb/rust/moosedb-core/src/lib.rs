@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod batch;
 mod block;
 mod bytes;
 mod cache;
@@ -37,6 +38,7 @@ pub mod table;
 pub mod time;
 mod wal;
 
+pub use batch::Batch;
 pub use compaction::CompactionReport;
 pub use error::{Error, Result};
 pub use options::{RawOptions, TableConfig, TableOptions};

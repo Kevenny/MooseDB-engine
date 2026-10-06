@@ -44,7 +44,7 @@ Cada tabela é um diretório `<datadir>/<schema>/<tabela>/`:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `MANIFEST` | lista de chunks vivos + checkpoint do WAL (CRC32, troca atômica) |
+| `MANIFEST` | lista de chunks vivos + checkpoint do WAL (`wal_seq`) + início do replay (`replay_seq`) (v2; CRC32, troca atômica) |
 | `OPTIONS` | TABLE OPTIONS normalizadas (texto), lidas pelo INFORMATION_SCHEMA |
 | `wal_NNNNNN.tfl.wal` | segmentos do WAL |
 | `chunk_<início>_<fim>_<id>.tfl` | chunk selado (formato v2, `chunk.rs`) |
@@ -99,6 +99,66 @@ em modo **read-only** até ser reaberta; um fsync nunca é "tentado de novo"
 pela recuperação. Erros de validação (linha acima de 1 GiB no WAL) só falham
 o statement.
 
+### Atomicidade por statement (lotes)
+
+Cada statement escreve num **lote** (`batch.rs`): as linhas ficam num buffer
+privado e entram na MemTable **de uma vez**, sob o mutex, no commit — um
+snapshot nunca vê parte de um statement. O handler faz commit no fim de todo
+statement (`external_lock(F_UNLCK)`, `end_bulk_insert`, e `reset()`/`close()`
+como rede de segurança; INSERT de uma linha sob `LOCK TABLES` usa a escrita
+de linha única — atômica — seguida de sync do WAL), **inclusive
+quando o statement falha**: a engine é não transacional para o servidor e o
+binlog já registra as linhas inseridas; descartá-las divergiria a réplica.
+
+Casos específicos:
+
+* **Triggers, funções e `CALL`** (modos *prelocked*): o servidor não chama
+  `start_bulk_insert`, mas a escrita continua em lote; o commit ocorre no
+  `external_lock(F_UNLCK)` do statement externo ou, dentro de `CALL`/`LOCK
+  TABLES`, no `reset()` ao fim da sub-instrução que usou a tabela.
+* **Ler as próprias escritas**: linhas do statement corrente são invisíveis
+  também para a própria sessão até o commit — um trigger ou rotina não vê as
+  linhas que o statement externo acabou de inserir.
+* **Réplica (RBR)**: o servidor aplica um statement em vários eventos de
+  linhas; o commit é adiado até `STMT_END_F` (fim do statement, antes de a
+  posição do relay log avançar) — um commit e um fsync por statement.
+* **`LOCK TABLES`**: INSERT de uma linha fora de lote é gravado e sincronizado
+  na hora; multi-linha commita em `end_bulk_insert`.
+* Erro de commit em `reset()` é reportado ao cliente (`print_error`); em
+  `close()`/destrutor (caminhos anormais) só vai para o log.
+
+WAL v2 (segmentos v1 continuam legíveis, cada entrada = linha commitada):
+
+| kind | corpo | significado |
+|---|---|---|
+| ROW | `batch_id` + linha | linha de lote ainda não commitado |
+| COMMIT | `batch_id` | todas as ROW do lote passam a valer |
+| ROW_COMMIT | linha | lote de uma linha |
+
+Replay e checkpoint (granularidade de segmento):
+
+* o flush grava `wal_seq` (até onde a MemTable foi selada) e
+  `replay_seq = min(wal_seq + 1, segmento da 1ª linha de qualquer lote aberto)`;
+  só segmentos `< replay_seq` são apagados — um lote aberto nunca perde linhas
+  por causa de um flush de outro escritor;
+* o replay lê a partir de `replay_seq`, agrupa por lote e aplica um lote só ao
+  achar seu COMMIT **depois** de `wal_seq` (os anteriores já estão em chunks —
+  sem duplicação); lote sem COMMIT é descartado (crash no meio do statement
+  não deixa linhas);
+* ids de lote nunca se repetem (`max visto + 1` na abertura); TRUNCATE
+  invalida lotes abertos por época.
+
+**Spill**: quando o buffer de um lote passa de `MEMTABLE_SIZE`, ele grava
+chunks *em estágio* (protocolo `.tmp` → fsync → rename, fora do MANIFEST) e
+para de logar no WAL. O commit grava o restante em estágio e faz **um** swap
+de MANIFEST com todos — commit durável e atômico; sem COMMIT no WAL, as
+linhas logadas antes do spill são descartadas no replay. Abort/crash: os
+chunks em estágio são órfãos e são removidos. Memória por lote limitada a
+`MEMTABLE_SIZE` (N statements concorrentes na mesma tabela: até N ×
+`MEMTABLE_SIZE`). Um lote aberto que logou no WAL retém os segmentos desde a
+sua primeira linha enquanto durar o statement; acima de 64 segmentos retidos
+a engine registra um warning no log.
+
 ### Limites de dados não confiáveis
 
 Arquivos em disco são tratados como entrada não confiável: nenhum campo lido
@@ -113,7 +173,8 @@ Os mesmos limites são aplicados na escrita (erro explícito, nunca perda).
 * `store_lock` faz como o InnoDB: INSERTs rodam concorrentes entre si e com
   SELECTs (`TL_WRITE_ALLOW_WRITE`); TRUNCATE/OPTIMIZE/DELETE/ALTER continuam
   exclusivos.
-* O core serializa os appends num mutex; leitores só seguram o mutex para
+* Escritores acumulam linhas em lotes privados (sem mutex) e só tomam o mutex
+  no commit; leitores só seguram o mutex para
   pegar um **snapshot**: lista de chunks + segmentos congelados da MemTable
   (sem cópia). O snapshot é compartilhado enquanto a tabela não muda.
 * `position()` guarda o snapshot do scan; `rnd_pos()` resolve posições por
@@ -201,7 +262,7 @@ v3. Salvaguardas atuais:
 | 9 | TFValue com `bool`/enum/união anônima | `uint8_t bool_val`, `uint8_t kind`, união `data` | Ler `bool`/enum inválido vindo do C é UB no Rust; cbindgen não gera união anônima. |
 | 10 | — | `TF_ERR_INTERNAL`, `TF_ERR_UNSUPPORTED` | Panic capturado / recurso indisponível. |
 | 11 | API FFI mínima | + sync do WAL, truncate, scans filtrados/bidirecionais, snapshots, séries, check, estimativa, inspeção, manutenção, chaves, settings | Necessárias para a Handler API completa e os recursos acima. |
-| 12 | fsync por `write_row` | fsync no **fim do statement** (`external_lock(F_UNLCK)`, `end_bulk_insert`; sob `LOCK TABLES`, a cada INSERT de uma linha) | Linha confirmada = statement retornou OK; fsync por linha inviabiliza 1M linhas em 30 s. |
+| 12 | fsync por `write_row` | commit do **lote** no fim do statement (`external_lock(F_UNLCK)`, `end_bulk_insert`; sob `LOCK TABLES`, cada INSERT de uma linha) com fsync conforme `wal_sync_mode` | Linha confirmada = statement retornou OK; fsync por linha inviabiliza 1M linhas em 30 s. Ver §Atomicidade por statement. |
 | 13 | Entrada do WAL `[CRC][len][ts][series_id][valores]` | header de segmento + `[CRC][len][linha]` | Header guarda os parâmetros de criptografia; `series_id` é reconstruído no replay. |
 | 14 | Header de 64 bytes com os campos listados | mesmos campos + `column_count`, `chunk_id`, `wal_seq`, `schema_fingerprint`; codec nas flags | Os campos listados somam 40 bytes; o resto valida schema e ajuda diagnóstico. |
 | 15 | Checkpoint implícito | `MANIFEST` explícito | Um flush gera vários chunks; sem commit único, um crash duplicaria ou perderia linhas. |
@@ -213,6 +274,8 @@ v3. Salvaguardas atuais:
 | 21 | — (particionamento não mencionado) | `HTON_NO_PARTITION`: `PARTITION BY` é recusado | `ha_partition` reorganiza partições com `delete_row`, que a engine append-only não suporta: `ADD`/`COALESCE PARTITION` duplicavam e perdiam linhas. O tempo já é particionado por chunks. |
 | 22 | Procedures sem modelo de privilégio | UDFs exigem `DELETE` (retenção) e `ALTER` (compactação) na tabela; tabela inexistente e sem privilégio dão o mesmo erro | MariaDB não aplica ACL a UDFs; sem a checagem, qualquer usuário podia expirar dados alheios. |
 | 23 | `RETENTION_PERIOD` / `HOT_THRESHOLD` sem limite | ≤ 10 000 anos; cálculo de cutoff saturante | Períodos absurdos estouravam a aritmética e geravam cutoff no futuro (retenção apagaria tudo). |
+| 24 | — (isolamento não especificado) | atomicidade por statement: linhas de um statement aparecem todas de uma vez; crash no meio não deixa nada; sem MVCC nem transações multi-statement | Leituras nunca veem statements parciais; MVCC completo não se justifica com dados imutáveis. Erro no meio do statement mantém as linhas já inseridas (coerente com o binlog de engine não transacional). |
+| 25 | Entrada do WAL única | WAL v2 com `ROW`/`COMMIT`/`ROW_COMMIT`; MANIFEST v2 com `replay_seq` | Necessário para a atomicidade por statement com escritores concorrentes. v1 continua legível. |
 
 ## Limitações conhecidas
 

@@ -542,6 +542,26 @@ ha_moosedb::ha_moosedb(handlerton *hton, TABLE_SHARE *table_arg)
   ref_length= TF_POSITION_LEN;
 }
 
+void tf_batch_closer::operator()(MooseDBBatch *b) const noexcept
+{
+  /* Never drop rows the server already acknowledged: commit, then warn. */
+  if (!b)
+    return;
+  const bool ok= moosedb_batch_commit(b, false) == TF_OK;
+  try
+  {
+    if (ok)
+      sql_print_warning("MooseDB: statement batch was still open on "
+                        "cleanup; committed");
+    else
+      sql_print_warning("MooseDB: statement batch commit failed on cleanup: "
+                        "%s", take_last_error().c_str());
+  }
+  catch (...)
+  {
+  }
+}
+
 ha_moosedb::~ha_moosedb()= default;
 
 int ha_moosedb::map_status(TFStatus status)
@@ -666,7 +686,14 @@ int ha_moosedb::close()
   DBUG_ENTER("ha_moosedb::close");
   scan_.reset();
   snapshots_.clear();
-  DBUG_RETURN(0);
+  int error= 0;
+  if (batch_)
+  {
+    sql_print_warning("MooseDB: statement batch still open at close; "
+                      "committing it");
+    error= commit_batch();
+  }
+  DBUG_RETURN(error);
 }
 
 int ha_moosedb::delete_table(const char *name)
@@ -765,16 +792,43 @@ int ha_moosedb::write_row(const uchar *buf)
     DBUG_RETURN(error);
 
   TFRow row{(uint32_t) values_.size(), values_.data()};
-  if ((error= map_status(moosedb_write_row(share_->table.get(), &row))))
-    DBUG_RETURN(error);
-  wrote_rows_= true;
   /*
-    Under LOCK TABLES the statement end is not signalled to the engine
-    (external_lock runs at UNLOCK TABLES): make each single-row INSERT
-    durable on its own. Multi-row inserts sync in end_bulk_insert().
+    Rows of one statement go into a batch: invisible to other sessions until
+    the statement ends, and lost as a whole if the server crashes before.
+    The batch is committed by end_bulk_insert(), external_lock(F_UNLCK) or
+    reset(), whichever comes first (none of them discards rows).
+
+    Only under plain LOCK TABLES is there no per-statement external_lock, and
+    the server calls start_bulk_insert() for multi-row statements there. So a
+    row written outside bulk insert with no open batch is a lone single-row
+    INSERT: write it directly and sync it right away (moosedb_write_row alone
+    does not sync the WAL). In prelocked modes (triggers, stored functions,
+    CALL) the server never calls start_bulk_insert(), so always use a batch.
   */
-  if (!in_bulk_insert_ && ha_thd()->locked_tables_mode != LTM_NONE)
-    error= sync_wal();
+  THD *thd= ha_thd();
+  if (!thd)
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  /* a bulk flag left over from an earlier statement is stale */
+  if (in_bulk_insert_ && bulk_query_id_ != thd->query_id)
+    in_bulk_insert_= false;
+  if (!batch_ && !in_bulk_insert_ &&
+      thd->locked_tables_mode == LTM_LOCK_TABLES)
+  {
+    if (!(error= map_status(moosedb_write_row(share_->table.get(), &row))))
+      error= map_status(moosedb_sync_wal(share_->table.get(),
+                                         srv_wal_sync_mode == WAL_SYNC_FSYNC));
+    DBUG_RETURN(error);
+  }
+  if (!batch_)
+  {
+    MooseDBBatch *b= nullptr;
+    if ((error= map_status(moosedb_batch_begin(share_->table.get(), &b))))
+      DBUG_RETURN(error);
+    if (!b)
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    batch_.reset(b);
+  }
+  error= map_status(moosedb_batch_write(batch_.get(), &row));
   DBUG_RETURN(error);
 }
 
@@ -844,24 +898,48 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
 
 /* ── Statement end / durability ───────────────────────────────────────── */
 
-int ha_moosedb::sync_wal()
+int ha_moosedb::commit_batch()
 {
-  if (!wrote_rows_ || !share_ || !share_->table)
+  if (!batch_)
     return 0;
-  wrote_rows_= false;
-  return map_status(moosedb_sync_wal(share_->table.get(),
-                                      srv_wal_sync_mode == WAL_SYNC_FSYNC));
+  /* commit always releases the handle, also on error */
+  MooseDBBatch *b= batch_.release();
+  int error= map_status(
+    moosedb_batch_commit(b, srv_wal_sync_mode == WAL_SYNC_FSYNC));
+  if (error)
+  {
+    last_error_= share_ ? scrub_paths(last_error_, share_->path,
+                                      share_->display) : last_error_;
+    sql_print_error("MooseDB: statement commit failed: %s",
+                    last_error_.c_str());
+  }
+  return error;
 }
 
 void ha_moosedb::start_bulk_insert(ha_rows, uint)
 {
   in_bulk_insert_= true;
+  THD *thd= ha_thd();
+  bulk_query_id_= thd ? thd->query_id : 0;
 }
 
 int ha_moosedb::end_bulk_insert()
 {
   in_bulk_insert_= false;
-  return sync_wal();
+  /*
+    Replication applier: Write_rows_log_event calls start/end_bulk_insert once
+    per row EVENT. Keep the batch open across the events of one statement; it
+    is committed (and synced) by external_lock(F_UNLCK) at STMT_END_F, which
+    runs (slave_close_thread_tables) before the relay log position is advanced.
+  */
+  THD *thd= ha_thd();
+  if (thd && thd->slave_thread)
+    return 0;
+  int error= commit_batch();
+  /* the server ignores our return value here and reads my_errno */
+  if (error)
+    my_errno= error;
+  return error;
 }
 
 int ha_moosedb::external_lock(THD *, int lock_type)
@@ -869,9 +947,13 @@ int ha_moosedb::external_lock(THD *, int lock_type)
   DBUG_ENTER("ha_moosedb::external_lock");
   /*
     F_UNLCK = statement end. MooseDB is non-transactional, so this is the
-    point where the client's OK is about to be sent: make rows durable.
+    point where the client's OK is about to be sent: commit the statement
+    batch (also when the statement failed: already-inserted rows are
+    binlogged and stay).
   */
-  DBUG_RETURN(lock_type == F_UNLCK ? sync_wal() : 0);
+  if (lock_type == F_UNLCK)
+    in_bulk_insert_= false;
+  DBUG_RETURN(lock_type == F_UNLCK ? commit_batch() : 0);
 }
 
 THR_LOCK_DATA **ha_moosedb::store_lock(THD *thd, THR_LOCK_DATA **to,
@@ -1112,12 +1194,28 @@ void ha_moosedb::cond_pop()
 
 int ha_moosedb::reset()
 {
+  /*
+    Statement-end safety net (runs per statement under LOCK TABLES and per
+    stored-routine statement). Never commit in the middle of a bulk insert of
+    the same statement.
+  */
+  int error= 0;
+  THD *thd= ha_thd();
+  if (in_bulk_insert_ && thd && bulk_query_id_ != thd->query_id)
+    in_bulk_insert_= false;   /* stale: end_bulk_insert() was never called */
+  if (!in_bulk_insert_ && batch_)
+  {
+    error= commit_batch();
+    /* ha_reset()'s return value is ignored by the server: report it here */
+    if (error)
+      print_error(error, MYF(0));
+  }
   pushed_.clear();
   pushed_valid_= false;
   scan_.reset();
   snapshots_.clear();
   scan_snapshot_saved_= false;
-  return 0;
+  return error;
 }
 
 /*

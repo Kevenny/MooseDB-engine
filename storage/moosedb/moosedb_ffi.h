@@ -40,6 +40,9 @@ typedef enum {
   TF_COL_DECIMAL = 7,
 } TFColumnType;
 
+// Opaque statement batch (see `moosedb_batch_begin`). Used by one thread.
+typedef struct MooseDBBatch MooseDBBatch;
+
 // Opaque diagnostics handle.
 typedef struct MooseDBInfo MooseDBInfo;
 
@@ -223,6 +226,40 @@ TFStatus moosedb_table_rename(const char *from, const char *to);
 // # Safety
 // `row` must point to `col_count` valid values matching the table's columns.
 TFStatus moosedb_write_row(MooseDBTable *table, const TFRow *row);
+
+// Starts a statement batch. Rows written with `moosedb_batch_write` are
+// invisible to every reader until `moosedb_batch_commit`, which publishes
+// them all at once; a crash before the commit loses all of them, after a
+// synced commit none. Any number of batches (and `moosedb_write_row` calls)
+// may be open at the same time. Memory use is bounded: large batches spill
+// to disk. The handle must end in `moosedb_batch_commit` or
+// `moosedb_batch_abort`, which release it.
+//
+// # Safety
+// `table` must be a valid handle; `out_batch` writable.
+TFStatus moosedb_batch_begin(MooseDBTable *table, MooseDBBatch **out_batch);
+
+// Adds one row to the batch (same value convention as `moosedb_write_row`).
+// On error the row is not part of the batch; the batch stays usable.
+//
+// # Safety
+// `batch` must be a live batch handle; `row` as in `moosedb_write_row`.
+TFStatus moosedb_batch_write(MooseDBBatch *batch, const TFRow *row);
+
+// Publishes every row of the batch at once and releases the handle (also on
+// error: the handle is invalid afterwards). With `sync` the commit is durable
+// when this returns.
+//
+// # Safety
+// `batch` must come from `moosedb_batch_begin` and not be used afterwards.
+TFStatus moosedb_batch_commit(MooseDBBatch *batch, bool sync);
+
+// Discards the batch (none of its rows ever becomes visible) and releases the
+// handle. NULL is ignored.
+//
+// # Safety
+// `batch` must come from `moosedb_batch_begin` and not be used afterwards.
+TFStatus moosedb_batch_abort(MooseDBBatch *batch);
 
 // Statement-end hook: flushes buffered WAL entries to the OS and, when
 // `durable`, fsyncs them.

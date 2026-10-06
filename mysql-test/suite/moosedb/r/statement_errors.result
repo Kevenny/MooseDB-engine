@@ -1,0 +1,68 @@
+CREATE TABLE e (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+# Error in the middle of a multi-row INSERT: the earlier rows stay
+INSERT INTO e VALUES ('2026-01-01', 1), ('2026-01-02', 2), ('0000-00-00', 3), ('2026-01-04', 4);
+ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
+SELECT v FROM e ORDER BY ts;
+v
+1
+2
+# Zero date rejected by the engine in INSERT...SELECT: earlier rows stay
+INSERT INTO e SELECT IF(seq = 3, '0000-00-00', '2026-02-01' + INTERVAL seq SECOND), seq FROM seq_1_to_5;
+ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
+SELECT COUNT(*) FROM e;
+COUNT(*)
+4
+# Same state after kill -9
+# Kill the server
+# restart
+SELECT COUNT(*) FROM e;
+COUNT(*)
+4
+SELECT v FROM e WHERE v < 10 ORDER BY ts, v;
+v
+1
+2
+1
+2
+# LOCK TABLES: single-row and multi-row INSERTs visible and durable
+LOCK TABLES e WRITE, e AS e2 READ;
+INSERT INTO e VALUES ('2026-03-01', 100);
+SELECT COUNT(*) FROM e WHERE v = 100;
+COUNT(*)
+1
+INSERT INTO e VALUES ('2026-03-02', 101), ('2026-03-03', 101);
+INSERT INTO e SELECT ts + INTERVAL 1 YEAR, 102 FROM e AS e2 WHERE v >= 100;
+SELECT v, COUNT(*) FROM e WHERE v >= 100 GROUP BY v ORDER BY v;
+v	COUNT(*)
+100	1
+101	2
+102	3
+# Kill the server
+# restart
+SELECT v, COUNT(*) FROM e WHERE v >= 100 GROUP BY v ORDER BY v;
+v	COUNT(*)
+100	1
+101	2
+102	3
+# Trigger and stored procedure writers
+CREATE TABLE src (a INT) ENGINE=MyISAM;
+CREATE TRIGGER tr AFTER INSERT ON src FOR EACH ROW INSERT INTO e VALUES ('2026-04-01', 200 + NEW.a);
+INSERT INTO src VALUES (1), (2), (3);
+CREATE PROCEDURE p() BEGIN
+INSERT INTO e VALUES ('2026-05-01', 300);
+INSERT INTO e VALUES ('2026-05-02', 300), ('2026-05-03', 300);
+INSERT INTO e VALUES ('2026-05-04', 300);
+END|
+CALL p();
+LOCK TABLES e WRITE;
+CALL p();
+# Kill the server
+# restart
+SELECT v, COUNT(*) FROM e WHERE v >= 200 GROUP BY v ORDER BY v;
+v	COUNT(*)
+201	1
+202	1
+203	1
+300	8
+DROP PROCEDURE p;
+DROP TABLE src, e;

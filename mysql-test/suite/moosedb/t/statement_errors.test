@@ -1,0 +1,58 @@
+#
+# Statement end commits also when the statement fails (non-transactional
+# engine: rows inserted before the error stay, as in the binlog), and
+# LOCK TABLES inserts are visible and durable before UNLOCK.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE e (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+
+--echo # Error in the middle of a multi-row INSERT: the earlier rows stay
+--error ER_GET_ERRMSG
+INSERT INTO e VALUES ('2026-01-01', 1), ('2026-01-02', 2), ('0000-00-00', 3), ('2026-01-04', 4);
+SELECT v FROM e ORDER BY ts;
+
+--echo # Zero date rejected by the engine in INSERT...SELECT: earlier rows stay
+--error ER_GET_ERRMSG
+INSERT INTO e SELECT IF(seq = 3, '0000-00-00', '2026-02-01' + INTERVAL seq SECOND), seq FROM seq_1_to_5;
+SELECT COUNT(*) FROM e;
+
+--echo # Same state after kill -9
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*) FROM e;
+SELECT v FROM e WHERE v < 10 ORDER BY ts, v;
+
+--echo # LOCK TABLES: single-row and multi-row INSERTs visible and durable
+LOCK TABLES e WRITE, e AS e2 READ;
+INSERT INTO e VALUES ('2026-03-01', 100);
+SELECT COUNT(*) FROM e WHERE v = 100;
+INSERT INTO e VALUES ('2026-03-02', 101), ('2026-03-03', 101);
+INSERT INTO e SELECT ts + INTERVAL 1 YEAR, 102 FROM e AS e2 WHERE v >= 100;
+SELECT v, COUNT(*) FROM e WHERE v >= 100 GROUP BY v ORDER BY v;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT v, COUNT(*) FROM e WHERE v >= 100 GROUP BY v ORDER BY v;
+
+--echo # Trigger and stored procedure writers
+CREATE TABLE src (a INT) ENGINE=MyISAM;
+CREATE TRIGGER tr AFTER INSERT ON src FOR EACH ROW INSERT INTO e VALUES ('2026-04-01', 200 + NEW.a);
+INSERT INTO src VALUES (1), (2), (3);
+DELIMITER |;
+CREATE PROCEDURE p() BEGIN
+  INSERT INTO e VALUES ('2026-05-01', 300);
+  INSERT INTO e VALUES ('2026-05-02', 300), ('2026-05-03', 300);
+  INSERT INTO e VALUES ('2026-05-04', 300);
+END|
+DELIMITER ;|
+CALL p();
+LOCK TABLES e WRITE;
+CALL p();
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT v, COUNT(*) FROM e WHERE v >= 200 GROUP BY v ORDER BY v;
+
+DROP PROCEDURE p;
+DROP TABLE src, e;

@@ -1,0 +1,34 @@
+#
+# kill -9 in the middle of a large statement: the unfinished statement
+# leaves no rows (its batch was never committed); earlier statements stay.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE k (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=65536;
+INSERT INTO k SELECT '2026-01-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_1000;
+INSERT INTO k VALUES ('2026-01-02', 1), ('2026-01-03', 1);
+SELECT COUNT(*) FROM k;
+
+connect (big, localhost, root,,);
+connection big;
+--send INSERT INTO k SELECT '2026-02-01' + INTERVAL seq SECOND, 2 FROM seq_1_to_6000000
+connection default;
+--let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.PROCESSLIST WHERE INFO LIKE 'INSERT INTO k SELECT%' AND TIME >= 1
+--source include/wait_condition.inc
+
+--echo # kill -9 while the INSERT...SELECT is running
+--source include/kill_mysqld.inc
+disconnect big;
+connection default;
+--source include/start_mysqld.inc
+
+--echo # Only the earlier statements survive (never a part of the big one)
+SELECT v, COUNT(*) FROM k GROUP BY v ORDER BY v;
+CHECK TABLE k;
+
+--echo # The table keeps working
+INSERT INTO k VALUES ('2026-03-01', 3);
+SELECT COUNT(*) FROM k;
+DROP TABLE k;

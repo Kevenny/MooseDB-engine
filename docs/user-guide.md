@@ -85,6 +85,10 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
 * `UPDATE` e `DELETE ... WHERE` retornam `ER_ILLEGAL_HA`: os dados são
   imutáveis. Use `RETENTION_PERIOD` para expirar e `TRUNCATE TABLE` (ou
   `DELETE` sem `WHERE`) para esvaziar.
+* Cada statement é **atômico para leitura e para crash**: outras sessões veem
+  todas as linhas de um INSERT de uma vez, e um crash no meio dele não deixa
+  nada. Não há transações (`BEGIN`/`ROLLBACK` não desfazem) e, se o statement
+  falhar no meio, as linhas inseridas antes do erro permanecem (como no MyISAM).
 * Uma linha está durável quando o statement retorna OK
   (`moosedb_wal_sync_mode=fsync`). Com `write`, sobrevive a um crash do
   `mysqld`, mas não a uma queda do sistema operacional.

@@ -69,6 +69,16 @@ struct tf_snapshot_closer
   void operator()(MooseDBSnapshot *s) const noexcept
   { moosedb_snapshot_close(s); }
 };
+/*
+  A statement batch left open when its owner dies is never discarded: the
+  server may already have reported those rows as inserted (and binlogged
+  them). Normal paths commit explicitly; this is the safety net.
+*/
+struct tf_batch_closer
+{
+  void operator()(MooseDBBatch *b) const noexcept;
+};
+using tf_batch_ptr= std::unique_ptr<MooseDBBatch, tf_batch_closer>;
 using tf_table_ptr= std::unique_ptr<MooseDBTable, tf_table_closer>;
 using tf_scan_ptr= std::unique_ptr<MooseDBScan, tf_scan_closer>;
 using tf_snapshot_ptr= std::unique_ptr<MooseDBSnapshot, tf_snapshot_closer>;
@@ -197,7 +207,7 @@ private:
   int fill_record(uchar *buf, const TFRow &row);
   longlong key_to_ts(uint idx, const uchar *key);
   int map_status(TFStatus status);
-  int sync_wal();
+  int commit_batch();   /* publish + sync the open statement batch, if any */
 
   void collect_tag_predicates(const Item *cond,
                               std::vector<tf_tag_predicate> *out);
@@ -208,8 +218,9 @@ private:
   tf_scan_ptr scan_;
   bool scan_snapshot_saved_= false; /* snapshot of scan_ kept for rnd_pos */
   std::vector<tf_snapshot_ptr> snapshots_;  /* resolve positions in rnd_pos */
-  bool wrote_rows_= false;     /* rows appended since the last WAL sync  */
+  tf_batch_ptr batch_;         /* open statement batch (lazy, per stmt)  */
   bool in_bulk_insert_= false;
+  query_id_t bulk_query_id_= 0;  /* statement that called start_bulk_insert */
   std::string last_error_;     /* message for get_error_message()        */
   std::vector<String> str_bufs_;
   std::vector<TFValue> values_;

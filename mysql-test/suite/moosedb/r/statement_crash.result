@@ -1,0 +1,28 @@
+CREATE TABLE k (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=65536;
+INSERT INTO k SELECT '2026-01-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_1000;
+INSERT INTO k VALUES ('2026-01-02', 1), ('2026-01-03', 1);
+SELECT COUNT(*) FROM k;
+COUNT(*)
+1002
+connect  big, localhost, root,,;
+connection big;
+INSERT INTO k SELECT '2026-02-01' + INTERVAL seq SECOND, 2 FROM seq_1_to_6000000;
+connection default;
+# kill -9 while the INSERT...SELECT is running
+# Kill the server
+disconnect big;
+connection default;
+# restart
+# Only the earlier statements survive (never a part of the big one)
+SELECT v, COUNT(*) FROM k GROUP BY v ORDER BY v;
+v	COUNT(*)
+1	1002
+CHECK TABLE k;
+Table	Op	Msg_type	Msg_text
+test.k	check	status	OK
+# The table keeps working
+INSERT INTO k VALUES ('2026-03-01', 3);
+SELECT COUNT(*) FROM k;
+COUNT(*)
+1003
+DROP TABLE k;

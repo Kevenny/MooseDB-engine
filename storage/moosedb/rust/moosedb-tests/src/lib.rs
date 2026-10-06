@@ -1053,3 +1053,6 @@ mod concurrency_tests {
         assert_eq!(all_rows(&t).len(), 5000);
     }
 }
+
+#[cfg(test)]
+mod batch_tests;
