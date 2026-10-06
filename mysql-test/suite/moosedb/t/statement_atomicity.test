@@ -1,0 +1,107 @@
+#
+# Statement atomicity: the rows of one statement become visible to other
+# sessions all at once, never partially (batch commit at statement end).
+# Each variant also asserts that the reader really ran while the statement
+# was executing.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+connect (wr, localhost, root,,);
+connect (wr2, localhost, root,,);
+
+--echo # Large INSERT...SELECT: concurrent readers see 0 or N rows, never in between
+CREATE TABLE a (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+connection wr;
+--send INSERT INTO a SELECT '2026-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_2000000
+connection default;
+--let $poll_table= a
+--let $poll_info= INSERT INTO a SELECT%
+--let $poll_n1= 2000000
+--let $poll_n2= 2000000
+--source suite/moosedb/include/poll_statement.inc
+connection wr;
+reap;
+connection default;
+SELECT COUNT(*) FROM a;
+
+--echo # Same with a tiny MemTable (the batch spills to disk)
+CREATE TABLE b (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=4096;
+connection wr;
+--send INSERT INTO b SELECT '2026-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_200000
+connection default;
+--let $poll_table= b
+--let $poll_info= INSERT INTO b SELECT%
+--let $poll_n1= 200000
+--let $poll_n2= 200000
+--source suite/moosedb/include/poll_statement.inc
+connection wr;
+reap;
+connection default;
+SELECT COUNT(*), SUM(v) FROM b;
+
+--echo # Two concurrent writers into the same table
+CREATE TABLE c2 (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=4096;
+connection wr;
+--send INSERT INTO c2 SELECT '2026-01-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_150000
+connection wr2;
+--send INSERT INTO c2 SELECT '2026-02-01' + INTERVAL seq SECOND, 2 FROM seq_1_to_150000
+connection default;
+--let $poll_table= c2
+--let $poll_info= INSERT INTO c2 SELECT%
+--let $poll_n1= 150000
+--let $poll_n2= 300000
+--source suite/moosedb/include/poll_statement.inc
+connection wr;
+reap;
+connection wr2;
+reap;
+connection default;
+SELECT v, COUNT(*) FROM c2 GROUP BY v ORDER BY v;
+
+--echo # Multi-row INSERT is one statement too
+INSERT INTO c2 VALUES ('2027-01-01', 3), ('2027-01-02', 3), ('2027-01-03', 3);
+SELECT COUNT(*) FROM c2 WHERE v = 3;
+
+--echo # Table with a BEFORE INSERT trigger (prelocked: no bulk insert calls)
+CREATE TABLE tt (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+CREATE TRIGGER tt_bi BEFORE INSERT ON tt FOR EACH ROW SET NEW.v= NEW.v + 1;
+connection wr;
+--send INSERT INTO tt SELECT '2026-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_200000
+connection default;
+--let $poll_table= tt
+--let $poll_info= INSERT INTO tt SELECT%
+--let $poll_n1= 200000
+--let $poll_n2= 200000
+--source suite/moosedb/include/poll_statement.inc
+connection wr;
+reap;
+connection default;
+SELECT COUNT(*), SUM(v) FROM tt;
+
+--echo # Inside a stored procedure
+CREATE TABLE tp (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+DELIMITER |;
+CREATE PROCEDURE p()
+BEGIN
+  INSERT INTO tp SELECT '2026-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_200000;
+END|
+DELIMITER ;|
+connection wr;
+--send CALL p()
+connection default;
+--let $poll_table= tp
+--let $poll_info= INSERT INTO tp SELECT%
+--let $poll_n1= 200000
+--let $poll_n2= 200000
+--source suite/moosedb/include/poll_statement.inc
+connection wr;
+reap;
+connection default;
+SELECT COUNT(*), SUM(v) FROM tp;
+
+disconnect wr;
+disconnect wr2;
+DROP PROCEDURE p;
+DROP TABLE a, b, c2, tt, tp;

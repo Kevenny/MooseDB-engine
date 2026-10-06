@@ -59,11 +59,36 @@ impl MemSnapshot {
     }
 }
 
+/// Accounting size of one row.
+pub(crate) fn row_bytes(row: &[Value]) -> usize {
+    mem::size_of::<MemRow>() + row.iter().map(Value::mem_size).sum::<usize>()
+}
+
+/// Batches at least this long become their own segment instead of being
+/// copied into the active one.
+const OWN_SEGMENT_ROWS: usize = 512;
+
 impl MemTable {
     pub(crate) fn push(&mut self, series_id: u64, row: Row) {
-        self.bytes += mem::size_of::<MemRow>() + row.iter().map(Value::mem_size).sum::<usize>();
+        self.bytes += row_bytes(&row);
         self.len += 1;
         self.active.push(MemRow { series_id, row });
+    }
+
+    /// Appends the rows of a committed batch at once, in order. `bytes` is
+    /// the sum of `row_bytes` over `rows`. The caller holds the table lock, so
+    /// no snapshot can see a part of the batch.
+    pub(crate) fn append(&mut self, rows: Vec<MemRow>, bytes: usize) {
+        self.len += rows.len();
+        self.bytes += bytes;
+        if rows.len() >= OWN_SEGMENT_ROWS {
+            if !self.active.is_empty() {
+                self.frozen.push(Arc::new(mem::take(&mut self.active)));
+            }
+            self.frozen.push(Arc::new(rows));
+        } else {
+            self.active.extend(rows);
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -113,17 +138,27 @@ impl MemTable {
         schema: &Schema,
         bucket: impl Fn(i64) -> (i64, i64),
     ) -> BTreeMap<(i64, i64), BTreeMap<u64, Vec<&Row>>> {
-        let mut out: BTreeMap<(i64, i64), BTreeMap<u64, Vec<&Row>>> = BTreeMap::new();
-        for r in self.rows() {
-            out.entry(bucket(schema.row_ts(&r.row))).or_default().entry(r.series_id).or_default().push(&r.row);
-        }
-        for series in out.values_mut() {
-            for rows in series.values_mut() {
-                rows.sort_by_key(|r| schema.row_ts(r));
-            }
-        }
-        out
+        group_rows(self.rows(), schema, bucket)
     }
+}
+
+/// Groups rows by `bucket(ts)` and then by `series_id`, each series sorted by
+/// timestamp (stable, so equal timestamps keep arrival order).
+pub(crate) fn group_rows<'a>(
+    rows: impl Iterator<Item = &'a MemRow>,
+    schema: &Schema,
+    bucket: impl Fn(i64) -> (i64, i64),
+) -> BTreeMap<(i64, i64), BTreeMap<u64, Vec<&'a Row>>> {
+    let mut out: BTreeMap<(i64, i64), BTreeMap<u64, Vec<&Row>>> = BTreeMap::new();
+    for r in rows {
+        out.entry(bucket(schema.row_ts(&r.row))).or_default().entry(r.series_id).or_default().push(&r.row);
+    }
+    for series in out.values_mut() {
+        for rows in series.values_mut() {
+            rows.sort_by_key(|r| schema.row_ts(r));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

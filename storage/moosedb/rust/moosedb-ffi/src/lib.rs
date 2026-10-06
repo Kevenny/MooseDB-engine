@@ -26,8 +26,8 @@ use std::sync::Arc;
 use moosedb_core::compression::Codec;
 use moosedb_core::inspect::{ChunkStatus, TableInfo};
 use moosedb_core::{
-    crypto, maintenance, settings, Column, ColumnType, Error, Position, RawOptions, Row, Scan, ScanFilter, Schema,
-    Snapshot, Table, TableConfig, Value, POSITION_LEN,
+    crypto, maintenance, settings, Batch, Column, ColumnType, Error, Position, RawOptions, Row, Scan, ScanFilter,
+    Schema, Snapshot, Table, TableConfig, Value, POSITION_LEN,
 };
 
 /// Size in bytes of a row position (`handler::ref_length`).
@@ -187,6 +187,11 @@ pub struct TFChunkInfo {
 /// Opaque table handle.
 pub struct MooseDBTable {
     table: Arc<Table>,
+}
+
+/// Opaque statement batch (see `moosedb_batch_begin`). Used by one thread.
+pub struct MooseDBBatch {
+    batch: Batch,
 }
 
 /// Buffers that keep a `TFRow` valid between calls.
@@ -628,20 +633,100 @@ pub unsafe extern "C" fn moosedb_table_rename(from: *const c_char, to: *const c_
 pub unsafe extern "C" fn moosedb_write_row(table: *mut MooseDBTable, row: *const TFRow) -> TFStatus {
     guard(|| {
         let t = table_ref(table)?;
-        let row = handle_ref(row, "row")?;
         // SAFETY: caller contract.
-        let values = unsafe { slice(row.values, row.col_count as usize, "row values") }?;
-        let cols = t.table.schema().columns();
-        if values.len() != cols.len() {
-            return Err(invalid(&format!("row has {} values, table has {} columns", values.len(), cols.len())));
-        }
-        let row = values
-            .iter()
-            .zip(cols)
-            // SAFETY: values come from the caller-validated slice.
-            .map(|(v, c)| unsafe { value_from_c(v, c.ty) })
-            .collect::<Result<Vec<_>, _>>()?;
+        let row = unsafe { row_from_c(t.table.schema(), row) }?;
         t.table.write(row)
+    })
+}
+
+/// Converts a caller-owned `TFRow` into a core row (marshalling only).
+///
+/// # Safety
+/// `row` must be NULL or point to `col_count` valid values.
+unsafe fn row_from_c(schema: &Schema, row: *const TFRow) -> Result<Row, Error> {
+    let row = handle_ref(row, "row")?;
+    // SAFETY: caller contract.
+    let values = unsafe { slice(row.values, row.col_count as usize, "row values") }?;
+    let cols = schema.columns();
+    if values.len() != cols.len() {
+        return Err(invalid(&format!("row has {} values, table has {} columns", values.len(), cols.len())));
+    }
+    values
+        .iter()
+        .zip(cols)
+        // SAFETY: values come from the caller-validated slice.
+        .map(|(v, c)| unsafe { value_from_c(v, c.ty) })
+        .collect()
+}
+
+/// Starts a statement batch. Rows written with `moosedb_batch_write` are
+/// invisible to every reader until `moosedb_batch_commit`, which publishes
+/// them all at once; a crash before the commit loses all of them, after a
+/// synced commit none. Any number of batches (and `moosedb_write_row` calls)
+/// may be open at the same time. Memory use is bounded: large batches spill
+/// to disk. The handle must end in `moosedb_batch_commit` or
+/// `moosedb_batch_abort`, which release it.
+///
+/// # Safety
+/// `table` must be a valid handle; `out_batch` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_batch_begin(table: *mut MooseDBTable, out_batch: *mut *mut MooseDBBatch) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_batch, "out_batch")?;
+        *out = ptr::null_mut();
+        let t = table_ref(table)?;
+        let batch = t.table.begin_batch()?;
+        *out = Box::into_raw(Box::new(MooseDBBatch { batch }));
+        Ok(())
+    })
+}
+
+/// Adds one row to the batch (same value convention as `moosedb_write_row`).
+/// On error the row is not part of the batch; the batch stays usable.
+///
+/// # Safety
+/// `batch` must be a live batch handle; `row` as in `moosedb_write_row`.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_batch_write(batch: *mut MooseDBBatch, row: *const TFRow) -> TFStatus {
+    guard(|| {
+        let b = handle_mut(batch, "batch")?;
+        // SAFETY: caller contract.
+        let row = unsafe { row_from_c(b.batch.schema(), row) }?;
+        b.batch.write(row)
+    })
+}
+
+/// Publishes every row of the batch at once and releases the handle (also on
+/// error: the handle is invalid afterwards). With `sync` the commit is durable
+/// when this returns.
+///
+/// # Safety
+/// `batch` must come from `moosedb_batch_begin` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_batch_commit(batch: *mut MooseDBBatch, sync: bool) -> TFStatus {
+    guard(|| {
+        if batch.is_null() {
+            return Err(invalid("batch is NULL"));
+        }
+        // SAFETY: ownership is transferred back from C, exactly once.
+        let b = unsafe { Box::from_raw(batch) };
+        b.batch.commit(sync)
+    })
+}
+
+/// Discards the batch (none of its rows ever becomes visible) and releases the
+/// handle. NULL is ignored.
+///
+/// # Safety
+/// `batch` must come from `moosedb_batch_begin` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_batch_abort(batch: *mut MooseDBBatch) -> TFStatus {
+    guard(|| {
+        if !batch.is_null() {
+            // SAFETY: ownership is transferred back from C, exactly once.
+            drop(unsafe { Box::from_raw(batch) });
+        }
+        Ok(())
     })
 }
 

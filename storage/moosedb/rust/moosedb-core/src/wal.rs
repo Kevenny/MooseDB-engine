@@ -8,28 +8,49 @@
 //! entry   := crc32:u32 len:u32 payload[len]     crc32 covers len || payload (as stored)
 //! ```
 //!
-//! The payload is a row in the `codec` format, encrypted with AES-256-CTR
-//! (keystream offset = file offset) when the table is encrypted. Appends are
-//! buffered; durability is reached by `sync`, which the handler calls at
-//! statement end.
+//! The payload is encrypted with AES-256-CTR (keystream offset = file offset)
+//! when the table is encrypted. Appends are buffered; durability is reached
+//! by `sync`, which the handler calls at statement end.
 //!
-//! A segment number is also the checkpoint unit: once every row of segments
-//! `<= N` is in sealed chunks, the MANIFEST records `wal_seq = N` and those
-//! segments are deleted.
+//! Payload by segment version:
+//!
+//! ```text
+//! v1: row                                  (every entry is committed)
+//! v2: kind:u8 body
+//!       1 ROW         batch_id:u64 row     row of a batch, not yet committed
+//!       2 COMMIT      batch_id:u64         makes every ROW of the batch count
+//!       3 ROW_COMMIT  row                  a one-row batch (plain `write`)
+//! ```
+//!
+//! Batches of one table may interleave in the log. Replay applies a batch
+//! only when it reaches its COMMIT; rows of batches without one are dropped.
+//!
+//! A segment number is also the checkpoint unit: the MANIFEST records
+//! `wal_seq = N` once every batch committed in segments `<= N` is in sealed
+//! chunks, and `replay_seq` (the first segment still needed, which trails
+//! `N + 1` while an older batch is open). Segments `< replay_seq` are deleted.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::bytes::ByteReader;
+use crate::bytes::{put_u64, ByteReader};
+use crate::codec::encode_row;
 use crate::crypto::{CipherParams, PARAMS_LEN};
 use crate::error::{corrupt, Error, Result};
 use crate::fsutil::{self, sync_dir};
+use crate::log::warn;
+use crate::schema::Value;
 
 const WAL_PREFIX: &str = "wal_";
 const WAL_SUFFIX: &str = ".tfl.wal";
 const MAGIC: &[u8; 4] = b"TFWL";
-const VERSION: u16 = 1;
+/// Version written by new segments; version 1 is still readable.
+const VERSION: u16 = 2;
+const K_ROW: u8 = 1;
+const K_COMMIT: u8 = 2;
+const K_ROW_COMMIT: u8 = 3;
 const FLAG_ENCRYPTED: u16 = 1;
 const BASE_HEADER: usize = 8;
 const ENTRY_HEADER: usize = 8;
@@ -53,6 +74,53 @@ pub(crate) fn max_entry() -> usize {
 #[cfg(test)]
 pub(crate) fn set_max_entry(n: usize) {
     ENTRY_LIMIT.with(|l| l.set(n));
+}
+
+/// Payload of a ROW entry (a row of batch `batch`, not yet committed).
+pub(crate) fn row_entry(batch: u64, row: &[Value]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(9 + 16 * row.len());
+    p.push(K_ROW);
+    put_u64(&mut p, batch);
+    encode_row(&mut p, row);
+    p
+}
+
+/// Payload of a ROW_COMMIT entry (a row that is its own committed batch).
+pub(crate) fn row_commit_entry(row: &[Value]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(1 + 16 * row.len());
+    p.push(K_ROW_COMMIT);
+    encode_row(&mut p, row);
+    p
+}
+
+/// Payload of a COMMIT entry.
+pub(crate) fn commit_entry(batch: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(9);
+    p.push(K_COMMIT);
+    put_u64(&mut p, batch);
+    p
+}
+
+enum Entry<'a> {
+    Row(u64, &'a [u8]),
+    Commit(u64),
+    RowCommit(&'a [u8]),
+}
+
+fn parse_entry(version: u16, payload: &[u8]) -> Result<Entry<'_>> {
+    if version == 1 {
+        return Ok(Entry::RowCommit(payload));
+    }
+    let mut r = ByteReader::new(payload);
+    match r.u8()? {
+        K_ROW => {
+            let batch = r.u64()?;
+            Ok(Entry::Row(batch, &payload[r.position()..]))
+        }
+        K_COMMIT => Ok(Entry::Commit(r.u64()?)),
+        K_ROW_COMMIT => Ok(Entry::RowCommit(&payload[1..])),
+        k => Err(corrupt(format!("WAL entry of unknown kind {k}"))),
+    }
 }
 
 pub(crate) fn segment_path(dir: &Path, seq: u64) -> PathBuf {
@@ -218,7 +286,7 @@ pub(crate) fn replay(
     dir: &Path,
     seq: u64,
     torn: TornTail,
-    mut apply: impl FnMut(&[u8]) -> Result<()>,
+    mut apply: impl FnMut(u16, &[u8]) -> Result<()>,
 ) -> Result<ReplayOutcome> {
     let path = segment_path(dir, seq);
     let mut data = Vec::new();
@@ -239,7 +307,7 @@ pub(crate) fn replay(
     r.take(4)?;
     let version = r.u16()?;
     let flags = r.u16()?;
-    if version != VERSION {
+    if version != VERSION && version != 1 {
         return Err(corrupt(format!("{}: WAL version {version} not supported", path.display())));
     }
     let cipher = if flags & FLAG_ENCRYPTED != 0 {
@@ -278,7 +346,7 @@ pub(crate) fn replay(
             }
             None => body,
         };
-        apply(payload)?;
+        apply(version, payload)?;
         entries += 1;
         pos += ENTRY_HEADER + len;
     }
@@ -300,13 +368,90 @@ pub(crate) fn replay(
     Ok(ReplayOutcome { unused: false, entries, torn_bytes })
 }
 
+pub(crate) struct Replayed {
+    /// Highest batch id seen in the replayed segments (0 if none): new batches
+    /// must use larger ids, or a COMMIT could adopt the dropped rows of an
+    /// old uncommitted batch that still sits in a retained segment.
+    pub max_batch_id: u64,
+}
+
+/// Replays `segs` (ascending) and hands every *committed* row to `on_row`
+/// as `(segment, payload)`, in commit order.
+///
+/// Rows of a batch are buffered until its COMMIT; batches that never commit
+/// are dropped. Commits located in segments `<= flushed_seq` are already in
+/// chunks and are skipped (their rows may still be read: the batch's first
+/// rows can precede the flush point). With `recover`, a torn tail of the last
+/// segment is cut off and never-used segments are deleted; otherwise the
+/// files are left untouched.
+pub(crate) fn replay_committed(
+    dir: &Path,
+    segs: &[u64],
+    flushed_seq: u64,
+    recover: bool,
+    mut on_row: impl FnMut(u64, &[u8]) -> Result<()>,
+) -> Result<Replayed> {
+    let mut pending: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
+    let mut max_batch_id = 0u64;
+    for (i, &seq) in segs.iter().enumerate() {
+        let torn = match (recover, i + 1 == segs.len()) {
+            (false, _) => TornTail::Ignore,
+            (true, true) => TornTail::Truncate,
+            (true, false) => TornTail::Error,
+        };
+        let outcome = replay(dir, seq, torn, |version, payload| {
+            match parse_entry(version, payload)? {
+                Entry::Row(batch, row) => {
+                    max_batch_id = max_batch_id.max(batch);
+                    pending.entry(batch).or_default().push(row.to_vec());
+                }
+                Entry::Commit(batch) => {
+                    max_batch_id = max_batch_id.max(batch);
+                    let rows = pending.remove(&batch);
+                    if seq > flushed_seq {
+                        let rows = rows.ok_or_else(|| {
+                            corrupt(format!("WAL segment {seq}: COMMIT of batch {batch} without its rows"))
+                        })?;
+                        for row in &rows {
+                            on_row(seq, row)?;
+                        }
+                    }
+                }
+                Entry::RowCommit(row) => {
+                    if seq > flushed_seq {
+                        on_row(seq, row)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if recover {
+            if outcome.unused {
+                // Header never completed (crash right after creating it).
+                fsutil::remove_if_exists(&segment_path(dir, seq))?;
+            }
+            if outcome.torn_bytes > 0 {
+                warn(&format!(
+                    "WAL segment {seq}: discarded {} torn bytes after {} valid entries",
+                    outcome.torn_bytes, outcome.entries
+                ));
+            }
+        }
+    }
+    let dropped: usize = pending.len();
+    if dropped > 0 && recover {
+        warn(&format!("WAL replay: discarded {dropped} batch(es) that never committed"));
+    }
+    Ok(Replayed { max_batch_id })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn collect(dir: &Path, seq: u64, truncate: bool) -> Result<(Vec<Vec<u8>>, ReplayOutcome)> {
         let mut got = Vec::new();
-        let out = replay(dir, seq, if truncate { TornTail::Truncate } else { TornTail::Error }, |p| {
+        let out = replay(dir, seq, if truncate { TornTail::Truncate } else { TornTail::Error }, |_, p| {
             got.push(p.to_vec());
             Ok(())
         })?;
@@ -426,6 +571,97 @@ mod tests {
         assert!(!raw.windows(6).any(|w| w == b"secret"), "plaintext leaked into the WAL");
         let (got, _) = collect(dir.path(), 1, true).unwrap();
         assert_eq!(got, vec![b"secret row one".to_vec(), b"secret row two".to_vec()]);
+    }
+
+    fn r(i: i64) -> Vec<Value> {
+        vec![Value::Timestamp(i)]
+    }
+
+    fn committed(dir: &Path, segs: &[u64], flushed: u64) -> (Vec<(u64, Vec<u8>)>, u64) {
+        let mut got = Vec::new();
+        let out = replay_committed(dir, segs, flushed, true, |seq, p| {
+            got.push((seq, p.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        (got, out.max_batch_id)
+    }
+
+    fn enc(i: i64) -> Vec<u8> {
+        let mut b = Vec::new();
+        encode_row(&mut b, &r(i));
+        b
+    }
+
+    #[test]
+    fn interleaved_batches_apply_only_at_commit_in_commit_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Wal::create(dir.path(), 1, None).unwrap();
+        w.append(&row_entry(1, &r(10))).unwrap();
+        w.append(&row_entry(2, &r(20))).unwrap();
+        w.append(&row_commit_entry(&r(30))).unwrap();
+        w.append(&row_entry(1, &r(11))).unwrap();
+        w.append(&commit_entry(1)).unwrap(); // batch 2 never commits
+        w.sync(true).unwrap();
+        drop(w);
+        let (got, max) = committed(dir.path(), &[1], 0);
+        let want: Vec<_> = [30, 10, 11].iter().map(|&i| (1, enc(i))).collect();
+        assert_eq!(got, want);
+        assert_eq!(max, 2);
+    }
+
+    #[test]
+    fn commits_before_the_flush_point_are_skipped_but_open_batches_keep_their_early_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Wal::create(dir.path(), 1, None).unwrap();
+        w.append(&row_entry(1, &r(1))).unwrap(); // batch 1 spans the flush point
+        w.append(&row_entry(2, &r(2))).unwrap();
+        w.append(&commit_entry(2)).unwrap(); // flushed already
+        w.sync(true).unwrap();
+        drop(w);
+        let mut w = Wal::create(dir.path(), 2, None).unwrap();
+        w.append(&row_entry(1, &r(3))).unwrap();
+        w.append(&commit_entry(1)).unwrap();
+        w.sync(true).unwrap();
+        drop(w);
+        let (got, _) = committed(dir.path(), &[1, 2], 1);
+        assert_eq!(got, vec![(2, enc(1)), (2, enc(3))]);
+    }
+
+    #[test]
+    fn commit_without_rows_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Wal::create(dir.path(), 1, None).unwrap();
+        w.append(&commit_entry(9)).unwrap();
+        w.sync(true).unwrap();
+        drop(w);
+        let err = replay_committed(dir.path(), &[1], 0, true, |_, _| Ok(())).err().unwrap();
+        assert!(matches!(err, Error::Corrupt(_)));
+    }
+
+    #[test]
+    fn version_1_segments_replay_as_committed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        for i in [5, 6] {
+            let body = enc(i);
+            let len = (body.len() as u32).to_le_bytes();
+            let mut h = crc32fast::Hasher::new();
+            h.update(&len);
+            h.update(&body);
+            data.extend_from_slice(&h.finalize().to_le_bytes());
+            data.extend_from_slice(&len);
+            data.extend_from_slice(&body);
+        }
+        fs::write(segment_path(dir.path(), 4), &data).unwrap();
+        let (got, max) = committed(dir.path(), &[4], 3);
+        assert_eq!(got, vec![(4, enc(5)), (4, enc(6))]);
+        assert_eq!(max, 0);
+        // At or before the flush point they are already in chunks.
+        assert!(committed(dir.path(), &[4], 4).0.is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::bytes::ByteReader;
 use crate::chunk::{parse_chunk_id, ChunkMeta};
 use crate::chunk_reader::{read_meta, verify_file};
 use crate::chunk_writer::ChunkBuilder;
-use crate::codec::{decode_row, encode_row};
+use crate::codec::decode_row;
 use crate::crypto::CipherParams;
 use crate::error::{corrupt, invalid, Error, Result};
 use crate::fsutil::{is_fsync_error, remove_if_exists, sync_dir, write_atomic};
@@ -27,9 +27,11 @@ use crate::memtable::MemTable;
 use crate::options::TableConfig;
 use crate::scan::{check_tag_columns, Position, ResolvedFilter, Scan, ScanFilter, Snapshot};
 use crate::schema::{Row, Schema, Value};
-use crate::wal::{self, list_segments, segment_path, TornTail, Wal};
+use crate::wal::{self, list_segments, segment_path, Wal};
 
 pub(crate) const OPTIONS_FILE: &str = "OPTIONS";
+/// Flushes warn when an open batch keeps more WAL segments than this.
+const MAX_RETAINED_SEGMENTS: u64 = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableStats {
@@ -47,7 +49,7 @@ pub(crate) struct Inner {
     pub(crate) manifest: Manifest,
     /// Live chunks, ascending id.
     pub(crate) chunks: Vec<Arc<ChunkMeta>>,
-    wal: Wal,
+    pub(crate) wal: Wal,
     pub(crate) memtable: MemTable,
     pub(crate) series: SeriesIndex,
     /// Bumped whenever MemTable rows move into chunks or vanish.
@@ -63,6 +65,14 @@ pub(crate) struct Inner {
     /// Set when a failure left disk and memory possibly inconsistent; the
     /// table then refuses writes until reopened (which runs recovery).
     poisoned: Option<String>,
+    /// Next batch id; larger than any id found in the WAL at open.
+    pub(crate) next_batch_id: u64,
+    /// Open batches that logged rows to the WAL (and will commit through it):
+    /// batch id -> segment of their first entry. The checkpoint can never
+    /// move replay past the oldest of these.
+    pub(crate) open_batches: HashMap<u64, u64>,
+    /// Bumped by TRUNCATE; a batch begun earlier can no longer commit.
+    pub(crate) epoch: u64,
 }
 
 impl Inner {
@@ -336,32 +346,23 @@ impl Table {
         }
 
         let mut memtable = MemTable::default();
-        for &seq in wal_segs.iter().filter(|&&s| s <= manifest.wal_seq) {
+        // Segments before `replay_seq` hold nothing recovery still needs. The
+        // ones from there on are read even when they precede the flush point
+        // (`wal_seq`): a batch that was open at the flush has its first rows
+        // there. Only commits after the flush point are applied.
+        for &seq in wal_segs.iter().filter(|&&s| s < manifest.replay_seq) {
             remove_if_exists(&segment_path(&dir, seq))?;
         }
-        let replay: Vec<u64> = wal_segs.iter().copied().filter(|&s| s > manifest.wal_seq).collect();
-        for (i, &seq) in replay.iter().enumerate() {
-            let torn = if i + 1 == replay.len() { TornTail::Truncate } else { TornTail::Error };
-            let outcome = wal::replay(&dir, seq, torn, |payload| {
-                let row = decode_row(&mut ByteReader::new(payload))?;
-                schema.validate_row(&row).map_err(|e| {
-                    corrupt(format!("WAL segment {seq} holds a row that does not match the schema: {e}"))
-                })?;
-                let sid = series.get_or_insert(&row_tags(&schema, &row));
-                memtable.push(sid, row);
-                Ok(())
-            })?;
-            if outcome.unused {
-                // Header never completed (crash right after creating it).
-                remove_if_exists(&segment_path(&dir, seq))?;
-            }
-            if outcome.torn_bytes > 0 {
-                warn(&format!(
-                    "WAL segment {seq}: discarded {} torn bytes after {} valid entries",
-                    outcome.torn_bytes, outcome.entries
-                ));
-            }
-        }
+        let replay: Vec<u64> = wal_segs.iter().copied().filter(|&s| s >= manifest.replay_seq).collect();
+        let replayed = wal::replay_committed(&dir, &replay, manifest.wal_seq, true, |seq, payload| {
+            let row = decode_row(&mut ByteReader::new(payload))?;
+            schema
+                .validate_row(&row)
+                .map_err(|e| corrupt(format!("WAL segment {seq} holds a row that does not match the schema: {e}")))?;
+            let sid = series.get_or_insert(&row_tags(&schema, &row));
+            memtable.push(sid, row);
+            Ok(())
+        })?;
 
         let next_seq = wal_segs.last().copied().unwrap_or(0).max(manifest.wal_seq) + 1;
         let wal = Wal::create(&dir, next_seq, config.opts.encryption_key_id)?;
@@ -380,6 +381,9 @@ impl Table {
                 compacting: HashSet::new(),
                 no_gain: HashSet::new(),
                 poisoned: None,
+                next_batch_id: replayed.max_batch_id + 1,
+                open_batches: HashMap::new(),
+                epoch: 0,
             }),
             maint: Mutex::new(()),
             defunct: AtomicBool::new(false),
@@ -410,8 +414,7 @@ impl Table {
     /// `sync_wal(true)` returns.
     pub fn write(&self, row: Row) -> Result<()> {
         self.schema.validate_row(&row)?;
-        let mut payload = Vec::with_capacity(16 * row.len());
-        encode_row(&mut payload, &row);
+        let payload = wal::row_commit_entry(&row);
         // Reject before touching the WAL: an oversized row is the caller's
         // mistake, not a storage failure, and must not poison the table.
         if payload.len() > wal::max_entry() {
@@ -468,7 +471,7 @@ impl Table {
         self.flush_locked(inner)
     }
 
-    fn flush_locked(&self, inner: &mut Inner) -> Result<()> {
+    pub(crate) fn flush_locked(&self, inner: &mut Inner) -> Result<()> {
         if inner.memtable.is_empty() {
             return Ok(());
         }
@@ -509,6 +512,18 @@ impl Table {
 
         let mut manifest = inner.manifest.clone();
         manifest.wal_seq = covered;
+        // A batch that logged rows before this flush but has not committed
+        // yet will put its COMMIT after the flush point: replay must still
+        // reach its first row.
+        let replay_seq = inner.open_batches.values().copied().min().map_or(covered + 1, |s| s.min(covered + 1));
+        manifest.replay_seq = replay_seq;
+        let lag = covered.saturating_sub(replay_seq);
+        if lag > MAX_RETAINED_SEGMENTS {
+            warn(&format!(
+                "{}: an open batch retains {lag} WAL segments (oldest needed: {replay_seq}, flushed: {covered})",
+                dir.display()
+            ));
+        }
         manifest.next_chunk_id = next_id;
         manifest.chunks.extend(written.iter().map(|m| m.id));
         inner.commit_manifest(dir, manifest)?;
@@ -519,7 +534,7 @@ impl Table {
         inner.memtable.clear();
         inner.mem_generation += 1;
         inner.rotate_wal(dir, opts.encryption_key_id)?;
-        delete_wal_upto(dir, covered);
+        delete_wal_upto(dir, replay_seq - 1);
         Ok(())
     }
 
@@ -533,6 +548,7 @@ impl Table {
 
         let mut manifest = inner.manifest.clone();
         manifest.wal_seq = old_seq;
+        manifest.replay_seq = old_seq + 1;
         manifest.chunks.clear();
         inner.commit_manifest(dir, manifest)?;
 
@@ -540,6 +556,10 @@ impl Table {
         inner.memtable.clear();
         inner.series.clear();
         inner.mem_generation += 1;
+        // Open batches must not resurrect rows from before the truncate: their
+        // commit is refused (epoch) and their logged rows lie before replay_seq.
+        inner.open_batches.clear();
+        inner.epoch += 1;
         inner.rotate_wal(dir, self.config.opts.encryption_key_id)?;
         delete_wal_upto(dir, old_seq);
         Ok(())

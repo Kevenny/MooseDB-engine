@@ -250,3 +250,50 @@ fn invalid_options_are_rejected() {
     assert_eq!(err.0, TFStatus::TF_ERR_INVALID_ARG);
     assert!(err.1.contains("CHUNK_INTERVAL"), "{}", err.1);
 }
+
+fn ts_row(ts: i64, host: &str, v: f64) -> [TFValue; 3] {
+    [
+        TFValue { kind: TFColumnType::TF_COL_TIMESTAMP as u8, is_null: false, data: TFValueData { ts_us: ts } },
+        tag(host),
+        TFValue { kind: TFColumnType::TF_COL_FLOAT64 as u8, is_null: false, data: TFValueData { float_val: v } },
+    ]
+}
+
+fn batch_write(b: *mut MooseDBBatch, ts: i64, host: &str) -> FfiResult<()> {
+    let mut vals = ts_row(ts, host, 1.0);
+    let row = TFRow { col_count: 3, values: vals.as_mut_ptr() };
+    check(unsafe { moosedb_batch_write(b, &row) })
+}
+
+#[test]
+fn batches_through_c_abi() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t_batch");
+    let t = Handle::create_and_open(path.to_str().unwrap()).unwrap();
+
+    let mut b = ptr::null_mut();
+    check(unsafe { moosedb_batch_begin(t.0, &mut b) }).unwrap();
+    for i in 0..10 {
+        batch_write(b, i * 1_000_000, "srv01").unwrap();
+    }
+    // A bad row is rejected and the batch stays usable.
+    let v = TFValue { kind: TFColumnType::TF_COL_INT64 as u8, is_null: false, data: TFValueData { int_val: 1 } };
+    let mut bad = [v, tag("a"), v];
+    let row = TFRow { col_count: 3, values: bad.as_mut_ptr() };
+    assert_eq!(unsafe { moosedb_batch_write(b, &row) }, TFStatus::TF_ERR_INVALID_ARG);
+    assert_eq!(t.count().unwrap(), 0, "invisible before commit");
+    check(unsafe { moosedb_batch_commit(b, true) }).unwrap();
+    assert_eq!(t.count().unwrap(), 10);
+
+    // Abort releases the handle and publishes nothing.
+    check(unsafe { moosedb_batch_begin(t.0, &mut b) }).unwrap();
+    batch_write(b, 99_000_000, "srv02").unwrap();
+    check(unsafe { moosedb_batch_abort(b) }).unwrap();
+    assert_eq!(t.count().unwrap(), 10);
+
+    // NULL handles are errors (commit) or ignored (abort).
+    assert_eq!(unsafe { moosedb_batch_commit(ptr::null_mut(), true) }, TFStatus::TF_ERR_INVALID_ARG);
+    assert_eq!(unsafe { moosedb_batch_write(ptr::null_mut(), ptr::null()) }, TFStatus::TF_ERR_INVALID_ARG);
+    assert_eq!(unsafe { moosedb_batch_begin(t.0, ptr::null_mut()) }, TFStatus::TF_ERR_INVALID_ARG);
+    assert_eq!(unsafe { moosedb_batch_abort(ptr::null_mut()) }, TFStatus::TF_OK);
+}

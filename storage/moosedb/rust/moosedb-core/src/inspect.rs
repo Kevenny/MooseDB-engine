@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::manifest::Manifest;
 use crate::options::TableOptions;
 use crate::table::OPTIONS_FILE;
-use crate::wal::{self, TornTail};
+use crate::wal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -152,9 +152,11 @@ pub fn inspect(dir: &Path, now: i64) -> Result<TableInfo> {
         }
     }
     let mut pending = 0u64;
-    for seq in wal::list_segments(dir)?.into_iter().filter(|&s| s > manifest.wal_seq) {
-        pending += wal::replay(dir, seq, TornTail::Ignore, |_| Ok(()))?.entries;
-    }
+    let segs: Vec<u64> = wal::list_segments(dir)?.into_iter().filter(|&s| s >= manifest.replay_seq).collect();
+    wal::replay_committed(dir, &segs, manifest.wal_seq, false, |_, _| {
+        pending += 1;
+        Ok(())
+    })?;
     Ok(build(false, &chunks, options, &HashSet::new(), pending, None, 0, now))
 }
 

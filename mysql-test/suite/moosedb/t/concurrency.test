@@ -39,7 +39,7 @@ connection default;
 connect (w3, localhost, root,,);
 send INSERT INTO c SELECT '2026-04-01' + INTERVAL seq SECOND, 3 FROM seq_1_to_5000;
 connection default;
-SELECT w, v FROM (SELECT w, ts AS v FROM c WHERE w IN (1, 2) ORDER BY w DESC, ts DESC LIMIT 2) x ORDER BY w;
+SELECT w, v FROM (SELECT w, ts AS v FROM c WHERE w IN (1, 2) ORDER BY w DESC, ts DESC LIMIT 2) x ORDER BY w, v DESC;
 connection w3;
 reap;
 disconnect w3;
