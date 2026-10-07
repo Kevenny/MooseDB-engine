@@ -23,7 +23,7 @@ use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::chunk::ChunkMeta;
-use crate::chunk_reader::decode_series;
+use crate::chunk_reader::{decode_series, fetch_row};
 use crate::error::{invalid, Error, Result};
 use crate::memtable::MemSnapshot;
 use crate::schema::{Row, Schema, Value};
@@ -165,8 +165,10 @@ impl Snapshot {
             .and_then(|i| self.chunks.get(i))
             .ok_or_else(missing)?;
         let idx = meta.series_for_ordinal(pos.ordinal).ok_or_else(missing)?;
-        let rows = decode_series(&self.schema, meta, idx)?;
-        rows.into_iter().nth((pos.ordinal - meta.series_offsets[idx]) as usize).ok_or_else(missing)
+        // Not `decode_series(..).nth(..)`: that decodes the whole series per
+        // fetch (O(series) per `rnd_pos`); this goes through the series cache.
+        let within = usize::try_from(pos.ordinal - meta.series_offsets[idx]).map_err(|_| missing())?;
+        fetch_row(&self.schema, meta, idx, within)?.ok_or_else(missing)
     }
 }
 

@@ -73,9 +73,11 @@ DROP TEMPORARY TABLE tt2;
 --error ER_ILLEGAL_HA_CREATE_OPTION
 CREATE TEMPORARY TABLE te (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=99;
 
---echo # Rows survive a flush into a chunk inside the session
-CREATE TEMPORARY TABLE big (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR' MEMTABLE_SIZE=4096;
-INSERT INTO big SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_1_to_3000;
+--echo # Rows survive a flush into a chunk inside the session (200000 rows against
+--echo # a 1 MiB MemTable; temporary tables are not listed in INFORMATION_SCHEMA, so
+--echo # the spill itself is proven by the equivalent permanent table in statement_atomicity)
+CREATE TEMPORARY TABLE big (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR' MEMTABLE_SIZE=1048576;
+INSERT INTO big SELECT '2026-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_200000;
 SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) FROM big;
 FLUSH TABLES;
 SELECT COUNT(*), SUM(v) FROM big;

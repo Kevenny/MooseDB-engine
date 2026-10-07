@@ -100,17 +100,19 @@ test.tt2	check	status	OK
 DROP TEMPORARY TABLE tt2;
 # Temporary table with encryption options validates the key too
 CREATE TEMPORARY TABLE te (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=99;
-ERROR HY000: MooseDB: invalid argument: encryption key 99 is not available: not found: encryption key 99 (version latest) is not available
-# Rows survive a flush into a chunk inside the session
-CREATE TEMPORARY TABLE big (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR' MEMTABLE_SIZE=4096;
-INSERT INTO big SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_1_to_3000;
+ERROR HY000: MooseDB: invalid argument: encryption key 99 is not available: encryption: encryption key 99 (version latest) is not available
+# Rows survive a flush into a chunk inside the session (200000 rows against
+# a 1 MiB MemTable; temporary tables are not listed in INFORMATION_SCHEMA, so
+# the spill itself is proven by the equivalent permanent table in statement_atomicity)
+CREATE TEMPORARY TABLE big (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR' MEMTABLE_SIZE=1048576;
+INSERT INTO big SELECT '2026-01-01' + INTERVAL seq SECOND, seq FROM seq_1_to_200000;
 SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) FROM big;
 COUNT(*)	SUM(v)	MIN(ts)	MAX(ts)
-3000	4501500	2026-01-01 00:01:00	2026-01-03 02:00:00
+200000	20000100000	2026-01-01 00:00:01	2026-01-03 07:33:20
 FLUSH TABLES;
 SELECT COUNT(*), SUM(v) FROM big;
 COUNT(*)	SUM(v)
-3000	4501500
+200000	20000100000
 DROP TEMPORARY TABLE big;
 # A session that ends with a temporary table does not leave files behind
 connect  con3,localhost,root,,test;

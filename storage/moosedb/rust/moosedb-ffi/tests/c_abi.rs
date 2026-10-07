@@ -297,3 +297,80 @@ fn batches_through_c_abi() {
     assert_eq!(unsafe { moosedb_batch_begin(t.0, ptr::null_mut()) }, TFStatus::TF_ERR_INVALID_ARG);
     assert_eq!(unsafe { moosedb_batch_abort(ptr::null_mut()) }, TFStatus::TF_OK);
 }
+
+#[test]
+fn series_versions_and_shared_lists_through_c_abi() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t_series");
+    let t = Handle::create_and_open(path.to_str().unwrap()).unwrap();
+    let version = |t: &Handle| {
+        let mut v = 0u64;
+        check(unsafe { moosedb_series_version(t.0, &mut v) }).unwrap();
+        v
+    };
+    let v0 = version(&t);
+    t.write(1_000_000, "srv01", 1.0).unwrap();
+    t.write(2_000_000, "srv02", 2.0).unwrap();
+    let v1 = version(&t);
+    assert!(v1 > v0);
+    t.write(3_000_000, "srv01", 3.0).unwrap();
+    assert_eq!(version(&t), v1, "a row of a known series does not change the version");
+
+    let mut list = ptr::null_mut();
+    check(unsafe { moosedb_series_list(t.0, &mut list) }).unwrap();
+    assert_eq!(unsafe { moosedb_series_list_len(list) }, 2);
+    assert_eq!(unsafe { moosedb_series_list_version(list) }, v1, "the list says which version it shows");
+
+    // The list in hand is a snapshot: a new series changes the version, not the list.
+    t.write(4_000_000, "srv03", 4.0).unwrap();
+    let v2 = version(&t);
+    assert!(v2 > v1);
+    assert_eq!(unsafe { moosedb_series_list_len(list) }, 2);
+    let mut id = 0u64;
+    let mut row = TFRow { col_count: 0, values: ptr::null_mut() };
+    check(unsafe { moosedb_series_list_get(list, 0, &mut id, &mut row) }).unwrap();
+    assert_eq!(row.col_count, 1);
+    assert_eq!(unsafe { moosedb_series_list_get(list, 2, &mut id, &mut row) }, TFStatus::TF_ERR_INVALID_ARG);
+    let epoch1 = unsafe { moosedb_series_list_epoch(list) };
+    assert_ne!(epoch1, 0);
+    assert_eq!(unsafe { moosedb_series_list_epoch(ptr::null()) }, 0);
+    check(unsafe { moosedb_series_list_close(list) }).unwrap();
+
+    let mut list = ptr::null_mut();
+    check(unsafe { moosedb_series_list(t.0, &mut list) }).unwrap();
+    assert_eq!(unsafe { moosedb_series_list_epoch(list) }, epoch1, "appending keeps the epoch");
+    assert_eq!(unsafe { moosedb_series_list_len(list) }, 3);
+    assert_eq!(unsafe { moosedb_series_list_version(list) }, v2);
+    check(unsafe { moosedb_series_list_close(list) }).unwrap();
+
+    check(unsafe { moosedb_truncate(t.0) }).unwrap();
+    assert!(version(&t) > v2, "TRUNCATE moves the version on");
+    // Even if the new list happens to grow back to the same size, its epoch differs.
+    for (i, h) in ["srv01", "srv02", "srv03"].iter().enumerate() {
+        t.write(5_000_000 + i as i64, h, 1.0).unwrap();
+    }
+    let mut list = ptr::null_mut();
+    check(unsafe { moosedb_series_list(t.0, &mut list) }).unwrap();
+    assert_eq!(unsafe { moosedb_series_list_len(list) }, 3);
+    assert_ne!(unsafe { moosedb_series_list_epoch(list) }, epoch1, "TRUNCATE replaces the log");
+    check(unsafe { moosedb_series_list_close(list) }).unwrap();
+    assert_eq!(unsafe { moosedb_series_version(ptr::null_mut(), ptr::null_mut()) }, TFStatus::TF_ERR_INVALID_ARG);
+}
+
+#[test]
+fn global_settings_carry_the_batch_budget() {
+    let s = TFGlobalSettings {
+        retention_check_interval_secs: 3600,
+        compaction_trigger_chunks: 10,
+        bloom_filter_false_positive_rate: 0.01,
+        chunk_cache_bytes: 128 << 20,
+        max_open_chunks: 100,
+        batch_memory_budget_bytes: 64 << 20,
+    };
+    check(unsafe { moosedb_set_globals(&s) }).unwrap();
+    assert_eq!(moosedb_core::settings::get().batch_memory_budget_bytes(), 64 << 20);
+    // 0 selects the default.
+    let s = TFGlobalSettings { batch_memory_budget_bytes: 0, ..s };
+    check(unsafe { moosedb_set_globals(&s) }).unwrap();
+    assert_eq!(moosedb_core::settings::get().batch_memory_budget_bytes(), 1 << 30);
+}

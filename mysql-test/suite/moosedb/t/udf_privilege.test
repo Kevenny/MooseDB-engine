@@ -16,9 +16,11 @@ CREATE USER 'nobody'@'localhost';
 CREATE USER 'reader'@'localhost';
 CREATE USER 'deleter'@'localhost';
 CREATE USER 'altering'@'localhost';
+CREATE USER 'optimizer'@'localhost';
 GRANT SELECT ON test.secret TO 'reader'@'localhost';
 GRANT SELECT, DELETE ON test.secret TO 'deleter'@'localhost';
 GRANT SELECT, ALTER ON test.secret TO 'altering'@'localhost';
+GRANT SELECT, INSERT ON test.secret TO 'optimizer'@'localhost';
 GRANT EXECUTE ON test.* TO 'reader'@'localhost';
 GRANT EXECUTE ON test.* TO 'deleter'@'localhost';
 GRANT EXECUTE ON test.* TO 'altering'@'localhost';
@@ -80,6 +82,23 @@ disconnect altering;
 connection default;
 SELECT COUNT(*) FROM secret;
 
+--echo # ---- OPTIMIZE needs only SELECT+INSERT: it must not expire data without DELETE ----
+INSERT INTO secret VALUES ('2001-01-02', 3);
+FLUSH TABLES secret;
+SELECT COUNT(*) FROM secret;
+connect (optimizer,localhost,optimizer,,);
+OPTIMIZE TABLE test.secret;
+connection default;
+--echo # the expired row is still there: retention was skipped
+SELECT COUNT(*) FROM secret;
+GRANT DELETE ON test.secret TO 'optimizer'@'localhost';
+connection optimizer;
+OPTIMIZE TABLE test.secret;
+disconnect optimizer;
+connection default;
+--echo # with DELETE the same OPTIMIZE applies retention
+SELECT COUNT(*) FROM secret;
+
 --echo # ---- the owner (all privileges) still can ----
 CALL moosedb_apply_retention('test.secret');
 CALL moosedb_compact('test.secret', NULL, NULL);
@@ -89,6 +108,7 @@ DROP USER 'nobody'@'localhost';
 DROP USER 'reader'@'localhost';
 DROP USER 'deleter'@'localhost';
 DROP USER 'altering'@'localhost';
+DROP USER 'optimizer'@'localhost';
 DROP TABLE secret;
 DROP PROCEDURE moosedb_compact;
 DROP PROCEDURE moosedb_apply_retention;

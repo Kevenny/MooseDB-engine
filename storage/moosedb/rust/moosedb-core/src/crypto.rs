@@ -37,6 +37,11 @@ fn fetch_key(key_id: u32, version: Option<u32>) -> Result<(u32, [u8; KEY_LEN])> 
     provider(key_id, version)
 }
 
+/// Latest key version the provider offers for `key_id`.
+pub(crate) fn latest_version(key_id: u32) -> Result<u32> {
+    fetch_key(key_id, None).map(|(v, _)| v)
+}
+
 /// Encryption parameters of one file, plus the resolved key.
 #[derive(Clone)]
 pub struct CipherParams {

@@ -1,0 +1,84 @@
+call mtr.add_suppression("MooseDB");
+call mtr.add_suppression("marked as crashed");
+call mtr.add_suppression("Checking table");
+call mtr.add_suppression("Got error");
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO t VALUES ('2026-01-01 01:00:00', 1);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-01 02:00:00', 2);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-01 03:00:00', 3);
+FLUSH TABLES t;
+# Corrupt the oldest chunk (the table is closed, only the newest is verified at open)
+# CHECK TABLE: warning carries the core message
+CHECK TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	check	Warning	MooseDB: 1 corrupt chunk(s): chunk_20260101T000000_20260102T000000_000001.tfl: test.t/chunk_20260101T000000_20260102T000000_000001.tfl checksum mismatch
+test.t	check	error	Corrupt
+# OPTIMIZE: the core error is raised as a warning
+OPTIMIZE TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	optimize	Warning	MooseDB: corrupt data: test.t/chunk_20260101T000000_20260102T000000_000001.tfl at offset 64: corrupt data: column block checksum mismatch (corrupt data or wrong key)
+test.t	optimize	status	Operation failed
+# Read through the handler: generic error, no path
+SELECT SUM(v) FROM t;
+ERROR HY000: Table 't' is marked as crashed and should be repaired
+# UDF behind CALL moosedb_compact: the error text is scrubbed
+CALL moosedb_compact('test.t', NULL, NULL);
+ERROR HY000: MooseDB: corrupt data: test.t/chunk_20260101T000000_20260102T000000_000001.tfl at offset 64: corrupt data: column block checksum mismatch (corrupt data or wrong key)
+# INFORMATION_SCHEMA: a table whose MANIFEST is unreadable
+FLUSH TABLES;
+SELECT COUNT(*) FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 't';
+COUNT(*)
+0
+Warnings:
+Warning	1105	MooseDB: test.t: corrupt data: MANIFEST too short
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1105	MooseDB: test.t: corrupt data: MANIFEST too short
+SELECT COUNT(*) FROM information_schema.MOOSEDB_CHUNKS;
+COUNT(*)
+0
+Warnings:
+Warning	1105	MooseDB: test.t: corrupt data: MANIFEST too short
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1105	MooseDB: test.t: corrupt data: MANIFEST too short
+# Opening the table with that MANIFEST fails with a path-free message
+SELECT COUNT(*) FROM t;
+ERROR HY000: Table 't' is marked as crashed and should be repaired
+SHOW WARNINGS;
+Level	Code	Message
+Error	1194	Table 't' is marked as crashed and should be repaired
+DROP TABLE t;
+# CREATE / RENAME where a stray directory is in the way
+CREATE TABLE stray (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+ERROR HY000: MooseDB: invalid argument: test.stray already exists and is not empty
+SHOW WARNINGS;
+Level	Code	Message
+Error	1478	MooseDB: invalid argument: test.stray already exists and is not empty
+Warning	1030	Got error 140 "Wrong create options" from storage engine MooseDB
+CREATE TABLE src (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+# (the server itself words the RENAME error; the engine message is not shown)
+RENAME TABLE src TO stray2;
+ERROR HY000: Error on rename of './test/src' to './test/stray2' (errno: 1205 "Unknown error 1205")
+DROP TABLE src;
+# moosedb_apply_retention on a table whose MANIFEST is unreadable
+CREATE TABLE r (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+INSERT INTO r VALUES ('2001-01-01 00:00:00', 1), (NOW(), 2);
+FLUSH TABLES r;
+SELECT COUNT(*) FROM r;
+COUNT(*)
+2
+FLUSH TABLES;
+CALL moosedb_apply_retention('test.r');
+ERROR HY000: Table 'r' is marked as crashed and should be repaired
+SHOW WARNINGS;
+Level	Code	Message
+Error	1194	Table 'r' is marked as crashed and should be repaired
+Note	4094	At line 14 in test.moosedb_apply_retention
+DROP TABLE IF EXISTS r;
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;

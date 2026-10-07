@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::block;
 use crate::bytes::ByteReader;
-use crate::cache::{self, BlockPayload};
+use crate::cache::{self, BlockPayload, DecodedSeries};
 use crate::chunk::{
     decode_series_entry, series_offsets, BlockRef, ChunkFile, ChunkHeader, ChunkMeta, ENC_HEADER_LEN, FOOTER_LEN,
     FOOTER_MAGIC, HEADER_LEN,
@@ -189,6 +189,13 @@ pub(crate) fn decode_series(schema: &Schema, meta: &ChunkMeta, idx: usize) -> Re
     if entry.blocks.len() != schema.data_indices().len() || entry.tags.len() != schema.tag_indices().len() {
         return Err(corrupt(format!("{} does not match the table schema", meta.path().display())));
     }
+    // Bound what we materialize (rows of Values) by the claimed row count,
+    // before allocating anything.
+    block::check_materialization(
+        n,
+        schema.columns().len() * std::mem::size_of::<crate::schema::Value>() + std::mem::size_of::<Row>(),
+    )
+    .map_err(|e| corrupt(format!("{}: {e}", meta.path().display())))?;
     let mut columns: Vec<Option<std::vec::IntoIter<crate::schema::Value>>> = vec![None; schema.columns().len()];
     for (&col, &b) in schema.data_indices().iter().zip(&entry.blocks) {
         let payload = read_block(meta, b)?;
@@ -212,6 +219,59 @@ pub(crate) fn decode_series(schema: &Schema, meta: &ChunkMeta, idx: usize) -> Re
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// Decodes series `idx` into compact columns, through the cache.
+fn decoded_series(schema: &Schema, meta: &ChunkMeta, idx: usize) -> Result<Arc<DecodedSeries>> {
+    let uid = meta.file.uid;
+    let key = u32::try_from(idx).map_err(|_| corrupt("series entry index out of range"))?;
+    if let Some(s) = cache::get_series(uid, key) {
+        return Ok(s);
+    }
+    let entry = meta.series.get(idx).ok_or_else(|| corrupt("series entry index out of range"))?;
+    let n = entry.row_count as usize;
+    if n == 0 || u64::from(entry.row_count) > MAX_SERIES_ROWS {
+        return Err(corrupt(format!("{} has a series with {n} rows", meta.path().display())));
+    }
+    if entry.blocks.len() != schema.data_indices().len() || entry.tags.len() != schema.tag_indices().len() {
+        return Err(corrupt(format!("{} does not match the table schema", meta.path().display())));
+    }
+    block::check_materialization(n, 9 * schema.data_indices().len().max(1))
+        .map_err(|e| corrupt(format!("{}: {e}", meta.path().display())))?;
+    let mut columns: Vec<Option<block::ColumnData>> = (0..schema.columns().len()).map(|_| None).collect();
+    for (&col, &b) in schema.data_indices().iter().zip(&entry.blocks) {
+        let payload = read_block(meta, b)?;
+        let data = block::decode_compact(schema.columns()[col].ty, n, &payload)
+            .map_err(|e| corrupt(format!("{} at offset {}: {e}", meta.path().display(), b.offset)))?;
+        if data.len() != n {
+            return Err(corrupt("column block too short"));
+        }
+        columns[col] = Some(data);
+    }
+    let series = Arc::new(DecodedSeries { columns });
+    cache::put_series(uid, key, series.clone());
+    Ok(series)
+}
+
+/// Reads one row of series `idx` by its position inside the series. The
+/// series is decoded once into compact columns kept in the shared cache, so
+/// the next fetch of any row of it costs O(columns), not O(series length).
+pub(crate) fn fetch_row(schema: &Schema, meta: &ChunkMeta, idx: usize, ordinal: usize) -> Result<Option<Row>> {
+    let entry = meta.series.get(idx).ok_or_else(|| corrupt("series entry index out of range"))?;
+    if ordinal >= entry.row_count as usize {
+        return Ok(None);
+    }
+    let series = decoded_series(schema, meta, idx)?;
+    let mut row = Vec::with_capacity(series.columns.len());
+    for (col, data) in series.columns.iter().enumerate() {
+        let v = match (data, schema.tag_position(col)) {
+            (Some(d), _) => d.value_at(ordinal).ok_or_else(|| corrupt("column block too short"))?,
+            (None, Some(t)) => entry.tags[t].clone(),
+            (None, None) => return Err(corrupt("column without data")),
+        };
+        row.push(v);
+    }
+    Ok(Some(row))
 }
 
 #[cfg(test)]

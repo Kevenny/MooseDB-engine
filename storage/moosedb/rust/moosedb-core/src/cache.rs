@@ -1,8 +1,10 @@
-//! Process-wide LRU caches: decoded chunk blocks and open chunk files.
+//! Process-wide LRU caches: decoded chunk blocks (and decoded series, for
+//! random row fetches) and open chunk files.
 //!
-//! Both are keyed by a chunk file's `uid`, a process-unique number assigned
+//! All are keyed by a chunk file's `uid`, a process-unique number assigned
 //! when the file is opened, so entries never alias across tables or across a
-//! deleted-and-recreated path.
+//! deleted-and-recreated path. Blocks and decoded series share one LRU and one
+//! byte budget (`moosedb_chunk_cache_size`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -10,6 +12,7 @@ use std::hash::Hash;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::block::ColumnData;
 use crate::error::Result;
 use crate::settings;
 
@@ -45,6 +48,8 @@ impl<K: Hash + Eq + Clone, V: Clone> Lru<K, V> {
     fn insert(&mut self, k: K, v: V, size: usize, capacity: usize) {
         self.remove(&k);
         if size > capacity {
+            // Also honours a capacity that was lowered since the last insert.
+            self.shrink(capacity);
             return;
         }
         self.tick += 1;
@@ -77,10 +82,43 @@ pub(crate) struct BlockPayload {
     pub data: Vec<u8>,
 }
 
-type BlockKey = (u64, u64); // (file uid, block offset)
+/// One series of a chunk with every data column decoded into native-width
+/// arrays: a row is then built from them in O(columns), whatever the series
+/// length. `columns[c]` is `None` for TAG columns (constant per series).
+pub(crate) struct DecodedSeries {
+    pub columns: Vec<Option<ColumnData>>,
+}
 
-fn blocks() -> &'static Mutex<Lru<BlockKey, Arc<BlockPayload>>> {
-    static C: OnceLock<Mutex<Lru<BlockKey, Arc<BlockPayload>>>> = OnceLock::new();
+impl DecodedSeries {
+    fn size(&self) -> usize {
+        64 + self.columns.iter().flatten().map(|c| c.heap_bytes() + 64).sum::<usize>()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum CacheKey {
+    /// (file uid, block offset)
+    Block(u64, u64),
+    /// (file uid, series entry index)
+    Series(u64, u32),
+}
+
+impl CacheKey {
+    fn uid(&self) -> u64 {
+        match self {
+            CacheKey::Block(uid, _) | CacheKey::Series(uid, _) => *uid,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Cached {
+    Block(Arc<BlockPayload>),
+    Series(Arc<DecodedSeries>),
+}
+
+fn blocks() -> &'static Mutex<Lru<CacheKey, Cached>> {
+    static C: OnceLock<Mutex<Lru<CacheKey, Cached>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(Lru::new()))
 }
 
@@ -90,18 +128,57 @@ fn files() -> &'static Mutex<Lru<u64, Arc<File>>> {
 }
 
 pub(crate) fn get_block(uid: u64, offset: u64) -> Option<Arc<BlockPayload>> {
-    blocks().lock().ok()?.get(&(uid, offset))
+    match blocks().lock().ok()?.get(&CacheKey::Block(uid, offset))? {
+        Cached::Block(b) => Some(b),
+        Cached::Series(_) => None,
+    }
+}
+
+fn capacity() -> usize {
+    usize::try_from(settings::get().chunk_cache_bytes()).unwrap_or(usize::MAX)
 }
 
 pub(crate) fn put_block(uid: u64, offset: u64, block: Arc<BlockPayload>) {
-    let capacity = usize::try_from(settings::get().chunk_cache_bytes()).unwrap_or(usize::MAX);
+    let capacity = capacity();
     if capacity == 0 {
         return;
     }
     let size = block.data.len() + 64;
     if let Ok(mut c) = blocks().lock() {
-        c.insert((uid, offset), block, size, capacity);
+        c.insert(CacheKey::Block(uid, offset), Cached::Block(block), size, capacity);
     }
+}
+
+pub(crate) fn get_series(uid: u64, index: u32) -> Option<Arc<DecodedSeries>> {
+    match blocks().lock().ok()?.get(&CacheKey::Series(uid, index))? {
+        Cached::Series(s) => Some(s),
+        Cached::Block(_) => None,
+    }
+}
+
+/// Keeps a decoded series; one bigger than the whole cache is not kept.
+pub(crate) fn put_series(uid: u64, index: u32, series: Arc<DecodedSeries>) {
+    let capacity = capacity();
+    if capacity == 0 {
+        return;
+    }
+    let size = series.size();
+    if let Ok(mut c) = blocks().lock() {
+        c.insert(CacheKey::Series(uid, index), Cached::Series(series), size, capacity);
+    }
+}
+
+/// Applies a new capacity at once: entries over it are evicted now, not at
+/// the next insert (a lowered `moosedb_chunk_cache_size` must free memory).
+pub(crate) fn resize(capacity: u64) {
+    if let Ok(mut c) = blocks().lock() {
+        c.shrink(usize::try_from(capacity).unwrap_or(usize::MAX));
+    }
+}
+
+/// Bytes currently held by the block/series cache (diagnostics, tests).
+pub fn used_bytes() -> usize {
+    blocks().lock().map_or(0, |c| c.used)
 }
 
 /// Opens (or reuses) a read handle for a chunk file.
@@ -122,7 +199,7 @@ pub(crate) fn forget_file(uid: u64) {
         c.remove(&uid);
     }
     if let Ok(mut c) = blocks().lock() {
-        c.retain(|k| k.0 != uid);
+        c.retain(|k| k.uid() != uid);
     }
 }
 

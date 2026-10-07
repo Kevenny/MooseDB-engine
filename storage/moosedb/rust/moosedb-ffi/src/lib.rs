@@ -27,7 +27,7 @@ use moosedb_core::compression::Codec;
 use moosedb_core::inspect::{ChunkStatus, TableInfo};
 use moosedb_core::{
     crypto, maintenance, settings, Batch, Column, ColumnType, Error, Position, RawOptions, Row, Scan, ScanFilter,
-    Schema, Snapshot, Table, TableConfig, Value, POSITION_LEN,
+    Schema, SeriesSnapshot, Snapshot, Table, TableConfig, Value, POSITION_LEN,
 };
 
 /// Size in bytes of a row position (`handler::ref_length`).
@@ -51,6 +51,10 @@ pub enum TFStatus {
     TF_ERR_INTERNAL = 8,
     /// The operation or feature is not available.
     TF_ERR_UNSUPPORTED = 9,
+    /// Decryption failed or the encryption key / key version is not available
+    /// (wrong or retired key, damaged ciphertext): distinct from
+    /// `TF_ERR_CORRUPT` because the data may be intact.
+    TF_ERR_CRYPTO = 10,
 }
 
 /// Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -133,8 +137,14 @@ pub struct TFGlobalSettings {
     pub retention_check_interval_secs: u64,
     pub compaction_trigger_chunks: u32,
     pub bloom_filter_false_positive_rate: f64,
+    /// Bytes of decoded blocks and decoded series kept for reads
+    /// (`moosedb_chunk_cache_size`); 0 disables the cache.
     pub chunk_cache_bytes: u64,
     pub max_open_chunks: u32,
+    /// Bytes the row buffers of all open statement batches may hold together
+    /// (`moosedb_batch_memory_budget`). Above it, the batches that hold at
+    /// least 1 MiB spill to disk early. 0 = default (1 GiB).
+    pub batch_memory_budget_bytes: u64,
 }
 
 /// Fetches an encryption key from the server. `version == 0` asks for the
@@ -233,9 +243,10 @@ pub struct MooseDBSnapshot {
     row: RowOut,
 }
 
-/// Opaque list of the series of a table.
+/// Opaque list of the series of a table: a shared, immutable snapshot of the
+/// series index (taking it copies nothing).
 pub struct MooseDBSeriesList {
-    items: Vec<(u64, Vec<Value>)>,
+    snap: SeriesSnapshot,
     row: RowOut,
 }
 
@@ -263,7 +274,7 @@ fn status_of(e: &Error) -> TFStatus {
         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => TFStatus::TF_ERR_NOT_FOUND,
         Error::Io(_) => TFStatus::TF_ERR_IO,
         Error::Corrupt(_) => TFStatus::TF_ERR_CORRUPT,
-        Error::Crypto(_) => TFStatus::TF_ERR_CORRUPT,
+        Error::Crypto(_) => TFStatus::TF_ERR_CRYPTO,
         Error::Full(_) => TFStatus::TF_ERR_FULL,
         Error::NotFound(_) => TFStatus::TF_ERR_NOT_FOUND,
         Error::InvalidArg(_) => TFStatus::TF_ERR_INVALID_ARG,
@@ -479,6 +490,7 @@ pub unsafe extern "C" fn moosedb_set_globals(s: *const TFGlobalSettings) -> TFSt
         g.set_bloom_fpr(s.bloom_filter_false_positive_rate);
         g.set_chunk_cache_bytes(s.chunk_cache_bytes);
         g.set_max_open_chunks(s.max_open_chunks);
+        g.set_batch_memory_budget_bytes(s.batch_memory_budget_bytes);
         Ok(())
     })
 }
@@ -497,7 +509,7 @@ pub extern "C" fn moosedb_set_key_callback(cb: TFKeyCallback) -> TFStatus {
                     return Err(Error::InvalidArg(format!("encryption key {key_id} is not a 256-bit key")));
                 }
                 if rc != 0 {
-                    return Err(Error::NotFound(format!(
+                    return Err(Error::Crypto(format!(
                         "encryption key {key_id} (version {}) is not available",
                         version.map_or("latest".to_string(), |v| v.to_string())
                     )));
@@ -830,12 +842,17 @@ pub unsafe extern "C" fn moosedb_scan_open_filtered(
     out_scan: *mut *mut MooseDBScan,
 ) -> TFStatus {
     let mut filter = ScanFilter::range(ts_start_us, ts_end_us);
-    if series_count >= 0 {
-        // SAFETY: caller contract.
-        match unsafe { slice(series_ids, series_count as usize, "series_ids") } {
-            Ok(ids) => filter.series = Some(ids.to_vec()),
-            Err(e) => return guard(|| Err(e)),
+    let status = guard(|| {
+        if series_count >= 0 {
+            // SAFETY: caller contract.
+            let ids = unsafe { slice(series_ids, series_count as usize, "series_ids") }?;
+            // Copying can fail (allocation): keep it under the guard.
+            filter.series = Some(ids.to_vec());
         }
+        Ok(())
+    });
+    if status != TFStatus::TF_OK {
+        return status;
     }
     open_scan(table, &filter, sorted, out_scan)
 }
@@ -981,7 +998,26 @@ pub unsafe extern "C" fn moosedb_snapshot_close(snapshot: *mut MooseDBSnapshot) 
 
 // ─── series ──────────────────────────────────────────────────────────────────
 
-/// Lists every series of the table (for TAG predicate pushdown).
+/// Version of the table's set of series: it changes whenever a series is added
+/// or the table is truncated, so equal values mean the same series. Lock-free
+/// and O(1): call it before every pushdown and rebuild a cached index (from
+/// `moosedb_series_list`) only when it differs from the cached one.
+///
+/// # Safety
+/// `table` must be valid; `out_version` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_series_version(table: *mut MooseDBTable, out_version: *mut u64) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_version, "out_version")?;
+        *out = table_ref(table)?.table.series_version();
+        Ok(())
+    })
+}
+
+/// Lists every series of the table (for TAG predicate pushdown). The list is
+/// a shared snapshot: O(1) and no copy of the index under the table lock, at
+/// any number of series. Entries come in registration order (not sorted by
+/// id); the list never changes after it is returned.
 ///
 /// # Safety
 /// `table` must be valid; `out_list` writable.
@@ -993,8 +1029,8 @@ pub unsafe extern "C" fn moosedb_series_list(
     guard(|| {
         let out = handle_mut(out_list, "out_list")?;
         *out = ptr::null_mut();
-        let items = table_ref(table)?.table.series()?;
-        *out = Box::into_raw(Box::new(MooseDBSeriesList { items, row: RowOut::new() }));
+        let snap = table_ref(table)?.table.series_snapshot()?;
+        *out = Box::into_raw(Box::new(MooseDBSeriesList { snap, row: RowOut::new() }));
         Ok(())
     })
 }
@@ -1005,7 +1041,31 @@ pub unsafe extern "C" fn moosedb_series_list(
 /// `list` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn moosedb_series_list_len(list: *const MooseDBSeriesList) -> u64 {
-    guard_value(0, || handle_ref(list, "list").map_or(0, |l| l.items.len() as u64))
+    guard_value(0, || handle_ref(list, "list").map_or(0, |l| l.snap.len() as u64))
+}
+
+/// The `moosedb_series_version` value this list corresponds to (read together
+/// with its content, so a cache keyed by it is never stale).
+///
+/// # Safety
+/// `list` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_series_list_version(list: *const MooseDBSeriesList) -> u64 {
+    guard_value(0, || handle_ref(list, "list").map_or(0, |l| l.snap.version()))
+}
+
+/// Identity of the log behind the list, unique in the process: it changes at
+/// every TRUNCATE and every table open and never repeats. Guarantee: two lists
+/// of the same table with the same epoch are prefixes of one append-only log, so
+/// the later list is the earlier one plus new entries (same series at the same
+/// indexes); a different epoch means the list was replaced and must be reread
+/// from scratch. (Versions only say "something changed", not how.)
+///
+/// # Safety
+/// `list` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_series_list_epoch(list: *const MooseDBSeriesList) -> u64 {
+    guard_value(0, || handle_ref(list, "list").map_or(0, |l| l.snap.epoch()))
 }
 
 /// Series `index`: its id and its TAG values (in table TAG-column order).
@@ -1022,13 +1082,12 @@ pub unsafe extern "C" fn moosedb_series_list_get(
     guard(|| {
         let l = handle_mut(list, "list")?;
         let (id, tags) = l
-            .items
+            .snap
             .get(usize::try_from(index).unwrap_or(usize::MAX))
-            .cloned()
             .ok_or_else(|| invalid("series index out of range"))?;
         *handle_mut(out_id, "out_id")? = id;
         let n = tags.len();
-        l.row.publish(tags, std::iter::repeat(ColumnType::Tag).take(n), handle_mut(out_tags, "out_tags")?);
+        l.row.publish(tags.to_vec(), std::iter::repeat(ColumnType::Tag).take(n), handle_mut(out_tags, "out_tags")?);
         Ok(())
     })
 }
@@ -1265,4 +1324,29 @@ pub unsafe extern "C" fn moosedb_free_str(ptr: *mut c_char) {
             drop(unsafe { CString::from_raw(ptr) });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crypto_errors_have_their_own_status() {
+        assert_eq!(TFStatus::TF_ERR_CRYPTO as i32, 10);
+        assert_eq!(status_of(&Error::Crypto("wrong key".into())), TFStatus::TF_ERR_CRYPTO);
+        assert_eq!(status_of(&Error::Corrupt("x".into())), TFStatus::TF_ERR_CORRUPT);
+        // Existing codes keep their values.
+        assert_eq!(TFStatus::TF_ERR_UNSUPPORTED as i32, 9);
+        assert_eq!(TFStatus::TF_ERR_CORRUPT as i32, 2);
+    }
+
+    #[test]
+    fn scan_open_filtered_reports_bad_pointers_instead_of_crashing() {
+        let mut out: *mut MooseDBScan = ptr::null_mut();
+        // SAFETY: a NULL table and a NULL id list with a positive count are
+        // rejected before anything is dereferenced.
+        let st = unsafe { moosedb_scan_open_filtered(ptr::null_mut(), 0, 1, ptr::null(), 3, false, &mut out) };
+        assert_ne!(st, TFStatus::TF_OK);
+        assert!(out.is_null());
+    }
 }

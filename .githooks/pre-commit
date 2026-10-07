@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# MooseDB pre-commit guardrails — enforces the mandatory rules of CLAUDE.md
+# that can be checked mechanically. Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# Fast static checks always run on the staged content. When Rust/FFI/handler
+# files are staged and Docker is available, it also runs clippy and
+# `cbindgen --verify` in the moosedb-dev image (MOOSEDB_HOOK_FAST=1 skips that).
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+fail=0
+err() { echo "pre-commit: $*" >&2; fail=1; }
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+touches() { grep -qE "$1" <<<"$staged"; }
+
+RUST=storage/moosedb/rust
+FFI=$RUST/moosedb-ffi
+
+# 1. `unsafe` only inside moosedb-ffi (staged content; comments ignored).
+if hits=$(git grep --cached -n -E '\bunsafe *(\{|\(|fn\b|impl\b|trait\b|extern\b)|allow\(unsafe_code\)' \
+            -- "$RUST" ":!$FFI" | grep -vE '^[^:]+:[0-9]+: *//'); then
+  err "unsafe outside moosedb-ffi:"; echo "$hits" >&2
+fi
+
+# 2. forbid(unsafe_code) in every crate root except moosedb-ffi.
+for lib in $(git ls-files --cached "$RUST/*/src/lib.rs" | grep -v "^$FFI/"); do
+  git show ":$lib" | grep -q '#!\[forbid(unsafe_code)\]' \
+    || err "$lib lacks #![forbid(unsafe_code)]"
+done
+
+# 3. panic = "unwind" in [profile.release] (other profiles are not checked).
+release=$(git show ":$RUST/Cargo.toml" \
+  | awk '/^\[/ { in_rel = ($0 == "[profile.release]") } in_rel')
+grep -q 'panic *= *"unwind"' <<<"$release" \
+  || err 'Cargo.toml: [profile.release] must keep panic = "unwind"'
+
+# 4. Plugin stays MODULE_ONLY (never DEFAULT).
+git show ":storage/moosedb/CMakeLists.txt" | grep -q 'STORAGE_ENGINE MODULE_ONLY' \
+  || err 'CMakeLists.txt: MYSQL_ADD_PLUGIN must stay STORAGE_ENGINE MODULE_ONLY'
+
+# 5. No raw new/delete in the handler. Comments and string literals are
+#    stripped first, so prose like "new row" never trips the check while
+#    `delete p; // x` still does. Placement new on the server's allocators
+#    (`new (mem_root)`, `new (std::nothrow)`) and `= delete` are allowed.
+strip_cxx() {
+  sed -E -e 's/"([^"\\]|\\.)*"/""/g' -e "s/'([^'\\\\]|\\\\.)*'/''/g" \
+    | awk '{
+        out = ""; line = $0
+        while (length(line) > 0) {
+          if (in_c) {
+            i = index(line, "*/"); if (i == 0) { line = ""; break }
+            line = substr(line, i + 2); in_c = 0
+          } else {
+            j = index(line, "/*"); k = index(line, "//")
+            if (k > 0 && (j == 0 || k < j)) { out = out substr(line, 1, k - 1); break }
+            if (j == 0) { out = out line; break }
+            out = out substr(line, 1, j - 1); line = substr(line, j + 2); in_c = 1
+          }
+        }
+        print out
+      }'
+}
+for f in storage/moosedb/ha_moosedb.cc storage/moosedb/ha_moosedb.h; do
+  if hits=$(git show ":$f" | strip_cxx | grep -nE '\bdelete\b|\bnew +[A-Za-z_:]' \
+              | grep -vE '= *delete'); then
+    err "$f: raw new/delete (use smart pointers):"; echo "$hits" >&2
+  fi
+done
+
+# 6. The FFI header is generated: it should change together with the FFI.
+if touches "^$FFI/src/" && ! touches '^storage/moosedb/moosedb_ffi\.h$'; then
+  echo "pre-commit: note: $FFI changed without moosedb_ffi.h — the cbindgen check below decides" >&2
+fi
+
+# 7. Heavy checks in Docker (clippy + cbindgen --verify). Uses its own build
+#    volume so a commit never races a concurrent build. Runs on the working
+#    tree, not the index: keep partial staging of Rust files in mind.
+if [ "${MOOSEDB_HOOK_FAST:-0}" != 1 ] && touches "^($RUST/|storage/moosedb/(ha_moosedb|moosedb_ffi))"; then
+  if command -v docker >/dev/null && docker image inspect moosedb-dev >/dev/null 2>&1; then
+    echo "pre-commit: clippy + cbindgen --verify (MOOSEDB_HOOK_FAST=1 skips)..." >&2
+    MSYS_NO_PATHCONV=1 docker run --rm -v "$root:/work" \
+      -v moosedb-cargo:/usr/local/cargo/registry -v moosedb-build-hook:/build \
+      -w /work/$RUST moosedb-dev bash -c \
+      'export CARGO_TARGET_DIR=/build/target
+       cargo clippy --workspace --all-targets --locked -q -- -D warnings &&
+       cbindgen --quiet --verify --config cbindgen.toml --output ../moosedb_ffi.h moosedb-ffi' \
+      >&2 || err "clippy or cbindgen --verify failed (header out of date? regenerate with cbindgen)"
+  else
+    echo "pre-commit: warning: Docker image moosedb-dev not found; skipped clippy/cbindgen" >&2
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "pre-commit: blocked by MooseDB guardrails (see CLAUDE.md)." >&2
+  exit 1
+fi

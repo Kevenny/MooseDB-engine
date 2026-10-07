@@ -18,7 +18,7 @@ description: Compara o código implementado contra moosedb_engine_spec.md e atua
    divergências em `docs/architecture.md` (§Divergências da spec).
 2. Se a mudança é uma divergência **nova**, adicione uma linha na tabela:
    `| # | <o que a spec diz> | <o que foi implementado> | <motivo> |`.
-   Siga o estilo das 20 entradas existentes — motivo é sempre técnico e
+   Siga o estilo das entradas existentes — motivo é sempre técnico e
    concreto (ex.: "o servidor tipa X com esse nome exato"), nunca "decisão
    de design" vago.
 3. Se a mudança **resolve** uma divergência (código passou a seguir a
@@ -37,5 +37,5 @@ linha(s) adicionada(s)/removida(s), não o arquivo inteiro.
 
 ## Quem executa
 
-Agente principal — arquivo pequeno (~190 linhas), não há razão para
+Agente principal — arquivo de tamanho moderado (~300 linhas), não há razão para
 delegar a leitura.

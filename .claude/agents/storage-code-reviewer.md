@@ -53,6 +53,20 @@ de segurança/correção) vs **nit** (sugestão, não bloqueia).
    cópia nova, reporte como achado de performance (não necessariamente
    bloqueador, mas sinalize).
 
+8b. Lotes/WAL v2: COMMIT publicado só depois do sync; `replay_seq` = mín.
+    entre o flush e a 1ª linha de lote aberto; replay aplica só COMMIT após
+    `wal_seq`; ids de lote únicos; `epoch` do TRUNCATE checado em write,
+    commit e spill; spill = um swap de MANIFEST; poison em qualquer falha de
+    fsync. Cenário de crash que perca ou duplique linha → **bloqueador**.
+8c. Handler: todo caminho de escrita commita o lote antes do OK ao cliente
+    (`external_lock(F_UNLCK)`, `end_bulk_insert`, `reset()`), inclusive
+    triggers/funções/`CALL` (modos *prelocked*) e réplica; nunca abort de
+    dados já reportados como OK. Violação → **bloqueador**.
+8d. Entrada não confiável (arquivos do datadir, args de UDF): alocação
+    controlada por campo lido sem teto, ou aritmética sem `checked_*` sobre
+    valor lido → **alto**. Mensagem ao cliente com caminho do datadir →
+    **médio**.
+
 ### Build/ABI
 
 10. `MYSQL_ADD_PLUGIN` ainda usa `STORAGE_ENGINE MODULE_ONLY` (não

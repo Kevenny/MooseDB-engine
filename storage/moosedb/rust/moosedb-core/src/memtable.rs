@@ -21,12 +21,60 @@ pub(crate) struct MemRow {
 /// workload alternating single-row writes and scans stays efficient.
 const MAX_FROZEN: usize = 64;
 
-#[derive(Default)]
+/// Row count and timestamp range of one segment, kept as rows arrive so the
+/// optimizer range estimate never has to visit the rows.
+#[derive(Clone, Copy)]
+struct SegStats {
+    len: usize,
+    ts_min: i64,
+    ts_max: i64,
+}
+
+impl SegStats {
+    const EMPTY: SegStats = SegStats { len: 0, ts_min: i64::MAX, ts_max: i64::MIN };
+
+    fn add(&mut self, len: usize, ts_min: i64, ts_max: i64) {
+        self.len += len;
+        self.ts_min = self.ts_min.min(ts_min);
+        self.ts_max = self.ts_max.max(ts_max);
+    }
+
+    /// Rows with `lo <= ts <= hi`, assuming they are spread evenly over the
+    /// range of the segment (the same model used for chunks).
+    fn estimate(&self, lo: i64, hi: i64) -> u64 {
+        if self.len == 0 || hi < self.ts_min || lo > self.ts_max {
+            return 0;
+        }
+        if lo <= self.ts_min && hi >= self.ts_max {
+            return self.len as u64;
+        }
+        let span = (i128::from(self.ts_max) - i128::from(self.ts_min)).max(1);
+        let overlap = (i128::from(hi.min(self.ts_max)) - i128::from(lo.max(self.ts_min)) + 1).clamp(1, span);
+        ((self.len as i128 * overlap / span) as u64).max(1)
+    }
+}
+
 pub(crate) struct MemTable {
     frozen: Vec<Arc<Vec<MemRow>>>,
+    /// Statistics of each `frozen` segment, same order.
+    frozen_stats: Vec<SegStats>,
     active: Vec<MemRow>,
+    active_stats: SegStats,
     len: usize,
     bytes: usize,
+}
+
+impl Default for MemTable {
+    fn default() -> Self {
+        MemTable {
+            frozen: Vec::new(),
+            frozen_stats: Vec::new(),
+            active: Vec::new(),
+            active_stats: SegStats::EMPTY,
+            len: 0,
+            bytes: 0,
+        }
+    }
 }
 
 /// Immutable view of the MemTable at one instant.
@@ -69,24 +117,36 @@ pub(crate) fn row_bytes(row: &[Value]) -> usize {
 const OWN_SEGMENT_ROWS: usize = 512;
 
 impl MemTable {
-    pub(crate) fn push(&mut self, series_id: u64, row: Row) {
+    /// Appends one row whose timestamp is `ts`.
+    pub(crate) fn push(&mut self, ts: i64, series_id: u64, row: Row) {
         self.bytes += row_bytes(&row);
         self.len += 1;
+        self.active_stats.add(1, ts, ts);
         self.active.push(MemRow { series_id, row });
     }
 
+    fn freeze_active(&mut self) {
+        if !self.active.is_empty() {
+            self.frozen.push(Arc::new(mem::take(&mut self.active)));
+            self.frozen_stats.push(mem::replace(&mut self.active_stats, SegStats::EMPTY));
+        }
+    }
+
     /// Appends the rows of a committed batch at once, in order. `bytes` is
-    /// the sum of `row_bytes` over `rows`. The caller holds the table lock, so
-    /// no snapshot can see a part of the batch.
-    pub(crate) fn append(&mut self, rows: Vec<MemRow>, bytes: usize) {
+    /// the sum of `row_bytes` over `rows`, `ts_min`/`ts_max` their timestamp
+    /// range (both computed by the batch outside the lock). The caller holds
+    /// the table lock, so no snapshot can see a part of the batch.
+    pub(crate) fn append(&mut self, rows: Vec<MemRow>, bytes: usize, ts_min: i64, ts_max: i64) {
         self.len += rows.len();
         self.bytes += bytes;
         if rows.len() >= OWN_SEGMENT_ROWS {
-            if !self.active.is_empty() {
-                self.frozen.push(Arc::new(mem::take(&mut self.active)));
-            }
+            self.freeze_active();
+            let mut stats = SegStats::EMPTY;
+            stats.add(rows.len(), ts_min, ts_max);
             self.frozen.push(Arc::new(rows));
+            self.frozen_stats.push(stats);
         } else {
+            self.active_stats.add(rows.len(), ts_min, ts_max);
             self.active.extend(rows);
         }
     }
@@ -113,22 +173,27 @@ impl MemTable {
 
     /// Freezes the active segment and returns a view sharing all segments.
     pub(crate) fn snapshot(&mut self, generation: u64) -> MemSnapshot {
-        if !self.active.is_empty() {
-            self.frozen.push(Arc::new(mem::take(&mut self.active)));
-        }
+        self.freeze_active();
         if self.frozen.len() > MAX_FROZEN {
             // Copy into one segment; snapshots holding the old ones are unaffected
             // and ordinals are preserved because order is preserved.
             let merged: Vec<MemRow> =
                 self.rows().map(|m| MemRow { series_id: m.series_id, row: m.row.clone() }).collect();
+            let mut stats = SegStats::EMPTY;
+            for s in &self.frozen_stats {
+                stats.add(s.len, s.ts_min, s.ts_max);
+            }
             self.frozen = vec![Arc::new(merged)];
+            self.frozen_stats = vec![stats];
         }
         MemSnapshot { generation, segments: self.frozen.clone() }
     }
 
-    /// Rows with `lo <= ts <= hi`, for optimizer estimates.
-    pub(crate) fn count_in_range(&self, schema: &Schema, lo: i64, hi: i64) -> usize {
-        self.rows().filter(|m| (lo..=hi).contains(&schema.row_ts(&m.row))).count()
+    /// Estimated rows with `lo <= ts <= hi`, for the optimizer. Costs
+    /// O(segments) from per-segment statistics, never a walk over the rows
+    /// (it runs under the table mutex, once per `records_in_range`).
+    pub(crate) fn estimate_in_range(&self, lo: i64, hi: i64) -> u64 {
+        self.frozen_stats.iter().chain(std::iter::once(&self.active_stats)).map(|s| s.estimate(lo, hi)).sum()
     }
 
     /// Groups rows by `bucket(ts)` and then by series, each series sorted by
@@ -170,12 +235,40 @@ mod tests {
     }
 
     #[test]
+    fn range_estimates_come_from_segment_statistics() {
+        let mut m = MemTable::default();
+        for i in 0..1000 {
+            m.push(i, 0, row(i));
+        }
+        assert_eq!(m.estimate_in_range(i64::MIN, i64::MAX), 1000);
+        assert_eq!(m.estimate_in_range(2000, 3000), 0);
+        let half = m.estimate_in_range(0, 499);
+        assert!((450..=550).contains(&half), "{half}");
+        // A frozen segment, a batch segment and the active one.
+        let _ = m.snapshot(0);
+        let big: Vec<MemRow> = (2000..2600).map(|i| MemRow { series_id: 0, row: row(i) }).collect();
+        m.append(big, 0, 2000, 2599);
+        m.push(5000, 0, row(5000));
+        assert_eq!(m.estimate_in_range(i64::MIN, i64::MAX), 1601);
+        assert_eq!(m.estimate_in_range(2000, 2599), 600);
+        assert_eq!(m.estimate_in_range(4000, 6000), 1);
+        // Merging segments keeps the statistics.
+        for i in 0..100 {
+            m.push(6000 + i, 0, row(6000 + i));
+            let _ = m.snapshot(0);
+        }
+        assert_eq!(m.estimate_in_range(i64::MIN, i64::MAX), 1701);
+        m.clear();
+        assert_eq!(m.estimate_in_range(i64::MIN, i64::MAX), 0);
+    }
+
+    #[test]
     fn snapshots_are_stable_and_share_segments() {
         let mut m = MemTable::default();
-        m.push(1, row(1));
-        m.push(1, row(2));
+        m.push(1, 1, row(1));
+        m.push(2, 1, row(2));
         let s1 = m.snapshot(0);
-        m.push(2, row(3));
+        m.push(3, 2, row(3));
         let s2 = m.snapshot(0);
         assert_eq!(s1.len(), 2);
         assert_eq!(s2.len(), 3);
@@ -190,7 +283,7 @@ mod tests {
         let mut m = MemTable::default();
         let mut snaps = Vec::new();
         for i in 0..200 {
-            m.push(0, row(i));
+            m.push(i, 0, row(i));
             snaps.push(m.snapshot(0));
         }
         assert!(m.frozen.len() <= MAX_FROZEN);

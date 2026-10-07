@@ -1,0 +1,36 @@
+#
+# A TAG-filtered read must see a statement all-or-nothing even when that
+# statement registers a brand-new series: the series ids of the filter and
+# the scan snapshot are taken consistently (series version re-check).
+# Each round inserts rows of an existing series X and of a new series Yk in
+# one statement while a reader polls a filter matching both.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE t (ts DATETIME(6) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO t VALUES ('2025-12-31', 'X', 0);
+connect (wr,localhost,root,,test);
+connection default;
+
+--let $round= 1
+while ($round <= 3)
+{
+  connection wr;
+  --send_eval INSERT INTO t SELECT '2026-01-01' + INTERVAL seq SECOND, IF(seq MOD 2, 'X', 'Y$round'), $round FROM seq_1_to_300000
+  connection default;
+  --let $poll_table= t WHERE host IN ('X', 'Y1', 'Y2', 'Y3')
+  --let $poll_info= INSERT INTO t SELECT%
+  --let $base= `SELECT 1 + 300000 * ($round - 1)`
+  --let $poll_n1= $base
+  --let $poll_n2= `SELECT $base + 300000`
+  --source suite/moosedb/include/poll_statement.inc
+  connection wr;
+  reap;
+  connection default;
+  --inc $round
+}
+SELECT host, COUNT(*) FROM t WHERE host IN ('X', 'Y1', 'Y2', 'Y3') GROUP BY host ORDER BY host;
+disconnect wr;
+DROP TABLE t;

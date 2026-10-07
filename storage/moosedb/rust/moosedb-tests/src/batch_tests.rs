@@ -388,3 +388,60 @@ fn readers_never_see_a_partial_batch_wal_path_with_flushes() {
 fn readers_never_see_a_partial_batch_spill_path() {
     never_partial(small(), 600, false);
 }
+
+#[test]
+fn batch_rejects_a_value_above_the_limit_without_losing_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), RawOptions::default());
+    let mut b = t.begin_batch().unwrap();
+    b.write(row(1, "a", 1.0)).unwrap();
+    let mut big = row(2, "a", 1.0);
+    big[5] = Value::Bytes(vec![b'x'; 65 << 20]);
+    let err = b.write(big).unwrap_err();
+    assert!(matches!(&err, Error::InvalidArg(m) if m.contains("exceeds the 64 MiB limit")), "{err}");
+    b.write(row(3, "a", 1.0)).unwrap();
+    b.commit(true).unwrap();
+    assert_eq!(count(&t, "a"), 2);
+    t.write(row(4, "a", 1.0)).unwrap();
+}
+
+#[test]
+fn spilled_batch_commit_releases_the_wal_it_logged_before_spilling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t");
+    let t = open_new(&path, small());
+    let mut b = t.begin_batch().unwrap();
+    write_all(&mut b, &host_rows("a", 400)); // spills: the first rows were logged
+    b.commit(true).unwrap();
+    assert_eq!(files_with_suffix(&path, ".tfl.wal").len(), 1, "the pre-spill ROW entries are collected");
+    assert_eq!(count(&t, "a"), 400);
+    drop(t);
+    let t = reopen(&path, small());
+    assert_eq!(count(&t, "a"), 400);
+    assert_eq!(files_with_suffix(&path, ".tfl.wal").len(), 1);
+    drop(t);
+    for _ in 0..3 {
+        drop(reopen(&path, small()));
+    }
+    assert_eq!(files_with_suffix(&path, ".tfl.wal").len(), 1);
+}
+
+#[test]
+fn spilled_batch_does_not_release_segments_another_open_batch_needs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t");
+    let t = open_new(&path, small());
+    let mut other = t.begin_batch().unwrap();
+    other.write(row(1, "z", 1.0)).unwrap();
+    let mut b = t.begin_batch().unwrap();
+    write_all(&mut b, &host_rows("a", 400));
+    b.commit(true).unwrap();
+    t.sync_wal(true).unwrap();
+    // `other` logged its row in the first segment, which must stay.
+    assert!(files_with_suffix(&path, ".tfl.wal").len() >= 2);
+    other.commit(true).unwrap();
+    drop(t);
+    let t = reopen(&path, small());
+    assert_eq!(count(&t, "a"), 400);
+    assert_eq!(count(&t, "z"), 1);
+}

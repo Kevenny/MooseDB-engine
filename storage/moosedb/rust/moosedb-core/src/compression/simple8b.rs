@@ -77,6 +77,11 @@ pub(crate) fn decode(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<u64>> {
     if count == 0 && r.remaining() == 0 {
         return Ok(Vec::new());
     }
+    // A few bytes can claim an enormous count (240 zeros per word): never
+    // expand more than the decode limit allows, whatever the stream says.
+    if count > super::MAX_DECODE_BYTES / 8 {
+        return Err(corrupt(format!("integer stream claims {count} values")));
+    }
     match r.u8()? {
         MODE_RAW => {
             if count.checked_mul(8) != Some(r.remaining()) {

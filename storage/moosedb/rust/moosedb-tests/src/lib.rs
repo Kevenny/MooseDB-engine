@@ -34,7 +34,17 @@ mod helpers {
     }
 
     pub fn config(dir: &Path, opts: RawOptions<'_>) -> TableConfig {
-        TableConfig::new(dir, schema(), &opts).unwrap()
+        // CREATE refuses MEMTABLE_SIZE below the product minimum (1 MiB). Tests
+        // that need tiny MemTables to force flushes and spills set it on the
+        // validated config instead.
+        let wanted = opts.memtable_size_bytes;
+        let tiny = wanted != 0 && wanted < moosedb_core::options::MIN_MEMTABLE_SIZE;
+        let raw = RawOptions { memtable_size_bytes: if tiny { 0 } else { wanted }, ..opts };
+        let mut cfg = TableConfig::new(dir, schema(), &raw).unwrap();
+        if tiny {
+            cfg.opts.memtable_size_bytes = wanted;
+        }
+        cfg
     }
 
     pub fn row(sec: i64, host: &str, value: f64) -> Row {
@@ -796,6 +806,10 @@ mod encryption_tests {
     use moosedb_core::{Error, RawOptions, Table};
 
     static LATEST: AtomicU32 = AtomicU32::new(1);
+    /// Key 66 rotates on its own (used by one test only): versions below
+    /// `RETIRED_66` are gone from the key server.
+    static LATEST_66: AtomicU32 = AtomicU32::new(1);
+    static RETIRED_66: AtomicU32 = AtomicU32::new(0);
     /// While set, key id 55 resolves to different key bytes ("wrong key").
     static WRONG_KEY_55: AtomicBool = AtomicBool::new(false);
 
@@ -805,6 +819,13 @@ mod encryption_tests {
             set_key_provider(Some(Arc::new(|id: u32, version: Option<u32>| {
                 if id == 404 {
                     return Err(Error::NotFound("no such key".into()));
+                }
+                if id == 66 {
+                    let v = version.unwrap_or_else(|| LATEST_66.load(Ordering::SeqCst));
+                    if v < RETIRED_66.load(Ordering::SeqCst) {
+                        return Err(Error::Crypto(format!("key 66 version {v} is retired")));
+                    }
+                    return Ok((v, [66u8 ^ v as u8; KEY_LEN]));
                 }
                 let v = version.unwrap_or_else(|| LATEST.load(Ordering::SeqCst));
                 if id == 55 && WRONG_KEY_55.load(Ordering::SeqCst) {
@@ -920,6 +941,81 @@ mod encryption_tests {
         assert_eq!(all_rows(&Table::open(config(&encrypted, enc(7))).unwrap()).len(), 1);
     }
 
+    /// Key version recorded in the header of every WAL segment of `dir`.
+    fn wal_key_versions(dir: &std::path::Path) -> Vec<u32> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".tfl.wal"))
+            .map(|p| {
+                let d = std::fs::read(p).unwrap();
+                // "TFWL" version:u16 flags:u16, then key_id:u32 key_version:u32.
+                u32::from_le_bytes(d[12..16].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_old_key_version_can_be_retired_after_flush_and_optimize() {
+        install();
+        LATEST_66.store(1, Ordering::SeqCst);
+        RETIRED_66.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+
+        // An idle table: reopen a few times under version 1, rotate, retire
+        // version 1. No WAL file may need it (the leftover segments are empty).
+        drop(create_open(&path, enc(66)));
+        for _ in 0..3 {
+            drop(Table::open(config(&path, enc(66))).unwrap());
+        }
+        assert_eq!(wal_key_versions(&path).len(), 1);
+        LATEST_66.store(2, Ordering::SeqCst);
+        RETIRED_66.store(2, Ordering::SeqCst);
+        let t = Table::open(config(&path, enc(66))).expect("an idle table must not depend on the retired version");
+        assert!(wal_key_versions(&path).iter().all(|&v| v == 2));
+        drop(t);
+        LATEST_66.store(1, Ordering::SeqCst);
+        RETIRED_66.store(0, Ordering::SeqCst);
+
+        // A table with data: one chunk and unflushed rows under version 1.
+        let t = Table::open(config(&path, enc(66))).unwrap();
+        for i in 0..50 {
+            t.write(row(i, "a", i as f64)).unwrap();
+        }
+        t.flush().unwrap();
+        for i in 0..10 {
+            t.write(row(3 * 86_400 + i, "b", i as f64)).unwrap();
+        }
+        t.sync_wal(true).unwrap();
+        drop(t);
+
+        // Rotate. Reopening replays the version 1 segment; a flush then moves
+        // the data into a version 2 chunk and releases every old WAL segment.
+        LATEST_66.store(2, Ordering::SeqCst);
+        let t = Table::open(config(&path, enc(66))).unwrap();
+        assert_eq!(all_rows(&t).len(), 60);
+        t.flush().unwrap();
+        assert!(wal_key_versions(&path).iter().all(|&v| v == 2), "{:?}", wal_key_versions(&path));
+        drop(t);
+
+        // The version 1 chunk still needs version 1: retiring it now fails closed.
+        RETIRED_66.store(2, Ordering::SeqCst);
+        assert!(matches!(Table::open(config(&path, enc(66))), Err(Error::Crypto(_))));
+        RETIRED_66.store(0, Ordering::SeqCst);
+
+        // OPTIMIZE rewrites it with the latest version, even though its
+        // bucket holds a single chunk.
+        let t = Table::open(config(&path, enc(66))).unwrap();
+        assert_eq!(t.compact(i64::MIN, i64::MAX, base_ts()).unwrap().groups, 1);
+        drop(t);
+        RETIRED_66.store(2, Ordering::SeqCst);
+        let t = Table::open(config(&path, enc(66))).expect("nothing depends on version 1 any more");
+        assert_eq!(all_rows(&t).len(), 60);
+        assert!(t.check().unwrap().is_empty());
+        RETIRED_66.store(0, Ordering::SeqCst);
+    }
+
     #[test]
     fn missing_key_is_rejected_at_create() {
         install();
@@ -930,7 +1026,78 @@ mod encryption_tests {
 }
 
 #[cfg(test)]
+mod limits_tests {
+    use super::helpers::*;
+    use moosedb_core::{Error, RawOptions, Row, Table, Value};
+
+    const MIB: usize = 1 << 20;
+
+    fn blob_row(sec: i64, bytes: usize) -> Row {
+        let mut r = row(sec, "h", 1.0);
+        r[5] = Value::Bytes(vec![b'x'; bytes]);
+        r
+    }
+
+    fn blob_len(r: &Row) -> usize {
+        match &r[5] {
+            Value::Bytes(b) => b.len(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn a_value_above_the_limit_is_rejected_and_the_table_stays_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let t = create_open(&path, RawOptions::default());
+        t.write(row(1, "a", 1.0)).unwrap();
+        let err = t.write(blob_row(2, 65 * MIB)).unwrap_err();
+        assert!(matches!(&err, Error::InvalidArg(m) if m.contains("exceeds the 64 MiB limit")), "{err}");
+        // Not poisoned: ordinary and big-but-allowed rows keep working, and
+        // survive a flush and a reopen.
+        t.write(blob_row(3, 4 * MIB)).unwrap();
+        t.write(blob_row(4, 32 * MIB)).unwrap();
+        t.sync_wal(true).unwrap();
+        t.flush().unwrap();
+        t.write(row(5, "a", 1.0)).unwrap();
+        t.sync_wal(true).unwrap();
+        drop(t);
+        let t = Table::open(config(&path, RawOptions::default())).unwrap();
+        let mut lens: Vec<usize> = all_rows(&t).iter().map(blob_len).collect();
+        lens.sort_unstable();
+        assert_eq!(lens.len(), 4);
+        assert_eq!(lens[2..], [4 * MIB, 32 * MIB]);
+        assert!(lens[..2].iter().all(|&n| n <= 2), "the two ordinary rows");
+        assert!(t.check().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_row_above_the_row_limit_is_rejected_even_if_each_value_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = create_open(&dir.path().join("t"), RawOptions::default());
+        let mut r = blob_row(1, 60 * MIB);
+        r[1] = Value::Bytes(vec![b'y'; 60 * MIB]); // the host tag
+        r[2] = Value::Bytes(vec![b'z'; 10 * MIB]); // the metric tag: 130 MiB in all
+        let err = t.write(r).unwrap_err();
+        assert!(matches!(&err, Error::InvalidArg(m) if m.contains("128 MiB")), "{err}");
+        t.write(row(2, "a", 1.0)).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod registry_tests {
+    /// Another test's `maintenance::run_once` may hold an `Arc` of every open
+    /// table for a moment; wait for it to let go instead of racing it.
+    fn wait_until_closed(path: &std::path::Path) {
+        for _ in 0..200 {
+            if moosedb_core::maintenance::lookup(path).is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("table still open");
+    }
+
     use std::sync::Arc;
 
     use super::helpers::*;
@@ -948,7 +1115,7 @@ mod registry_tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert!(maintenance::lookup(&dir.path().join("t")).is_some());
         drop((a, b));
-        assert!(maintenance::lookup(&dir.path().join("t")).is_none());
+        wait_until_closed(&dir.path().join("t"));
     }
 
     #[test]
@@ -974,6 +1141,7 @@ mod registry_tests {
         assert_eq!(open.chunks[0].status, ChunkStatus::Cold);
         assert_eq!(open.options.as_ref().unwrap().retention_text, "400 DAYS");
         drop(t);
+        wait_until_closed(&path);
 
         let closed = inspect(&path, now).unwrap();
         assert!(!closed.is_open);

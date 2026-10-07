@@ -4,6 +4,7 @@ ENGINE	SUPPORT	TRANSACTIONS	XA	SAVEPOINTS
 MooseDB	YES	NO	NO	NO
 SHOW VARIABLES LIKE 'moosedb%';
 Variable_name	Value
+moosedb_batch_memory_budget	1073741824
 moosedb_bloom_filter_false_positive_rate	0.010000
 moosedb_chunk_cache_size	134217728
 moosedb_compaction_threads	2
@@ -54,7 +55,7 @@ ERROR HY000: MooseDB: invalid argument: COMPRESSION 'GZIP' not supported; use ZS
 CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB COMPRESSION_LEVEL=25;
 ERROR HY000: Incorrect value '25' for option 'COMPRESSION_LEVEL'
 CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB MEMTABLE_SIZE=100;
-ERROR HY000: MooseDB: invalid argument: MEMTABLE_SIZE must be at least 4096 bytes
+ERROR HY000: MooseDB: invalid argument: MEMTABLE_SIZE must be at least 1048576 bytes (1 MiB)
 # Table definition rules
 CREATE TABLE t1 (ts DATETIME NOT NULL, v INT) ENGINE=MooseDB;
 ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'

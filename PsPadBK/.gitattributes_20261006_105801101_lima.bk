@@ -1,6 +1,0 @@
-# Everything is built and tested in Linux containers: keep LF line endings
-# regardless of core.autocrlf (CRLF breaks shell scripts and MTR results).
-* text=auto eol=lf
-
-*.so  binary
-*.tfl binary

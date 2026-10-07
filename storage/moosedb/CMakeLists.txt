@@ -36,10 +36,24 @@ ADD_CUSTOM_COMMAND(
   VERBATIM)
 ADD_CUSTOM_TARGET(moosedb_rust DEPENDS ${MOOSEDB_RUST_LIB})
 
-# moosedb_ffi.h is committed so the C++ side builds without cbindgen.
-# When cbindgen is available, fail the build if the header is stale.
-FIND_PROGRAM(CBINDGEN_EXECUTABLE cbindgen)
-IF(CBINDGEN_EXECUTABLE)
+# moosedb_ffi.h is committed so the C++ side builds without cbindgen at
+# *compile* time, but the build must prove it matches the Rust FFI: a stale
+# header is an ABI mismatch that only shows up at runtime. cbindgen --verify
+# is therefore mandatory. MOOSEDB_SKIP_HEADER_CHECK=ON opts out explicitly.
+OPTION(MOOSEDB_SKIP_HEADER_CHECK
+  "Skip the cbindgen --verify check of moosedb_ffi.h (unsafe)" OFF)
+IF(MOOSEDB_SKIP_HEADER_CHECK)
+  MESSAGE(WARNING "MooseDB: MOOSEDB_SKIP_HEADER_CHECK=ON, moosedb_ffi.h is NOT "
+                  "verified against the Rust FFI; a stale header means an ABI "
+                  "mismatch at runtime")
+ELSE()
+  FIND_PROGRAM(CBINDGEN_EXECUTABLE cbindgen)
+  IF(NOT CBINDGEN_EXECUTABLE)
+    MESSAGE(FATAL_ERROR "MooseDB: cbindgen not found. It is required to verify "
+      "that moosedb_ffi.h matches the Rust FFI (cargo install cbindgen). "
+      "To build without the check at your own risk, pass "
+      "-DMOOSEDB_SKIP_HEADER_CHECK=ON.")
+  ENDIF()
   ADD_CUSTOM_TARGET(moosedb_ffi_header_check
     COMMAND ${CBINDGEN_EXECUTABLE} --verify
             --config ${MOOSEDB_RUST_DIR}/cbindgen.toml

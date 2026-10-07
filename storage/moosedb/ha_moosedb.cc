@@ -13,10 +13,12 @@
 #include "ha_moosedb.h"
 
 #include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <system_error>
 
 #include "my_global.h"
@@ -145,6 +147,65 @@ std::string table_label(const TABLE_SHARE *s)
          (s->table_name.str ? s->table_name.str : "?");
 }
 
+/* Characters that can be part of a path component: a match must not start
+   or end inside one (so "test/t" never matches inside "latest/t2"). */
+bool is_path_char(char c)
+{
+  return isalnum((unsigned char) c) || c == '_' || c == '-' || c == '.' ||
+         c == '/' || c == '#' || c == '@';
+}
+
+/* Like replace_all, but only for matches delimited by non-path characters
+   (or a '/' right after, for a directory prefix). */
+void replace_bounded(std::string *s, const std::string &from,
+                     const std::string &to)
+{
+  if (from.empty())
+    return;
+  for (size_t pos= 0; (pos= s->find(from, pos)) != std::string::npos;)
+  {
+    const bool left= pos == 0 || !is_path_char((*s)[pos - 1]);
+    const size_t end= pos + from.size();
+    const bool right= end >= s->size() || (*s)[end] == '/' ||
+                      !is_path_char((*s)[end]);
+    if (left && right)
+    {
+      s->replace(pos, from.size(), to);
+      pos+= to.size();
+    }
+    else
+      pos++;
+  }
+}
+
+/* Spellings of the data directory, computed once. Empty when the datadir is
+   relative or too short to be told apart from ordinary text ("./", "/"). */
+const std::vector<std::string> &datadir_variants()
+{
+  static const std::vector<std::string> v= [] {
+    std::vector<std::string> out;
+    std::string home(mysql_real_data_home);
+    if (home.size() > 1 && home[0] == '/')
+    {
+      out.push_back(home);
+      std::error_code ec;
+      std::filesystem::path abs= std::filesystem::absolute(home, ec);
+      if (!ec)
+        out.push_back(abs.lexically_normal().string());
+      ec.clear();
+      std::filesystem::path canon= std::filesystem::canonical(home, ec);
+      if (!ec)
+        out.push_back((canon / "").string());
+      std::sort(out.begin(), out.end(),
+                [](const std::string &x, const std::string &y)
+                { return x.size() > y.size(); });
+      out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
+    return out;
+  }();
+  return v;
+}
+
 /*
   Removes host paths (the table directory as given by the server, its
   absolute form, and the data directory) from an engine message so that
@@ -155,24 +216,45 @@ std::string scrub_paths(std::string msg, const std::string &name,
 {
   if (!name.empty())
   {
-    replace_all(&msg, name, label);
+    replace_bounded(&msg, name, label);
     std::error_code ec;
     std::filesystem::path abs= std::filesystem::absolute(name, ec);
     if (!ec)
-      replace_all(&msg, abs.lexically_normal().string(), label);
+      replace_bounded(&msg, abs.lexically_normal().string(), label);
+    /* "./db/t" -> "db/t", only as a whole path (bounded) */
     if (name.compare(0, 2, "./") == 0)
-      replace_all(&msg, name.substr(2), label);
+      replace_bounded(&msg, name.substr(2), label);
   }
-  if (mysql_real_data_home[0])
-  {
-    std::string home(mysql_real_data_home);
+  for (const std::string &home : datadir_variants())
     replace_all(&msg, home, "");
-    std::error_code ec;
-    std::filesystem::path abs= std::filesystem::absolute(home, ec);
-    if (!ec)
-      replace_all(&msg, abs.lexically_normal().string(), "");
-  }
   return msg;
+}
+
+/* "db.table" label out of a server table path ("./db/table"), for messages
+   raised where no TABLE_SHARE is at hand (DROP, RENAME). */
+std::string label_from_path(const std::string &name)
+{
+  std::string n= name;
+  while (!n.empty() && n.back() == '/')
+    n.pop_back();
+  const size_t last= n.rfind('/');
+  if (last == std::string::npos)
+    return n.empty() ? "?" : n;
+  const size_t prev= last ? n.rfind('/', last - 1) : std::string::npos;
+  const std::string tbl= n.substr(last + 1);
+  const std::string db= prev == std::string::npos
+                          ? "" : n.substr(prev + 1, last - prev - 1);
+  return db.empty() || db == "." ? tbl : db + "." + tbl;
+}
+
+/*
+  The one place engine messages become client-visible: takes the pending
+  Rust error of this thread and strips every host path from it (the table
+  directory in all its spellings and the data directory).
+*/
+std::string client_error(const std::string &path, const std::string &label)
+{
+  return scrub_paths(take_last_error(), path, label);
 }
 
 /* Engine-private error codes, reported through get_error_message(). */
@@ -194,16 +276,18 @@ static uint srv_retention_check_interval= 3600;
 static double srv_bloom_fpr= 0.01;
 static ulonglong srv_chunk_cache_size= 128ULL << 20;
 static uint srv_max_open_chunks= 100;
+static ulonglong srv_batch_memory_budget= 1ULL << 30;
 
 /* Mirrors the current values into the Rust core. */
 static void push_globals()
 {
-  TFGlobalSettings s;
+  TFGlobalSettings s= {};
   s.retention_check_interval_secs= srv_retention_check_interval;
   s.compaction_trigger_chunks= srv_compaction_trigger_chunks;
   s.bloom_filter_false_positive_rate= srv_bloom_fpr;
   s.chunk_cache_bytes= srv_chunk_cache_size;
   s.max_open_chunks= srv_max_open_chunks;
+  s.batch_memory_budget_bytes= srv_batch_memory_budget;
   if (moosedb_set_globals(&s) != TF_OK)
     sql_print_warning("MooseDB: cannot apply settings: %s",
                       take_last_error().c_str());
@@ -227,7 +311,7 @@ static MYSQL_SYSVAR_ULONGLONG(memtable_flush_threshold,
   "MemTable size in bytes that triggers a flush to a chunk, for tables "
   "without an explicit MEMTABLE_SIZE. Applies to tables opened afterwards. "
   "At most 96 MiB, so a flushed column block stays below the 256 MiB limit",
-  NULL, NULL, 64ULL << 20, 4096, 96ULL << 20, 0);
+  NULL, NULL, 64ULL << 20, 1ULL << 20, 96ULL << 20, 0);
 
 static MYSQL_SYSVAR_UINT(compaction_trigger_chunks,
   srv_compaction_trigger_chunks, PLUGIN_VAR_RQCMDARG,
@@ -253,13 +337,20 @@ static MYSQL_SYSVAR_DOUBLE(bloom_filter_false_positive_rate, srv_bloom_fpr,
 
 static MYSQL_SYSVAR_ULONGLONG(chunk_cache_size, srv_chunk_cache_size,
   PLUGIN_VAR_RQCMDARG,
-  "Bytes of decoded chunk blocks cached in memory (0 disables the cache)",
+  "Bytes of decoded chunk blocks and decoded series cached in memory (0 "
+  "disables the caches). Shrinking it at runtime evicts immediately",
   NULL, update_global<ulonglong>, 128ULL << 20, 0, ULONGLONG_MAX, 0);
 
 static MYSQL_SYSVAR_UINT(max_open_chunks, srv_max_open_chunks,
   PLUGIN_VAR_RQCMDARG,
   "Maximum chunk files kept open between reads",
   NULL, update_global<uint>, 100, 1, 1000000, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(batch_memory_budget, srv_batch_memory_budget,
+  PLUGIN_VAR_RQCMDARG,
+  "Bytes the row buffers of all open statement batches may hold together; "
+  "above it, batches holding at least 1 MiB spill to disk early",
+  NULL, update_global<ulonglong>, 1ULL << 30, 16ULL << 20, 1ULL << 40, 0);
 
 static struct st_mysql_sys_var *moosedb_system_variables[]= {
   MYSQL_SYSVAR(wal_sync_mode),
@@ -270,6 +361,7 @@ static struct st_mysql_sys_var *moosedb_system_variables[]= {
   MYSQL_SYSVAR(bloom_filter_false_positive_rate),
   MYSQL_SYSVAR(chunk_cache_size),
   MYSQL_SYSVAR(max_open_chunks),
+  MYSQL_SYSVAR(batch_memory_budget),
   NULL
 };
 
@@ -564,24 +656,40 @@ void tf_batch_closer::operator()(MooseDBBatch *b) const noexcept
 
 ha_moosedb::~ha_moosedb()= default;
 
-int ha_moosedb::map_status(TFStatus status)
+int ha_moosedb::map_status(TFStatus status, const char *name)
 {
   if (status == TF_OK)
     return 0;
-  last_error_= take_last_error();
+  /* Every message that can reach a client goes through here: no host path. */
+  if (share_ && !share_->path.empty())
+    last_error_= client_error(share_->path, share_->display);
+  else if (name && name[0])
+    last_error_= client_error(name, label_from_path(name));
+  else
+    last_error_= client_error("", "");
   switch (status) {
   case TF_ERR_FULL:      return HA_ERR_RECORD_FILE_FULL;
   case TF_ERR_READONLY:  return HA_ERR_TABLE_READONLY;
   case TF_ERR_CORRUPT:   return HA_ERR_CRASHED_ON_USAGE;
   case TF_ERR_OOM:       return HA_ERR_OUT_OF_MEM;
   case TF_ERR_NOT_FOUND: return HA_ERR_NO_SUCH_TABLE;
+  case TF_ERR_CRYPTO:    return HA_ERR_DECRYPTION_FAILED;
   default:               return HA_ERR_MOOSEDB_BASE + (int) status;
   }
 }
 
 bool ha_moosedb::get_error_message(int error, String *buf)
 {
-  if (error >= HA_ERR_MOOSEDB_BASE && !last_error_.empty())
+  if (!buf)
+    return false;
+  if (error == HA_ERR_DECRYPTION_FAILED)
+  {
+    /* last_error_ was scrubbed by map_status(): no host path in it. */
+    const std::string msg= last_error_.empty()
+      ? std::string("wrong or unavailable encryption key") : last_error_;
+    buf->copy(msg.c_str(), msg.length(), system_charset_info);
+  }
+  else if (error >= HA_ERR_MOOSEDB_BASE && !last_error_.empty())
     buf->copy(last_error_.c_str(), last_error_.length(), system_charset_info);
   return false;
 }
@@ -612,7 +720,8 @@ MooseDB_share *ha_moosedb::get_share()
 int ha_moosedb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *)
 {
   DBUG_ENTER("ha_moosedb::create");
-  if (!table_arg || !name)
+  assert(table_arg && name);
+  if (!table_arg || !table_arg->s || !name)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
 
   tf_layout layout;
@@ -627,8 +736,7 @@ int ha_moosedb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *)
   TFStatus st= moosedb_table_create(name, &cfg.cfg);
   if (st != TF_OK)
   {
-    std::string msg= scrub_paths(take_last_error(), name,
-                                 table_label(table_arg->s));
+    std::string msg= client_error(name, table_label(table_arg->s));
     my_printf_error(ER_ILLEGAL_HA_CREATE_OPTION, "MooseDB: %s", MYF(0),
                     msg.c_str());
     DBUG_RETURN(HA_WRONG_CREATE_OPTION);
@@ -665,7 +773,6 @@ int ha_moosedb::open(const char *name, int, uint)
       share_->table.reset(t);
       if (error)
       {
-        last_error_= scrub_paths(last_error_, name, share_->display);
         sql_print_error("MooseDB: cannot open %s: %s",
                         share_->display.c_str(), last_error_.c_str());
       }
@@ -705,7 +812,7 @@ int ha_moosedb::delete_table(const char *name)
     take_last_error();
     DBUG_RETURN(ENOENT);
   }
-  DBUG_RETURN(map_status(st));
+  DBUG_RETURN(map_status(st, name));
 }
 
 int ha_moosedb::rename_table(const char *from, const char *to)
@@ -717,7 +824,7 @@ int ha_moosedb::rename_table(const char *from, const char *to)
     take_last_error();
     DBUG_RETURN(ENOENT);
   }
-  DBUG_RETURN(map_status(st));
+  DBUG_RETURN(map_status(st, from));
 }
 
 /* ── Row conversion ───────────────────────────────────────────────────── */
@@ -725,10 +832,13 @@ int ha_moosedb::rename_table(const char *from, const char *to)
 int ha_moosedb::write_row(const uchar *buf)
 {
   DBUG_ENTER("ha_moosedb::write_row");
-  if (!share_ || !share_->table)
+  assert(table);
+  if (!table || !buf || !share_ || !share_->table)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
 
   const tf_layout &l= share_->layout;
+  if (values_.size() < l.columns.size() || str_bufs_.size() < l.columns.size())
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   const my_ptrdiff_t diff= buf - table->record[0];
   MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
   int error= 0;
@@ -736,6 +846,12 @@ int ha_moosedb::write_row(const uchar *buf)
   for (size_t i= 0; i < l.columns.size() && !error; i++)
   {
     const tf_column &c= l.columns[i];
+    if (c.field_index >= table->s->fields || !table->field[c.field_index] ||
+        i >= values_.size() || i >= str_bufs_.size())
+    {
+      error= HA_ERR_INTERNAL_ERROR;
+      break;
+    }
     Field *f= table->field[c.field_index];
     TFValue &v= values_[i];
     v.kind= (uint8_t) c.type;
@@ -834,6 +950,9 @@ int ha_moosedb::write_row(const uchar *buf)
 
 int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
 {
+  assert(table);
+  if (!table || !share_)
+    return HA_ERR_INTERNAL_ERROR;
   const tf_layout &l= share_->layout;
   if (row.col_count != l.columns.size() || !row.values)
   {
@@ -848,6 +967,11 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
   {
     const tf_column &c= l.columns[i];
     const TFValue &v= row.values[i];
+    if (c.field_index >= table->s->fields || !table->field[c.field_index])
+    {
+      dbug_tmp_restore_column_map(&table->write_set, old_map);
+      return HA_ERR_INTERNAL_ERROR;
+    }
     Field *f= table->field[c.field_index];
     f->move_field_offset(diff);
     if (v.is_null)
@@ -908,8 +1032,6 @@ int ha_moosedb::commit_batch()
     moosedb_batch_commit(b, srv_wal_sync_mode == WAL_SYNC_FSYNC));
   if (error)
   {
-    last_error_= share_ ? scrub_paths(last_error_, share_->path,
-                                      share_->display) : last_error_;
     sql_print_error("MooseDB: statement commit failed: %s",
                     last_error_.c_str());
   }
@@ -1022,8 +1144,7 @@ int ha_moosedb::check(THD *thd, HA_CHECK_OPT *)
     DBUG_RETURN(error);
   if (bad)
   {
-    std::string msg= scrub_paths(take_last_error(), share_->path,
-                                 share_->display);
+    std::string msg= client_error(share_->path, share_->display);
     push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN, ER_NOT_KEYFILE,
                         "MooseDB: %u corrupt chunk(s): %s", bad, msg.c_str());
     sql_print_error("MooseDB: CHECK TABLE %s found %u corrupt chunk(s): %s",
@@ -1040,8 +1161,28 @@ int ha_moosedb::optimize(THD *thd, HA_CHECK_OPT *)
     DBUG_RETURN(HA_ADMIN_INTERNAL_ERROR);
   /* Seal the MemTable, expire old chunks, merge and re-encode the rest. */
   int error= moosedb_force_flush();
+  /*
+    Retention deletes data: moosedb_apply_retention requires DELETE, while
+    OPTIMIZE only needs SELECT+INSERT, so apply it only when the user could
+    have run the procedure. Otherwise just flush and compact.
+  */
+  bool retention_skipped= false;
   if (!error)
-    error= map_status(moosedb_apply_retention(share_->table.get()));
+  {
+    bool may_delete= true;
+    if (thd && table && table->s && table->s->tmp_table == NO_TMP_TABLE)
+    {
+      LEX_CSTRING db_l= table->s->db;
+      LEX_CSTRING tbl_l= table->s->table_name;
+      TABLE_LIST tl;
+      tl.init_one_table(&db_l, &tbl_l, nullptr, TL_READ);
+      may_delete= !check_table_access(thd, DELETE_ACL, &tl, false, 1, true);
+    }
+    if (may_delete)
+      error= map_status(moosedb_apply_retention(share_->table.get()));
+    else
+      retention_skipped= true;
+  }
   if (!error)
     error= moosedb_compact_chunks(LONGLONG_MIN, LONGLONG_MAX);
   if (error)
@@ -1050,6 +1191,10 @@ int ha_moosedb::optimize(THD *thd, HA_CHECK_OPT *)
                         "MooseDB: %s", last_error_.c_str());
     DBUG_RETURN(HA_ADMIN_FAILED);
   }
+  if (retention_skipped)
+    push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE, ER_UNKNOWN_ERROR,
+                        "MooseDB: retention skipped: DELETE privilege "
+                        "required");
   DBUG_RETURN(HA_ADMIN_OK);
 }
 
@@ -1237,16 +1382,14 @@ bool ha_moosedb::pushed_series(const std::vector<uint64_t> **ids)
   if (!pushed_filter_)
     return false;
 
-  MooseDBSeriesList *list= nullptr;
   if (!share_ || !share_->table)
   {
     pushed_filter_= false;
     return false;
   }
-  if (moosedb_series_list(share_->table.get(), &list) != TF_OK)
+  assert(table);
+  if (!table)
   {
-    sql_print_warning("MooseDB: TAG pushdown disabled: %s",
-                      take_last_error().c_str());
     pushed_filter_= false;
     return false;
   }
@@ -1254,8 +1397,83 @@ bool ha_moosedb::pushed_series(const std::vector<uint64_t> **ids)
   std::vector<CHARSET_INFO *> tag_cs;
   for (const tf_column &c : share_->layout.columns)
     if (c.conv == tf_conv::TAG)
+    {
+      if (c.field_index >= table->s->fields || !table->field[c.field_index])
+      {
+        pushed_filter_= false;
+        return false;
+      }
       tag_cs.push_back(table->field[c.field_index]->charset());
+    }
+  for (const tf_tag_predicate *p : preds)
+    if (p->tag_pos < 0 || (size_t) p->tag_pos >= tag_cs.size() || !p->cs)
+    {
+      pushed_filter_= false;
+      return false;
+    }
 
+  if (pushed_series_cached(preds, tag_cs))
+    return true;
+
+  /* Fallback: compare every series (also used past the cache limits). */
+  MooseDBSeriesList *list= nullptr;
+  if (moosedb_series_list(share_->table.get(), &list) != TF_OK)
+  {
+    sql_print_warning("MooseDB: TAG pushdown disabled: %s",
+                      take_last_error().c_str());
+    pushed_filter_= false;
+    return false;
+  }
+  const bool ok= pushed_series_scan(list, preds, tag_cs);
+  moosedb_series_list_close(list);
+  return ok;
+}
+
+namespace {
+
+/* Series value as seen under the predicate's collation (same conversion the
+   comparison path always applied). */
+struct tag_view
+{
+  const char *ptr;
+  size_t len;
+};
+
+tag_view tag_in_collation(const TFValue &v, CHARSET_INFO *from,
+                          CHARSET_INFO *to, String *conv)
+{
+  const TFStr s= v.data.str_val;
+  tag_view r{s.ptr ? s.ptr : "", s.len};
+  uint errors;
+  if (!my_charset_same(from, to) && !conv->copy(r.ptr, r.len, from, to, &errors))
+  {
+    r.ptr= conv->ptr();
+    r.len= conv->length();
+  }
+  return r;
+}
+
+uint64_t tag_hash(CHARSET_INFO *cs, const char *ptr, size_t len)
+{
+  ulong nr1= 1, nr2= 4;
+  cs->hash_sort((const uchar *) ptr, len, &nr1, &nr2);
+  return ((uint64_t) nr1 * 0x9E3779B97F4A7C15ULL) ^ (uint64_t) nr2;
+}
+
+constexpr size_t TAG_CACHE_MAX_INDEXES= 32;
+/* Per-table heap cap of the TAG index; above it the direct comparison is
+   used. A group costs its value plus ~96 bytes (string, id vector, hash
+   bucket entry); each further series of the group costs one id. */
+constexpr size_t TAG_CACHE_MAX_BYTES= 256ULL << 20;
+constexpr size_t TAG_CACHE_GROUP_OVERHEAD= 96;
+
+} // namespace
+
+/* Reference implementation: one strnncollsp per series and value. */
+bool ha_moosedb::pushed_series_scan(
+    MooseDBSeriesList *list, const std::vector<const tf_tag_predicate *> &preds,
+    const std::vector<CHARSET_INFO *> &tag_cs)
+{
   const uint64_t n= moosedb_series_list_len(list);
   String conv;
   for (uint64_t i= 0; i < n; i++)
@@ -1267,26 +1485,18 @@ bool ha_moosedb::pushed_series(const std::vector<uint64_t> **ids)
     bool match= true;
     for (const tf_tag_predicate *p : preds)
     {
-      if ((uint) p->tag_pos >= tags.col_count || tags.values[p->tag_pos].is_null)
+      if ((uint) p->tag_pos >= tags.col_count || !tags.values ||
+          tags.values[p->tag_pos].is_null)
       {
         match= false;
         break;
       }
-      const TFStr s= tags.values[p->tag_pos].data.str_val;
-      const char *ptr= s.ptr ? s.ptr : "";
-      size_t len= s.len;
-      CHARSET_INFO *from= tag_cs[p->tag_pos];
-      uint errors;
-      if (!my_charset_same(from, p->cs) &&
-          !conv.copy(ptr, len, from, p->cs, &errors))
-      {
-        ptr= conv.ptr();
-        len= conv.length();
-      }
+      const tag_view v= tag_in_collation(tags.values[p->tag_pos],
+                                         tag_cs[p->tag_pos], p->cs, &conv);
       bool any= false;
-      for (const std::string &v : p->values)
-        if (!p->cs->strnncollsp((const uchar *) ptr, len,
-                                (const uchar *) v.data(), v.size()))
+      for (const std::string &val : p->values)
+        if (!p->cs->strnncollsp((const uchar *) v.ptr, v.len,
+                                (const uchar *) val.data(), val.size()))
         {
           any= true;
           break;
@@ -1300,7 +1510,183 @@ bool ha_moosedb::pushed_series(const std::vector<uint64_t> **ids)
     if (match)
       pushed_ids_.push_back(id);
   }
-  moosedb_series_list_close(list);
+  std::sort(pushed_ids_.begin(), pushed_ids_.end());
+  return true;
+}
+
+/*
+  Indexed implementation. Per (TAG column, collation) the series are grouped
+  by value; the series list is append-only (registration order) except for
+  TRUNCATE, so the cache only indexes the new tail. A predicate then costs
+  O(values), not O(series x values).
+
+  Equality is exactly strnncollsp's: candidates come from hash_sort buckets
+  (the hash the server itself uses for GROUP BY / hash joins, consistent with
+  the collation's equality, PAD SPACE / NO PAD and _ci included) and every
+  candidate is confirmed with strnncollsp.
+
+  The list's epoch identifies the log behind it: the same epoch guarantees the
+  current list extends the indexed one (same series at the same indexes); a
+  new epoch (TRUNCATE, table reopened) drops the cache. The version only says
+  "something changed" -- it is a process-wide counter, so its deltas must not
+  be compared with length deltas.
+*/
+bool ha_moosedb::pushed_series_cached(
+    const std::vector<const tf_tag_predicate *> &preds,
+    const std::vector<CHARSET_INFO *> &tag_cs)
+{
+  for (const tf_tag_predicate *p : preds)
+    if (!p->cs->coll || !p->cs->coll->hash_sort)
+      return false;
+
+  tf_tag_cache &cache= share_->tag_cache;
+  std::lock_guard<std::mutex> guard(cache.mutex);
+
+  uint64_t cur= 0;
+  if (moosedb_series_version(share_->table.get(), &cur) != TF_OK)
+    return false;
+  bool missing= false;
+  for (const tf_tag_predicate *p : preds)
+    if (!cache.indexes.count({p->tag_pos, p->cs}))
+      missing= true;
+  if (!cache.valid || cache.version != cur || missing)
+  {
+    MooseDBSeriesList *list= nullptr;
+    if (moosedb_series_list(share_->table.get(), &list) != TF_OK)
+      return false;
+    const uint64_t lv= moosedb_series_list_version(list);
+    const uint64_t epoch= moosedb_series_list_epoch(list);
+    const uint64_t n= moosedb_series_list_len(list);
+    const bool appended= cache.valid && epoch != 0 && epoch == cache.epoch &&
+                         n >= cache.len;
+    if (!appended)
+    {
+      cache.indexes.clear();
+      cache.bytes= 0;
+    }
+    for (const tf_tag_predicate *p : preds)
+    {
+      const std::pair<int, const CHARSET_INFO *> key{p->tag_pos, p->cs};
+      if (!cache.indexes.count(key) &&
+          cache.indexes.size() >= TAG_CACHE_MAX_INDEXES)
+      {
+        /* Indexes stay consistent with each other only if all advance. */
+        cache.valid= false;
+        moosedb_series_list_close(list);
+        return false;
+      }
+      cache.indexes[key];
+    }
+    /* Every index (old ones: the new tail; new ones: everything). */
+    String conv;
+    for (auto &kv : cache.indexes)
+    {
+      tf_tag_index &ix= kv.second;
+      CHARSET_INFO *cs= const_cast<CHARSET_INFO *>(kv.first.second);
+      const int pos= kv.first.first;
+      for (uint64_t i= ix.built_len; i < n; i++)
+      {
+        uint64_t id= 0;
+        TFRow tags{0, nullptr};
+        if (moosedb_series_list_get(list, i, &id, &tags) != TF_OK)
+        {
+          /* Skipping it would lose the series until the next epoch. */
+          take_last_error();
+          cache.indexes.clear();
+          cache.bytes= 0;
+          cache.valid= false;
+          moosedb_series_list_close(list);
+          return false;
+        }
+        if ((uint) pos >= tags.col_count || !tags.values ||
+            tags.values[pos].is_null)
+          continue;
+        const tag_view v= tag_in_collation(tags.values[pos], tag_cs[pos], cs,
+                                           &conv);
+        std::vector<uint32_t> &bucket= ix.buckets[tag_hash(cs, v.ptr, v.len)];
+        bool found= false;
+        for (uint32_t g : bucket)
+        {
+          if (g >= ix.groups.size())
+            continue;
+          tf_tag_group &grp= ix.groups[g];
+          if (!cs->strnncollsp((const uchar *) grp.value.data(),
+                               grp.value.size(), (const uchar *) v.ptr, v.len))
+          {
+            grp.ids.push_back(id);
+            cache.bytes+= sizeof(uint64_t);
+            found= true;
+            break;
+          }
+        }
+        if (!found)
+        {
+          bucket.push_back((uint32_t) ix.groups.size());
+          ix.groups.push_back({std::string(v.ptr, v.len), {id}});
+          cache.bytes+= TAG_CACHE_GROUP_OVERHEAD + v.len;
+        }
+        if (cache.bytes > TAG_CACHE_MAX_BYTES)
+        {
+          /* Too many distinct series to index: use the direct comparison. */
+          cache.indexes.clear();
+          cache.bytes= 0;
+          cache.valid= false;
+          moosedb_series_list_close(list);
+          return false;
+        }
+      }
+      ix.built_len= n;
+    }
+    cache.valid= true;
+    cache.version= lv;
+    cache.epoch= epoch;
+    cache.len= n;
+    moosedb_series_list_close(list);
+  }
+
+  bool first= true;
+  std::vector<uint64_t> result;
+  for (const tf_tag_predicate *p : preds)
+  {
+    const auto it= cache.indexes.find({p->tag_pos, (const CHARSET_INFO *) p->cs});
+    if (it == cache.indexes.end())
+      return false;
+    const tf_tag_index &ix= it->second;
+    std::vector<uint32_t> hit;
+    for (const std::string &val : p->values)
+    {
+      const auto b= ix.buckets.find(tag_hash(p->cs, val.data(), val.size()));
+      if (b == ix.buckets.end())
+        continue;
+      for (uint32_t g : b->second)
+        if (g < ix.groups.size() &&
+            !p->cs->strnncollsp((const uchar *) ix.groups[g].value.data(),
+                                ix.groups[g].value.size(),
+                                (const uchar *) val.data(), val.size()))
+          hit.push_back(g);
+    }
+    std::sort(hit.begin(), hit.end());
+    hit.erase(std::unique(hit.begin(), hit.end()), hit.end());
+    std::vector<uint64_t> ids;
+    for (uint32_t g : hit)
+      ids.insert(ids.end(), ix.groups[g].ids.begin(), ix.groups[g].ids.end());
+    std::sort(ids.begin(), ids.end());
+    if (first)
+    {
+      result.swap(ids);
+      first= false;
+    }
+    else
+    {
+      std::vector<uint64_t> both;
+      std::set_intersection(result.begin(), result.end(), ids.begin(),
+                            ids.end(), std::back_inserter(both));
+      result.swap(both);
+    }
+    if (result.empty())
+      break;
+  }
+  pushed_ids_= std::move(result);
   return true;
 }
 
@@ -1312,12 +1698,59 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted)
   scan_snapshot_saved_= false;
   if (!share_ || !share_->table)
     return HA_ERR_INTERNAL_ERROR;
-  const std::vector<uint64_t> *ids= nullptr;
-  const bool filtered= pushed_series(&ids);
+  /*
+    The ids of a TAG filter and the scan are two separate calls: a statement
+    that commits between them with a brand-new series would be seen only
+    partially. The series version read before resolving the ids must still
+    be current once the scan (which snapshots the data) is open; otherwise
+    resolve again and reopen. A false alarm only costs a retry.
+  */
+  /*
+    If the version cannot be read or keeps moving (16 tries), fall back to an
+    unfiltered scan: the server evaluates the whole WHERE anyway, so that is
+    always correct -- only slower -- and never partially visible.
+  */
+  int error= 0;
   MooseDBScan *s= nullptr;
-  int error= map_status(moosedb_scan_open_filtered(
-      share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
-      filtered ? (int64_t) ids->size() : -1, sorted, &s));
+  bool unfiltered= false;
+  for (int attempt= 0; attempt <= 16; attempt++)
+  {
+    uint64_t v0= 0;
+    if (attempt == 16 ||
+        (!pushed_.empty() &&
+         moosedb_series_version(share_->table.get(), &v0) != TF_OK))
+    {
+      take_last_error();
+      unfiltered= true;
+    }
+    if (pushed_valid_ && pushed_version_ != v0)
+      pushed_valid_= false;
+    const std::vector<uint64_t> *ids= nullptr;
+    const bool filtered= !unfiltered && pushed_series(&ids);
+    if (filtered)
+      pushed_version_= v0;
+    s= nullptr;
+    error= map_status(moosedb_scan_open_filtered(
+        share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
+        filtered ? (int64_t) ids->size() : -1, sorted, &s));
+    if (error || !filtered)
+      break;
+    uint64_t v1= 0;
+    const bool v1_ok=
+        moosedb_series_version(share_->table.get(), &v1) == TF_OK;
+    if (!v1_ok)
+    {
+      take_last_error();
+      unfiltered= true;
+    }
+    else if (v1 == v0)
+      break;
+    moosedb_scan_close(s);
+    s= nullptr;
+    pushed_valid_= false;
+    if (unfiltered)
+      attempt= 15;   /* next iteration opens the unfiltered scan */
+  }
   scan_.reset(s);
   return error;
 }
@@ -1443,10 +1876,15 @@ int ha_moosedb::index_end()
   DBUG_RETURN(0);
 }
 
-longlong ha_moosedb::key_to_ts(uint idx, const uchar *key)
+int ha_moosedb::key_to_ts(uint idx, const uchar *key, longlong *out)
 {
+  assert(table && key);
+  if (!table || !key || !out || !table->key_info || idx >= table->s->keys)
+    return HA_ERR_INTERNAL_ERROR;
   KEY *ki= &table->key_info[idx];
-  Field *f= ki->key_part[0].field;
+  Field *f= ki->key_part ? ki->key_part[0].field : nullptr;
+  if (!f)
+    return HA_ERR_INTERNAL_ERROR;
   /* Decode through the field itself, using record[1] as scratch space. */
   key_restore(table->record[1], key, ki, ki->key_part[0].store_length);
   const my_ptrdiff_t diff= table->record[1] - table->record[0];
@@ -1467,7 +1905,8 @@ longlong ha_moosedb::key_to_ts(uint idx, const uchar *key)
       ts= time_to_micros(lt);
   }
   f->move_field_offset(-diff);
-  return ts;
+  *out= ts;
+  return 0;
 }
 
 int ha_moosedb::open_range_scan(longlong lo, longlong hi, bool backward,
@@ -1491,7 +1930,11 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
                 find_flag == HA_READ_PREFIX_LAST_OR_PREV
                 ? index_last(buf) : index_first(buf));
 
-  const longlong ts= key_to_ts(active_index, key);
+  if (!table || active_index >= table->s->keys)
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  longlong ts;
+  if (int error= key_to_ts(active_index, key, &ts))
+    DBUG_RETURN(error);
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   bool backward= false;
   switch (find_flag) {
@@ -1523,7 +1966,12 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
     inclusively is always a superset, the server re-checks the bound.
   */
   if (!backward && end_range && end_range->key)
-    hi= std::min(hi, key_to_ts(active_index, end_range->key));
+  {
+    longlong end_ts;
+    if (int error= key_to_ts(active_index, end_range->key, &end_ts))
+      DBUG_RETURN(error);
+    hi= std::min(hi, end_ts);
+  }
   DBUG_RETURN(open_range_scan(lo, hi, backward, buf, HA_ERR_KEY_NOT_FOUND));
 }
 
@@ -1588,13 +2036,15 @@ ha_rows ha_moosedb::records_in_range(uint inx, const key_range *min_key,
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   if (min_key)
   {
-    lo= key_to_ts(inx, min_key->key);
+    if (key_to_ts(inx, min_key->key, &lo))
+      DBUG_RETURN(HA_POS_ERROR);
     if (min_key->flag == HA_READ_AFTER_KEY && lo < LONGLONG_MAX)
       lo++;
   }
   if (max_key)
   {
-    hi= key_to_ts(inx, max_key->key);
+    if (key_to_ts(inx, max_key->key, &hi))
+      DBUG_RETURN(HA_POS_ERROR);
     if (max_key->flag == HA_READ_BEFORE_KEY && hi > LONGLONG_MIN)
       hi--;
   }
@@ -1684,7 +2134,8 @@ template <typename F> int fill_moosedb_is(THD *thd, F f)
     {
       push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
                           ER_UNKNOWN_ERROR, "MooseDB: %s.%s: %s", db, tbl,
-                          take_last_error().c_str());
+                          client_error(path, std::string(db) + "." + tbl)
+                            .c_str());
       return false;
     }
     std::unique_ptr<MooseDBInfo, tf_info_closer> info(raw);
@@ -1870,7 +2321,8 @@ bool parse_bound(const char *s, size_t len, longlong dflt, longlong *out)
   tables). The UDFs are callable directly, so they cannot rely on the SELECT
   check the procedures get from the statement they build.
 */
-MooseDBTable *lookup_open_table(UDF_ARGS *args, privilege_t need)
+MooseDBTable *lookup_open_table(UDF_ARGS *args, privilege_t need,
+                               std::string *path_out, std::string *label_out)
 {
   THD *thd= current_thd;
   assert(thd);
@@ -1906,6 +2358,8 @@ MooseDBTable *lookup_open_table(UDF_ARGS *args, privilege_t need)
   }
   char path[FN_REFLEN + 1];
   build_table_filename(path, sizeof(path) - 1, db.c_str(), tbl.c_str(), "", 0);
+  *path_out= path;
+  *label_out= db + "." + tbl;
   MooseDBTable *t= nullptr;
   if (moosedb_table_lookup(path, &t) != TF_OK)
   {
@@ -1948,7 +2402,8 @@ long long moosedb_compact_impl(UDF_INIT *, UDF_ARGS *args, char *,
                                 char *error)
 {
   /* Privilege first (see lookup_open_table), then argument validation. */
-  tf_table_ptr t(lookup_open_table(args, ALTER_ACL));
+  std::string path, label;
+  tf_table_ptr t(lookup_open_table(args, ALTER_ACL, &path, &label));
   if (!t)
   {
     *error= 1;
@@ -1967,7 +2422,7 @@ long long moosedb_compact_impl(UDF_INIT *, UDF_ARGS *args, char *,
   if (moosedb_compact(t.get(), lo, hi) != TF_OK)
   {
     my_printf_error(ER_UNKNOWN_ERROR, "MooseDB: %s", MYF(0),
-                    take_last_error().c_str());
+                    client_error(path, label).c_str());
     *error= 1;
     return 0;
   }
@@ -1984,7 +2439,8 @@ my_bool moosedb_retention_impl_init(UDF_INIT *initid, UDF_ARGS *args,
 long long moosedb_retention_impl(UDF_INIT *, UDF_ARGS *args, char *,
                                   char *error)
 {
-  tf_table_ptr t(lookup_open_table(args, DELETE_ACL));
+  std::string path, label;
+  tf_table_ptr t(lookup_open_table(args, DELETE_ACL, &path, &label));
   if (!t)
   {
     *error= 1;
@@ -1993,7 +2449,7 @@ long long moosedb_retention_impl(UDF_INIT *, UDF_ARGS *args, char *,
   if (moosedb_apply_retention(t.get()) != TF_OK)
   {
     my_printf_error(ER_UNKNOWN_ERROR, "MooseDB: %s", MYF(0),
-                    take_last_error().c_str());
+                    client_error(path, label).c_str());
     *error= 1;
     return 0;
   }

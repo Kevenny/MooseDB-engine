@@ -44,4 +44,22 @@ CREATE TABLE bad (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YE
 --error ER_ILLEGAL_HA_CREATE_OPTION
 CREATE TABLE bad (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=3;
 
+--echo # A wrong key is a decryption failure (HA_ERR_DECRYPTION_FAILED), not corruption
+call mtr.add_suppression("MooseDB");
+INSERT INTO s VALUES ('2026-01-02', 'SECRET-HOST-NAME', 'CONFIDENTIAL-after');
+--let $restart_parameters= --file-key-management-filename=$MYSQL_TEST_DIR/suite/moosedb/std_data/keys_wrong.txt
+--source include/restart_mysqld.inc
+--error ER_GET_ERRMSG
+SELECT COUNT(*) FROM s;
+SHOW WARNINGS;
+--error ER_GET_ERRMSG
+INSERT INTO s VALUES ('2026-01-03', 'SECRET-HOST-NAME', 'CONFIDENTIAL-wrong-key');
+--echo # The files were not touched: with the right key again, all data is back
+--let $restart_parameters=
+--source include/restart_mysqld.inc
+SELECT COUNT(*), MAX(note) FROM s;
+CHECK TABLE s;
+--let SEARCH_DIR= test/s
+--source suite/moosedb/include/grep_table_files.inc
+
 DROP TABLE s;

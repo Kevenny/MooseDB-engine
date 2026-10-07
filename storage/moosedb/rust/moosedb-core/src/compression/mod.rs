@@ -27,6 +27,11 @@ pub(crate) const MAX_BLOCK_RAW: usize = 256 << 20;
 /// Ceiling on the number of rows of one series entry in a chunk. Enforced by
 /// the writer and checked when reading the series index.
 pub(crate) const MAX_SERIES_ROWS: u64 = 1 << 27;
+/// Ceiling on the memory one decode may materialize (column values or the rows
+/// of a series), checked from the claimed row count *before* allocating. A
+/// writer never produces more: series parts are cut at `MAX_BLOCK_RAW / 2`
+/// estimated bytes.
+pub(crate) const MAX_DECODE_BYTES: usize = 512 << 20;
 /// Most generous expansion each codec can legitimately reach (LZ4 tops out
 /// near 255:1, ZSTD near 32768:1), used to reject implausible `raw_len`.
 const LZ4_MAX_RATIO: usize = 256;
