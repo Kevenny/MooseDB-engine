@@ -92,8 +92,15 @@ liberado** (`ChunkFile::drop`). Na recuperação:
   descartado em silêncio), exceto quando existe o `.tfl.corrupt`
   correspondente — quarentena interrompida por crash, que é concluída;
 * segmentos de WAL com header incompleto (0–7 bytes, zeros, parâmetros de
-  cifra truncados) nunca receberam entradas e são removidos; o restante do WAL
-  não coberto pelo checkpoint é reaplicado.
+  cifra truncados) nunca receberam entradas e são removidos — e não contam ao
+  decidir qual é o último segmento: a cauda incompleta do último segmento
+  *com entradas* é cortada (e o corte, sincronizado), enquanto uma cauda
+  inválida seguida de entradas reais continua sendo corrupção; o restante do
+  WAL não coberto pelo checkpoint é reaplicado.
+* durabilidade validada com perda de energia simulada (LazyFS: descarta tudo
+  que não teve fsync): 76 ciclos com 6–10 clientes, 4.341 statements
+  confirmados, nenhum perdido, parcial ou duplicado. Com `wal_sync_mode=write`
+  statements confirmados podem sumir (≈20% no teste), mas sempre inteiros.
 
 Se uma falha deixa memória e disco possivelmente divergentes — inclusive
 **qualquer erro de fsync** (WAL, chunk, MANIFEST, diretório) — a tabela entra
@@ -156,11 +163,18 @@ chunks *em estágio* (protocolo `.tmp` → fsync → rename, fora do MANIFEST) e
 para de logar no WAL. O commit grava o restante em estágio e faz **um** swap
 de MANIFEST com todos — commit durável e atômico; sem COMMIT no WAL, as
 linhas logadas antes do spill são descartadas no replay. Abort/crash: os
-chunks em estágio são órfãos e são removidos. Memória por lote limitada a
-`MEMTABLE_SIZE` (N statements concorrentes na mesma tabela: até N ×
-`MEMTABLE_SIZE`). Um lote aberto que logou no WAL retém os segmentos desde a
-sua primeira linha enquanto durar o statement; acima de 64 segmentos retidos
-a engine registra um warning no log.
+chunks em estágio são órfãos e são removidos.
+
+Memória: cada lote é limitado a `MEMTABLE_SIZE`, e **todos** os lotes do
+processo (linhas + séries novas) a `moosedb_batch_memory_budget` (1 GiB por
+padrão): acima do orçamento, um lote com ≥ 1 MiB faz spill antecipado. Pior
+caso: orçamento + 1 MiB por lote aberto.
+
+WAL retido: um lote aberto que logou no WAL segura os segmentos desde a sua
+primeira linha. Se passar de 64 segmentos retidos, ele é marcado e faz spill
+no próximo write (deixa de logar e libera os segmentos). Um lote totalmente
+parado (sem novos writes) continua retendo até commit/abort — descartá-lo
+divergiria do binlog; o flush registra um warning.
 
 ### Limites de dados não confiáveis
 
@@ -168,7 +182,14 @@ Arquivos em disco são tratados como entrada não confiável: nenhum campo lido
 controla uma alocação sem teto (um OOM aborta o `mysqld` e não é capturado
 por `catch_unwind`). Bloco descomprimido ≤ 256 MiB e plausível em relação ao
 tamanho armazenado; série ≤ 2²⁷ linhas por chunk, soma das séries = contagem
-do header; RLE e decodificação crescem sob demanda. Violação → `Corrupt`.
+do header; RLE e decodificação crescem sob demanda; nenhuma decodificação
+materializa mais de 512 MiB. O replay do WAL é em streaming e em duas passadas
+(a 1ª só anota COMMITs; a 2ª guarda, para cada linha de lote que vai
+commitar, só a posição no WAL — 16 B — e relê a linha, conferindo CRC e
+decifrando, na hora de aplicar o COMMIT). Assim o volume em bytes de lotes
+pendentes nunca impede a abertura, qualquer que tenha sido a configuração na
+escrita. Tetos só para o que o writer não produz: 16 M linhas pendentes,
+8 M COMMITs e 512 MiB de MemTable aplicada. Violação → `Corrupt`.
 Aritmética sobre ids/seqs lidos usa `checked_*` (overflow → `Corrupt`).
 
 Na escrita: valor ≤ **64 MiB** por coluna e linha ≤ **128 MiB** (erro
@@ -213,6 +234,29 @@ Segmento cifrado só com header não exige a chave no replay.
 
 ## Leitura
 
+* **`rnd_pos`** (filesort por rowid, etc.): a série é decodificada uma vez em
+  colunas compactas e guardada num LRU que divide o orçamento de
+  `moosedb_chunk_cache_size` com o cache de blocos; cada fetch custa O(colunas)
+  (~300 ns numa série de 200k linhas; antes, ~22 ms). Uma série cujo formato
+  compacto não cabe no cache (ou com cache 0) é redecodificada a cada fetch —
+  correto, mas O(série); dimensione `moosedb_chunk_cache_size` para as maiores
+  séries consultadas com filesort.
+* **Índice de séries**: log append-only compartilhado (`Arc`), lido sem cópia e
+  fora do mutex, com versão (contador do processo, nunca repete) e *epoch*
+  (identidade do log; muda em TRUNCATE/reabertura). A lista da FFI vem em
+  ordem de registro.
+* **Cache do pushdown de TAG** (handler, por tabela): por (coluna TAG,
+  collation do predicado), as séries são agrupadas por valor em buckets de
+  `CHARSET_INFO::hash_sort` — o mesmo hash que o servidor usa em GROUP BY e
+  hash join — e cada candidato é confirmado com `strnncollsp`, então o
+  resultado é idêntico à comparação série a série (PAD SPACE, NO PAD, `_ci`,
+  expansões como ß = ss, ignoráveis). Custo O(valores do `IN`) em vez de
+  O(séries × valores): 200k séries e `IN` de 900 valores caíram de ~1,6 s
+  para ~20 ms. Indexação incremental enquanto a epoch não muda; teto de
+  256 MiB e de 32 índices por tabela (acima disso, comparação direta).
+  Para não ver um statement pela metade, o handler relê a versão depois de
+  abrir o scan e refaz se ela mudou; após 16 tentativas (ou erro), abre o
+  scan sem filtro de séries — correto, pois o servidor avalia o WHERE inteiro.
 * **Full scan**: chunk por chunk, série por série (blocos lidos sob demanda,
   via cache LRU), e por fim a MemTable.
 * **Scan por índice** (`index_read_map`, `index_first/last`, `ORDER BY ts`):
@@ -329,6 +373,12 @@ v3. Salvaguardas atuais:
   com valor maior abrem com o valor limitado.
 * O plugin se declara `EXPERIMENTAL`: requer `plugin_maturity=experimental`.
 * Criptografia sem integridade autenticada (ver §Criptografia).
+* **`mariadb-backup` não copia tabelas MooseDB** (sai com rc=0): ele pula
+  subdiretórios do banco (`extra/mariabackup/backup_copy.cc:379`) e só copia
+  extensões fixas (`backup_copy.cc:926-943`, `common_engine.cc:352-361`).
+  A engine ainda não implementa `hton->prepare_for_backup`/`end_backup`
+  (pausar manutenção durante `BACKUP STAGE`). Backup suportado:
+  `mariadb-dump --lock-all-tables` — ver user-guide §Backup.
 * Tabelas não podem ser particionadas.
 * `HANDLER ... OPEN` não é suportado (`ER_ILLEGAL_HA`); `IN` com mais de
   `in_predicate_conversion_threshold` (1000) valores vira subquery no

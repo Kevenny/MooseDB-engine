@@ -41,7 +41,14 @@ mod wal;
 pub use batch::Batch;
 pub use compaction::CompactionReport;
 pub use error::{Error, Result};
+pub use index::series::SeriesSnapshot;
 pub use options::{RawOptions, TableConfig, TableOptions};
 pub use scan::{Position, Scan, ScanFilter, Snapshot, POSITION_LEN};
 pub use schema::{Column, ColumnType, Row, Schema, Value};
 pub use table::{Table, TableStats};
+
+/// Bytes held right now by the process-wide decoded block/series cache
+/// (bounded by `settings::chunk_cache_bytes`).
+pub fn chunk_cache_used_bytes() -> usize {
+    cache::used_bytes()
+}

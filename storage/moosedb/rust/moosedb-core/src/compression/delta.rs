@@ -43,7 +43,8 @@ fn decode(r: &mut ByteReader<'_>, count: usize, order: u8) -> Result<Vec<i64>> {
     }
     let first = r.i64()?;
     let residuals = simple8b::decode(r, count - 1)?;
-    let mut out = Vec::with_capacity(count);
+    // `residuals` is as long as the stream really holds: never reserve from `count`.
+    let mut out = Vec::with_capacity(residuals.len() + 1);
     out.push(first);
     let (mut prev, mut prev_delta) = (first, 0i64);
     for z in residuals {
@@ -90,6 +91,21 @@ mod tests {
         encode_delta_of_delta(&ts, &mut buf);
         assert!(buf.len() < 400, "{} bytes", buf.len());
         assert_eq!(decode_delta_of_delta(&mut ByteReader::new(&buf), ts.len()).unwrap(), ts);
+    }
+
+    #[test]
+    fn a_forged_count_cannot_reserve_gigabytes() {
+        // 4.5 MB of selector-0 words (240 zeros each) encode 2^27 values: the
+        // stream is real, so the count must be refused before it is expanded.
+        let count = 1usize << 27;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i64.to_le_bytes());
+        buf.push(0); // packed mode
+        for _ in 0..count.div_ceil(240) {
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+        assert!(decode_delta(&mut ByteReader::new(&buf), count).is_err());
+        assert!(decode_delta_of_delta(&mut ByteReader::new(&buf), usize::MAX).is_err());
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::bytes::ByteReader;
@@ -21,7 +21,7 @@ use crate::compaction::split_series;
 use crate::crypto::CipherParams;
 use crate::error::{corrupt, invalid, Error, Result};
 use crate::fsutil::{is_fsync_error, remove_if_exists, sync_dir, write_atomic};
-use crate::index::series::{row_tags, SeriesIndex};
+use crate::index::series::{row_tags, SeriesIndex, SeriesSnapshot};
 use crate::log::warn;
 use crate::manifest::Manifest;
 use crate::memtable::MemTable;
@@ -31,8 +31,9 @@ use crate::schema::{Row, Schema, Value};
 use crate::wal::{self, list_segments, segment_path, Wal};
 
 pub(crate) const OPTIONS_FILE: &str = "OPTIONS";
-/// Flushes warn when an open batch keeps more WAL segments than this.
-const MAX_RETAINED_SEGMENTS: u64 = 64;
+/// An open batch that keeps more WAL segments than this alive is asked to
+/// spill at its next write (see `Inner::flag_laggards`).
+pub(crate) const MAX_RETAINED_SEGMENTS: u64 = 64;
 /// Largest value WAL replay puts in the MemTable. Older versions accepted
 /// values up to 1 GiB; a flush cannot store one above half the block limit
 /// (it would fail forever and make the table unusable), so replay sets such a
@@ -152,15 +153,49 @@ pub(crate) struct Inner {
     poisoned: Option<String>,
     /// Next batch id; larger than any id found in the WAL at open.
     pub(crate) next_batch_id: u64,
-    /// Open batches that logged rows to the WAL (and will commit through it):
-    /// batch id -> segment of their first entry. The checkpoint can never
-    /// move replay past the oldest of these.
-    pub(crate) open_batches: HashMap<u64, u64>,
+    /// Open batches that logged rows to the WAL (and will commit through it),
+    /// by batch id. The checkpoint can never move replay past the oldest
+    /// first-entry segment among them.
+    pub(crate) open_batches: HashMap<u64, OpenBatch>,
     /// Bumped by TRUNCATE; a batch begun earlier can no longer commit.
     pub(crate) epoch: u64,
 }
 
+/// A batch that has logged rows to the WAL and has not finished.
+pub(crate) struct OpenBatch {
+    /// Segment of its first logged entry.
+    pub(crate) seg: u64,
+    /// Set by a flush when this batch pins too many segments: the batch
+    /// spills (and stops pinning) on its next write instead of logging on.
+    pub(crate) spill_hint: Arc<AtomicBool>,
+}
+
 impl Inner {
+    /// Oldest segment an open batch still needs, if any batch logged rows.
+    pub(crate) fn oldest_pin(&self) -> Option<u64> {
+        self.open_batches.values().map(|b| b.seg).min()
+    }
+
+    /// Asks every open batch that keeps more than `MAX_RETAINED_SEGMENTS`
+    /// segments (counted up to `current`, the segment of the checkpoint)
+    /// to spill at its next write. A batch cannot be released from outside:
+    /// its rows are private to the statement's thread, and its COMMIT will
+    /// refer to rows in the old segments, which therefore have to stay until
+    /// the batch spills (its rows then go to chunks), commits or aborts.
+    pub(crate) fn flag_laggards(&self, dir: &Path, current: u64) {
+        for (id, b) in &self.open_batches {
+            let lag = current.saturating_sub(b.seg);
+            if lag > MAX_RETAINED_SEGMENTS && !b.spill_hint.swap(true, Ordering::Relaxed) {
+                warn(&format!(
+                    "{}: batch {id} keeps {lag} WAL segments alive (oldest needed: {}, current: {current}); \
+                     it is asked to spill at its next write",
+                    dir.display(),
+                    b.seg
+                ));
+            }
+        }
+    }
+
     pub(crate) fn check_writable(&self) -> Result<()> {
         match &self.poisoned {
             Some(why) => Err(Error::ReadOnly(format!("table must be reopened after an earlier failure: {why}"))),
@@ -240,6 +275,9 @@ pub struct Table {
     pub(crate) config: TableConfig,
     pub(crate) schema: Arc<Schema>,
     pub(crate) inner: Mutex<Inner>,
+    /// Version of the series set (bumped when a series is added or the table
+    /// is truncated); readable without the table mutex.
+    series_version: Arc<AtomicU64>,
     /// Serializes maintenance jobs (compaction, retention) of this table.
     pub(crate) maint: Mutex<()>,
     /// Set when the directory is being dropped or renamed: maintenance stops.
@@ -460,15 +498,25 @@ impl Table {
                 && decode_row(&mut ByteReader::new(payload))
                     .is_ok_and(|row| row.iter().any(|v| matches!(v, Value::Bytes(b) if b.len() > max_replay_value())))
         };
-        let replayed = wal::replay_committed(&dir, &replay, manifest.wal_seq, true, &too_big, |seq, payload| {
-            let row = decode_row(&mut ByteReader::new(payload))?;
-            schema
-                .validate_row(&row)
-                .map_err(|e| corrupt(format!("WAL segment {seq} holds a row that does not match the schema: {e}")))?;
-            let sid = series.get_or_insert(&row_tags(&schema, &row));
-            memtable.push(sid, row);
-            Ok(())
-        })?;
+        let limits = wal::ReplayLimits::standard();
+        let replayed =
+            wal::replay_committed(&dir, &replay, manifest.wal_seq, true, &limits, &too_big, |seq, payload| {
+                let row = decode_row(&mut ByteReader::new(payload))?;
+                schema.validate_row(&row).map_err(|e| {
+                    corrupt(format!("WAL segment {seq} holds a row that does not match the schema: {e}"))
+                })?;
+                let sid = series.get_or_insert(&row_tags(&schema, &row));
+                memtable.push(schema.row_ts(&row), sid, row);
+                if memtable.bytes() > limits.applied {
+                    // A MemTable flushes long before this: only a forged or damaged
+                    // log holds that many committed rows past the checkpoint.
+                    return Err(corrupt(format!(
+                    "WAL segment {seq}: the committed rows to replay exceed {} bytes of memory; refusing to load them",
+                    limits.applied
+                )));
+                }
+                Ok(())
+            })?;
         if !replayed.rejected.is_empty() {
             // Accepted by an older version, but no chunk can hold such a value:
             // keeping it would make every flush (and so the table) fail for
@@ -535,6 +583,7 @@ impl Table {
                 Err(e) => warn(&format!("cannot advance the WAL checkpoint at open: {e}")),
             }
         }
+        let series_version = series.version_handle();
         Ok(Table {
             config,
             schema,
@@ -554,6 +603,7 @@ impl Table {
                 open_batches: HashMap::new(),
                 epoch: 0,
             }),
+            series_version,
             maint: Mutex::new(()),
             defunct: AtomicBool::new(false),
             // First background sweep one interval after opening; explicit
@@ -615,7 +665,7 @@ impl Table {
             return Err(e);
         }
         let sid = inner.series.get_or_insert(&tags);
-        inner.memtable.push(sid, row);
+        inner.memtable.push(self.schema.row_ts(&row), sid, row);
         inner.changed();
         if inner.memtable.bytes() >= limit {
             // The row is already safe in the WAL, so a failed flush must not fail
@@ -703,15 +753,9 @@ impl Table {
         // A batch that logged rows before this flush but has not committed
         // yet will put its COMMIT after the flush point: replay must still
         // reach its first row.
-        let replay_seq = inner.open_batches.values().copied().min().map_or(after_covered, |s| s.min(after_covered));
+        let replay_seq = inner.oldest_pin().map_or(after_covered, |s| s.min(after_covered));
         manifest.replay_seq = replay_seq;
-        let lag = covered.saturating_sub(replay_seq);
-        if lag > MAX_RETAINED_SEGMENTS {
-            warn(&format!(
-                "{}: an open batch retains {lag} WAL segments (oldest needed: {replay_seq}, flushed: {covered})",
-                dir.display()
-            ));
-        }
+        inner.flag_laggards(dir, covered);
         manifest.next_chunk_id = next_id;
         manifest.chunks.extend(written.iter().map(|m| m.id));
         inner.commit_manifest(dir, manifest)?;
@@ -741,7 +785,7 @@ impl Table {
         }
         let dir = &self.config.dir;
         let active = inner.wal.seq();
-        let pin = inner.open_batches.values().copied().min();
+        let pin = inner.oldest_pin();
         if inner.wal.is_empty() {
             // Keep appending to the empty active segment; only older ones go.
             let target = pin.map_or(active, |p| p.min(active));
@@ -767,13 +811,7 @@ impl Table {
         manifest.wal_seq = active;
         manifest.replay_seq = pin.map_or(next, |p| p.min(next));
         let replay_seq = manifest.replay_seq;
-        let lag = active.saturating_sub(replay_seq);
-        if lag > MAX_RETAINED_SEGMENTS {
-            warn(&format!(
-                "{}: an open batch retains {lag} WAL segments (oldest needed: {replay_seq}, current: {active})",
-                dir.display()
-            ));
-        }
+        inner.flag_laggards(dir, active);
         inner.commit_manifest(dir, manifest)?;
         inner.wal = fresh;
         delete_wal_upto(dir, replay_seq - 1);
@@ -832,9 +870,12 @@ impl Table {
     /// since the previous call (the view is shared).
     pub fn snapshot(&self) -> Result<Arc<Snapshot>> {
         let mut guard = self.lock()?;
-        let inner = &mut *guard;
+        Ok(self.snapshot_locked(&mut guard))
+    }
+
+    fn snapshot_locked(&self, inner: &mut Inner) -> Arc<Snapshot> {
         if let Some(s) = &inner.snapshot_cache {
-            return Ok(s.clone());
+            return s.clone();
         }
         let mem = inner.memtable.snapshot(inner.mem_generation);
         let s = Arc::new(Snapshot {
@@ -844,16 +885,19 @@ impl Table {
             version: inner.version,
         });
         inner.snapshot_cache = Some(s.clone());
-        Ok(s)
+        s
     }
 
-    fn resolve(&self, filter: &ScanFilter) -> Result<ResolvedFilter> {
+    /// `all` is the series snapshot taken under the same lock as the table
+    /// snapshot (only needed when the filter has TAG predicates).
+    fn resolve(&self, filter: &ScanFilter, all: Option<SeriesSnapshot>) -> Result<ResolvedFilter> {
         check_tag_columns(&self.schema, filter)?;
         let mut series: Option<HashSet<u64>> = filter.series.as_ref().map(|s| s.iter().copied().collect());
         if !filter.tags.is_empty() {
-            let inner = self.lock()?;
-            let matching: HashSet<u64> = inner
-                .series
+            // The walk over every series happens on a shared snapshot, not
+            // under the table mutex.
+            let all = all.ok_or_else(|| invalid("internal error: series snapshot missing"))?;
+            let matching: HashSet<u64> = all
                 .iter()
                 .filter(|(_, tags)| {
                     filter
@@ -874,8 +918,16 @@ impl Table {
     /// Opens a scan over a snapshot of the table. With `sorted`, rows come in
     /// timestamp order and the scan supports backward iteration.
     pub fn scan(&self, filter: &ScanFilter, sorted: bool) -> Result<Scan> {
-        let resolved = self.resolve(filter)?;
-        Scan::new(self.snapshot()?, resolved, sorted)
+        // Both views under ONE acquisition of the mutex: a commit between two
+        // acquisitions could show the rows of a statement's series X but not
+        // of its new series Y (a partly visible statement).
+        let (snap, all) = {
+            let mut guard = self.lock()?;
+            let all = (!filter.tags.is_empty()).then(|| guard.series.snapshot());
+            (self.snapshot_locked(&mut guard), all)
+        };
+        let resolved = self.resolve(filter, all)?;
+        Scan::new(snap, resolved, sorted)
     }
 
     /// Re-reads the row at `pos` from the current contents.
@@ -883,12 +935,23 @@ impl Table {
         self.snapshot()?.fetch(pos)
     }
 
-    /// Every known series: `(series_id, tag values in tag order)`.
+    /// Every known series: `(series_id, tag values in tag order)`, sorted by
+    /// id. Copies the series (outside the table mutex); prefer
+    /// [`Table::series_snapshot`] for large series sets.
     pub fn series(&self) -> Result<Vec<(u64, Vec<Value>)>> {
-        let inner = self.lock()?;
-        let mut v: Vec<(u64, Vec<Value>)> = inner.series.iter().map(|(id, t)| (id, t.to_vec())).collect();
-        v.sort_by_key(|(id, _)| *id);
-        Ok(v)
+        Ok(self.series_snapshot()?.to_sorted_vec())
+    }
+
+    /// Shared, immutable view of the series: O(1) under the table mutex
+    /// whatever the number of series (no copy of the index).
+    pub fn series_snapshot(&self) -> Result<SeriesSnapshot> {
+        Ok(self.lock()?.series.snapshot())
+    }
+
+    /// Changes whenever a series is added or the table is truncated; equal
+    /// values mean the same set of series. Lock-free.
+    pub fn series_version(&self) -> u64 {
+        self.series_version.load(Ordering::Acquire)
     }
 
     pub fn stats(&self) -> Result<TableStats> {
@@ -922,7 +985,7 @@ impl Table {
             let overlap = (hi.min(cmax) as i128 - lo.max(cmin) as i128 + 1).clamp(1, span);
             total += ((c.header.row_count as i128 * overlap / span) as u64).max(1);
         }
-        total += inner.memtable.count_in_range(&self.schema, lo, hi) as u64;
+        total += inner.memtable.estimate_in_range(lo, hi);
         Ok(total)
     }
 

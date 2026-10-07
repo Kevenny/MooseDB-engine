@@ -23,8 +23,29 @@
 //!
 //! A TRUNCATE invalidates open batches (their commit fails): otherwise the
 //! rows logged before it could come back at replay.
+//!
+//! Memory and WAL retention are bounded on three levels:
+//!
+//! * per batch: spill at `MEMTABLE_SIZE` (rows *and* the series/tag
+//!   bookkeeping of the batch are counted);
+//! * process-wide: the buffers of all open batches together are counted in
+//!   one atomic (`batch_memory_in_use`); above the configured budget
+//!   (`settings::batch_memory_budget_bytes`) a batch that is at least
+//!   `MIN_FORCED_SPILL` big spills at its next write, whatever its own limit.
+//!   Small batches are left alone (a spill makes a chunk file; spilling a
+//!   handful of rows would trade memory for file churn), so the worst case is
+//!   the budget plus `MIN_FORCED_SPILL` per open batch;
+//! * WAL retention: a batch that has logged rows pins every segment from its
+//!   first one on. When a flush sees one pinning more than
+//!   `MAX_RETAINED_SEGMENTS` it sets the batch's `spill_hint`; the batch spills
+//!   at its next write (it stops logging and stops pinning). A batch that never
+//!   writes again cannot be released from outside — its rows live in its own
+//!   thread's buffer, and its COMMIT will refer to the old segments — so it
+//!   keeps them until it commits or aborts (the warning is logged once per batch).
+//!   Evicting it instead would fail a statement the binlog already recorded.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::chunk::ChunkMeta;
@@ -36,8 +57,33 @@ use crate::index::series::{row_tags, series_key};
 use crate::log::warn;
 use crate::memtable::{group_rows, row_bytes, MemRow};
 use crate::schema::{Row, Schema, Value};
-use crate::table::Table;
+use crate::table::{OpenBatch, Table};
 use crate::wal;
+
+/// Bytes held by the row buffers of every open batch of the process.
+static BATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+/// A batch smaller than this is never spilled because of the global budget.
+const MIN_FORCED_SPILL: usize = 1 << 20;
+
+/// Bytes the open batches of this process hold in memory right now (rows plus
+/// series bookkeeping): what `moosedb_batch_memory_budget` limits.
+pub fn batch_memory_in_use() -> u64 {
+    BATCH_BYTES.load(Ordering::Relaxed)
+}
+
+fn budget() -> u64 {
+    crate::settings::get().batch_memory_budget_bytes()
+}
+
+/// Memory of one new series in a batch: the key in `local_ids`, its map
+/// entry, and the tag values in `local_tags`.
+fn series_cost(key_len: usize, tags: &[Value]) -> usize {
+    key_len
+        + std::mem::size_of::<Vec<u8>>()
+        + 16
+        + std::mem::size_of::<Vec<Value>>()
+        + tags.iter().map(Value::mem_size).sum::<usize>()
+}
 
 pub struct Batch {
     table: Arc<Table>,
@@ -46,7 +92,17 @@ pub struct Batch {
     epoch: u64,
     /// Buffered rows; `series_id` is an index into `local_tags` until commit.
     rows: Vec<MemRow>,
+    /// Sum of `row_bytes` over `rows` (what the MemTable will account).
     bytes: usize,
+    /// Bytes of `local_ids` and `local_tags`.
+    series_bytes: usize,
+    /// What this batch has added to `BATCH_BYTES` and not yet given back.
+    accounted: usize,
+    /// Timestamp range of `rows` (the MemTable keeps it for estimates).
+    ts_min: i64,
+    ts_max: i64,
+    /// Set by a flush when this batch pins too many WAL segments.
+    spill_hint: Arc<AtomicBool>,
     local_ids: HashMap<Vec<u8>, u64>,
     local_tags: Vec<Vec<Value>>,
     /// Rows were logged to the WAL and the batch is registered as open there.
@@ -87,6 +143,11 @@ impl Table {
             epoch,
             rows: Vec::new(),
             bytes: 0,
+            series_bytes: 0,
+            accounted: 0,
+            ts_min: i64::MAX,
+            ts_max: i64::MIN,
+            spill_hint: Arc::new(AtomicBool::new(false)),
             local_ids: HashMap::new(),
             local_tags: Vec::new(),
             logged: false,
@@ -113,7 +174,7 @@ impl Batch {
         table.schema.validate_for_write(&row)?;
         // Spill *before* taking the row: a failed spill then fails this row
         // alone instead of reporting an error for a row that was kept.
-        if self.bytes >= self.spill_limit && !self.rows.is_empty() {
+        if !self.rows.is_empty() && self.should_spill() {
             self.spill()?;
         }
         let payload = if self.spilled {
@@ -141,22 +202,54 @@ impl Batch {
                 return Err(e);
             }
             let seg = inner.wal.seq();
-            inner.open_batches.entry(self.id).or_insert(seg);
+            let hint = self.spill_hint.clone();
+            inner.open_batches.entry(self.id).or_insert_with(|| OpenBatch { seg, spill_hint: hint });
             self.logged = true;
         }
+        let ts = table.schema.row_ts(&row);
         let key = series_key(&tags);
+        let rb = row_bytes(&row);
+        let mut added = rb;
         let local = match self.local_ids.get(&key) {
             Some(&l) => l,
             None => {
                 let l = self.local_tags.len() as u64;
+                let cost = series_cost(key.len(), &tags);
+                self.series_bytes += cost;
+                added += cost;
                 self.local_tags.push(tags);
                 self.local_ids.insert(key, l);
                 l
             }
         };
-        self.bytes += row_bytes(&row);
+        self.bytes += rb;
+        self.ts_min = self.ts_min.min(ts);
+        self.ts_max = self.ts_max.max(ts);
         self.rows.push(MemRow { series_id: local, row });
+        self.accounted += added;
+        BATCH_BYTES.fetch_add(added as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Whether the next write must first move the buffer to staged chunks.
+    fn should_spill(&self) -> bool {
+        let local = self.bytes + self.series_bytes;
+        if local >= self.spill_limit {
+            return true;
+        }
+        // Pinning too many WAL segments (only a batch that still logs pins any).
+        if !self.spilled && self.spill_hint.load(Ordering::Relaxed) {
+            return true;
+        }
+        local >= MIN_FORCED_SPILL && BATCH_BYTES.load(Ordering::Relaxed) > budget()
+    }
+
+    /// Gives this batch's share back to the process-wide counter.
+    fn release_budget(&mut self) {
+        if self.accounted > 0 {
+            BATCH_BYTES.fetch_sub(self.accounted as u64, Ordering::Relaxed);
+            self.accounted = 0;
+        }
     }
 
     /// Writes the buffered rows as staged chunks and drops them from memory.
@@ -165,6 +258,10 @@ impl Batch {
         self.staged.extend(metas);
         self.rows = Vec::new();
         self.bytes = 0;
+        self.series_bytes = 0;
+        self.ts_min = i64::MAX;
+        self.ts_max = i64::MIN;
+        self.release_budget();
         self.local_ids = HashMap::new();
         self.local_tags = Vec::new();
         if !self.spilled {
@@ -230,7 +327,9 @@ impl Batch {
             for r in &mut rows {
                 r.series_id = ids[r.series_id as usize];
             }
-            inner.memtable.append(rows, self.bytes);
+            inner.memtable.append(rows, self.bytes, self.ts_min, self.ts_max);
+            // The rows now belong to the MemTable, which has its own limits.
+            self.release_budget();
             inner.changed();
             if inner.memtable.bytes() >= limit {
                 // The rows are safe in the WAL: a failed flush is retried later.
@@ -287,6 +386,7 @@ impl Batch {
         }
         self.staged.clear();
         self.rows = Vec::new();
+        self.release_budget();
         if self.logged {
             if let Ok(mut g) = self.table.lock() {
                 g.open_batches.remove(&self.id);
@@ -300,6 +400,8 @@ impl Drop for Batch {
         if !self.finished {
             self.cleanup();
         }
+        // A commit that failed before publishing leaves its share behind.
+        self.release_budget();
     }
 }
 
@@ -392,7 +494,7 @@ mod tests {
     use crate::options::{RawOptions, TableConfig};
     use crate::schema::{Column, ColumnType};
 
-    fn open(dir: &std::path::Path) -> Arc<Table> {
+    fn config(dir: &std::path::Path) -> TableConfig {
         let schema = Schema::new(
             vec![
                 Column { name: "ts".into(), ty: ColumnType::Timestamp },
@@ -401,9 +503,120 @@ mod tests {
             0,
         )
         .unwrap();
-        let cfg = TableConfig::new(dir, schema, &RawOptions::default()).unwrap();
+        TableConfig::new(dir, schema, &RawOptions::default()).unwrap()
+    }
+
+    fn open(dir: &std::path::Path) -> Arc<Table> {
+        let cfg = config(dir);
         Table::create(&cfg).unwrap();
         Arc::new(Table::open(cfg).unwrap())
+    }
+
+    fn segments(dir: &std::path::Path) -> usize {
+        wal::list_segments(dir).unwrap().len()
+    }
+
+    /// A continuous writer: every flush starts a new WAL segment.
+    fn churn(t: &Table, from: i64, n: usize) {
+        for i in 0..n {
+            t.write(row(from + i as i64)).unwrap();
+            t.flush().unwrap();
+        }
+    }
+
+    const LAG: usize = crate::table::MAX_RETAINED_SEGMENTS as usize + 6;
+
+    #[test]
+    fn a_batch_pinning_too_many_wal_segments_spills_at_its_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let t = open(&path);
+        let mut slow = t.begin_batch().unwrap();
+        slow.write(row(0)).unwrap();
+        t.sync_wal(false).unwrap();
+        churn(&t, 1000, LAG);
+        assert!(segments(&path) > LAG - 3, "the pin keeps every segment: {}", segments(&path));
+        assert!(slow.spill_hint.load(Ordering::Relaxed), "the flush asked the batch to spill");
+        assert!(!slow.spilled);
+
+        // Its next write moves the buffer into staged chunks: it stops logging
+        // and stops pinning, and the next flush collects the segments.
+        slow.write(row(1)).unwrap();
+        assert!(slow.spilled);
+        churn(&t, 5000, 1);
+        assert!(segments(&path) <= 2, "{} segments left", segments(&path));
+
+        // Atomicity is untouched: invisible until commit, then whole.
+        assert_eq!(t.stats().unwrap().row_count as usize, LAG + 1);
+        slow.write(row(2)).unwrap();
+        slow.commit(true).unwrap();
+        assert_eq!(t.stats().unwrap().row_count as usize, LAG + 1 + 3);
+        drop(t);
+        let t = Table::open(config(&path)).unwrap();
+        assert_eq!(t.stats().unwrap().row_count as usize, LAG + 1 + 3, "durable across a reopen");
+    }
+
+    #[test]
+    fn a_batch_that_never_writes_again_releases_the_segments_when_it_commits_or_aborts() {
+        for commit in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t");
+            let t = open(&path);
+            let mut idle = t.begin_batch().unwrap();
+            idle.write(row(0)).unwrap();
+            churn(&t, 1000, LAG);
+            assert!(idle.spill_hint.load(Ordering::Relaxed));
+            let pinned = segments(&path);
+            assert!(pinned > LAG - 3, "an idle batch cannot be released from outside: {pinned}");
+            // The flush keeps flagging it but cannot evict it: its rows live in
+            // its own buffer and its COMMIT will refer to the old segments.
+            churn(&t, 3000, 3);
+            assert!(segments(&path) > pinned);
+            if commit {
+                idle.commit(true).unwrap();
+            } else {
+                idle.abort();
+            }
+            churn(&t, 6000, 1);
+            assert!(segments(&path) <= 2, "{} segments left after commit={commit}", segments(&path));
+            let want = LAG + 3 + 1 + usize::from(commit);
+            assert_eq!(t.stats().unwrap().row_count as usize, want);
+            drop(t);
+            assert_eq!(Table::open(config(&path)).unwrap().stats().unwrap().row_count as usize, want);
+        }
+    }
+
+    #[test]
+    fn a_forced_spill_that_never_commits_leaves_nothing_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let t = open(&path);
+        let mut slow = t.begin_batch().unwrap();
+        slow.write(row(0)).unwrap();
+        churn(&t, 1000, LAG);
+        slow.write(row(1)).unwrap(); // spills
+        slow.write(row(2)).unwrap();
+        t.sync_wal(true).unwrap();
+        std::mem::forget(slow);
+        std::mem::forget(t);
+        let t = Table::open(config(&path)).unwrap();
+        assert_eq!(t.stats().unwrap().row_count as usize, LAG, "only the committed rows of the other writer");
+        assert!(t.check().unwrap().is_empty());
+    }
+
+    #[test]
+    fn series_bookkeeping_counts_toward_the_batch_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir.path().join("t"));
+        let mut b = t.begin_batch().unwrap();
+        b.write(vec![Value::Timestamp(1), Value::Bytes(b"a-very-long-host-name-for-one-series".to_vec())]).unwrap();
+        let one = b.bytes + b.series_bytes;
+        assert!(b.series_bytes > 36, "key and tags of a new series are charged: {}", b.series_bytes);
+        b.write(vec![Value::Timestamp(2), Value::Bytes(b"a-very-long-host-name-for-one-series".to_vec())]).unwrap();
+        let two = b.bytes + b.series_bytes;
+        assert!(two - one < one, "a known series costs only its row");
+        assert_eq!(b.accounted, two);
+        b.abort();
     }
 
     fn row(i: i64) -> Row {

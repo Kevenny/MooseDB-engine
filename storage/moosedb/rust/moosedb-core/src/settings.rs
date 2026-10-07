@@ -3,12 +3,17 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
+/// Default of `moosedb_batch_memory_budget`: 1 GiB for the buffers of every
+/// open statement batch of the process together.
+pub const DEFAULT_BATCH_MEMORY_BUDGET: u64 = 1 << 30;
+
 pub struct Settings {
     retention_check_interval_secs: AtomicU64,
     compaction_trigger_chunks: AtomicU32,
     bloom_fpr_bits: AtomicU64,
     chunk_cache_bytes: AtomicU64,
     max_open_chunks: AtomicU32,
+    batch_memory_budget_bytes: AtomicU64,
 }
 
 static SETTINGS: Settings = Settings {
@@ -17,6 +22,7 @@ static SETTINGS: Settings = Settings {
     bloom_fpr_bits: AtomicU64::new(0x3F84_7AE1_47AE_147B), // 0.01
     chunk_cache_bytes: AtomicU64::new(128 << 20),
     max_open_chunks: AtomicU32::new(100),
+    batch_memory_budget_bytes: AtomicU64::new(DEFAULT_BATCH_MEMORY_BUDGET),
 };
 
 pub fn get() -> &'static Settings {
@@ -55,6 +61,7 @@ impl Settings {
     }
     pub fn set_chunk_cache_bytes(&self, v: u64) {
         self.chunk_cache_bytes.store(v, Relaxed);
+        crate::cache::resize(v);
     }
 
     /// Chunk file descriptors kept open between reads (min 1).
@@ -63,6 +70,18 @@ impl Settings {
     }
     pub fn set_max_open_chunks(&self, v: u32) {
         self.max_open_chunks.store(v, Relaxed);
+    }
+
+    /// Bytes the row buffers of all open batches of the process may hold
+    /// together; a batch that crosses it spills early. 0 selects the default.
+    pub fn batch_memory_budget_bytes(&self) -> u64 {
+        match self.batch_memory_budget_bytes.load(Relaxed) {
+            0 => DEFAULT_BATCH_MEMORY_BUDGET,
+            v => v,
+        }
+    }
+    pub fn set_batch_memory_budget_bytes(&self, v: u64) {
+        self.batch_memory_budget_bytes.store(v, Relaxed);
     }
 }
 

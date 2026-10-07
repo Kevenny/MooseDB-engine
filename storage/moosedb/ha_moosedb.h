@@ -15,8 +15,11 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "my_global.h"
@@ -95,6 +98,36 @@ struct tf_tag_predicate
 };
 
 /*
+  Series of one TAG column grouped by value under one collation. Values that
+  compare equal (strnncollsp == 0) share a group; groups are found through
+  CHARSET_INFO::hash_sort buckets and confirmed with strnncollsp, so lookups
+  give exactly the series a collation-aware comparison would.
+*/
+struct tf_tag_group
+{
+  std::string value;                 /* representative, in the index's cs */
+  std::vector<uint64_t> ids;         /* series_id, in registration order  */
+};
+struct tf_tag_index
+{
+  std::unordered_map<uint64_t, std::vector<uint32_t>> buckets;
+  std::vector<tf_tag_group> groups;
+  uint64_t built_len= 0;             /* list entries already indexed      */
+};
+
+/* Cache of tf_tag_index per (TAG position, collation); guarded by `mutex`. */
+struct tf_tag_cache
+{
+  std::mutex mutex;
+  bool valid= false;
+  uint64_t version= 0;               /* series-list version indexed       */
+  uint64_t epoch= 0;                 /* identity of the indexed log       */
+  size_t bytes= 0;                   /* estimated heap held by `indexes`  */
+  uint64_t len= 0;                   /* series-list length indexed        */
+  std::map<std::pair<int, const CHARSET_INFO *>, tf_tag_index> indexes;
+};
+
+/*
   Per-table state shared by every handler instance of one TABLE_SHARE.
   The Rust table is opened once here and is thread-safe.
 */
@@ -106,6 +139,7 @@ public:
   tf_layout layout;
   std::string path;      /* table directory, as given to open()      */
   std::string display;   /* db.table, for messages (no host paths)    */
+  tf_tag_cache tag_cache; /* TAG pushdown lookup, see pushed_series()  */
 
   MooseDB_share();
   ~MooseDB_share() override;
@@ -212,6 +246,11 @@ private:
   void collect_tag_predicates(const Item *cond,
                               std::vector<tf_tag_predicate> *out);
   bool pushed_series(const std::vector<uint64_t> **ids);
+  bool pushed_series_scan(MooseDBSeriesList *list,
+                          const std::vector<const tf_tag_predicate *> &preds,
+                          const std::vector<CHARSET_INFO *> &tag_cs);
+  bool pushed_series_cached(const std::vector<const tf_tag_predicate *> &preds,
+                            const std::vector<CHARSET_INFO *> &tag_cs);
 
   THR_LOCK_DATA lock_data_;
   MooseDB_share *share_= nullptr;
@@ -227,6 +266,7 @@ private:
 
   /* Pushed-down TAG predicates: one entry per cond_push() call. */
   std::vector<std::vector<tf_tag_predicate>> pushed_;
+  uint64_t pushed_version_= 0;          /* series version pushed_ids_ is for */
   bool pushed_valid_= false;            /* pushed_ids_ is up to date      */
   bool pushed_filter_= false;           /* some predicate restricts rows  */
   std::vector<uint64_t> pushed_ids_;    /* series matching all predicates */

@@ -53,7 +53,8 @@ typedef struct MooseDBInfo MooseDBInfo;
 // Opaque scan handle.
 typedef struct MooseDBScan MooseDBScan;
 
-// Opaque list of the series of a table.
+// Opaque list of the series of a table: a shared, immutable snapshot of the
+// series index (taking it copies nothing).
 typedef struct MooseDBSeriesList MooseDBSeriesList;
 
 // Opaque snapshot handle: resolves row positions (`rnd_pos`).
@@ -67,8 +68,14 @@ typedef struct {
   uint64_t retention_check_interval_secs;
   uint32_t compaction_trigger_chunks;
   double bloom_filter_false_positive_rate;
+  // Bytes of decoded blocks and decoded series kept for reads
+  // (`moosedb_chunk_cache_size`); 0 disables the cache.
   uint64_t chunk_cache_bytes;
   uint32_t max_open_chunks;
+  // Bytes the row buffers of all open statement batches may hold together
+  // (`moosedb_batch_memory_budget`). Above it, the batches that hold at
+  // least 1 MiB spill to disk early. 0 = default (1 GiB).
+  uint64_t batch_memory_budget_bytes;
 } TFGlobalSettings;
 
 // Fetches an encryption key from the server. `version == 0` asks for the
@@ -369,7 +376,19 @@ TFStatus moosedb_snapshot_fetch(MooseDBSnapshot *snapshot, const uint8_t *pos, T
 // `snapshot` must come from `moosedb_scan_snapshot` and not be used afterwards.
 TFStatus moosedb_snapshot_close(MooseDBSnapshot *snapshot);
 
-// Lists every series of the table (for TAG predicate pushdown).
+// Version of the table's set of series: it changes whenever a series is added
+// or the table is truncated, so equal values mean the same series. Lock-free
+// and O(1): call it before every pushdown and rebuild a cached index (from
+// `moosedb_series_list`) only when it differs from the cached one.
+//
+// # Safety
+// `table` must be valid; `out_version` writable.
+TFStatus moosedb_series_version(MooseDBTable *table, uint64_t *out_version);
+
+// Lists every series of the table (for TAG predicate pushdown). The list is
+// a shared snapshot: O(1) and no copy of the index under the table lock, at
+// any number of series. Entries come in registration order (not sorted by
+// id); the list never changes after it is returned.
 //
 // # Safety
 // `table` must be valid; `out_list` writable.
@@ -380,6 +399,24 @@ TFStatus moosedb_series_list(MooseDBTable *table, MooseDBSeriesList **out_list);
 // # Safety
 // `list` must be valid.
 uint64_t moosedb_series_list_len(const MooseDBSeriesList *list);
+
+// The `moosedb_series_version` value this list corresponds to (read together
+// with its content, so a cache keyed by it is never stale).
+//
+// # Safety
+// `list` must be valid.
+uint64_t moosedb_series_list_version(const MooseDBSeriesList *list);
+
+// Identity of the log behind the list, unique in the process: it changes at
+// every TRUNCATE and every table open and never repeats. Guarantee: two lists
+// of the same table with the same epoch are prefixes of one append-only log, so
+// the later list is the earlier one plus new entries (same series at the same
+// indexes); a different epoch means the list was replaced and must be reread
+// from scratch. (Versions only say "something changed", not how.)
+//
+// # Safety
+// `list` must be valid.
+uint64_t moosedb_series_list_epoch(const MooseDBSeriesList *list);
 
 // Series `index`: its id and its TAG values (in table TAG-column order).
 //

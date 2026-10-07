@@ -1,0 +1,361 @@
+SET NAMES utf8mb4;
+CREATE TABLE tf (
+ts  DATETIME NOT NULL,
+ci  VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci COMMENT 'TAG',
+uni VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci COMMENT 'TAG',
+bin VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin COMMENT 'TAG',
+np  VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin COMMENT 'TAG',
+ch  CHAR(8) CHARACTER SET latin1 COMMENT 'TAG',
+n   INT,
+INDEX(ts)
+) ENGINE=MooseDB;
+CREATE TABLE ctl LIKE tf;
+ALTER TABLE ctl ENGINE=MyISAM;
+CREATE PROCEDURE cmp(p TEXT CHARACTER SET utf8mb4)
+BEGIN
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @a FROM tf WHERE ', p);
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @b FROM ctl WHERE ', p);
+SELECT IF(@a = @b, 'OK', 'FAIL') AS status, p AS predicate, @a AS moosedb, @b AS control;
+END//
+CREATE PROCEDURE cmpq(lbl VARCHAR(40), p TEXT CHARACTER SET utf8mb4)
+BEGIN
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @a FROM tf WHERE ', p);
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @b FROM ctl WHERE ', p);
+SELECT IF(@a = @b, 'OK', 'FAIL') AS status, lbl AS predicate, @a AS moosedb, @b AS control;
+END//
+CREATE PROCEDURE sweep()
+BEGIN
+CALL cmp("ci = 'abc'");
+CALL cmp("ci IN ('ABC ', 'ñandu', 'zzz', '😀')");
+CALL cmp("uni = 'ABÇ'");
+CALL cmp("uni IN ('nandu', 'STRASSE', '')");
+CALL cmp("bin = 'abc'");
+CALL cmp("bin IN ('abc ', 'abc  ', 'ABC')");
+CALL cmp("np = 'abc '");
+CALL cmp("np IN ('abc', 'abc  ', '')");
+CALL cmp("ch IN ('abc', 'N', 's  ')");
+CALL cmp("ci = 'abc' AND ch = 'ABC'");
+CALL cmp("ci = 'abc' COLLATE utf8mb4_bin");
+CALL cmp("ci = 'abc ' COLLATE utf8mb4_general_nopad_ci");
+END//
+INSERT INTO tf VALUES ('2026-01-01 00:00:01', 'abc',   'abc',  'abc',   'abc',   'abc',  1),
+('2026-01-01 00:00:02', 'ABC',   'ÀBC',  'ABC',   'ABC',   'ABC',  2),
+('2026-01-01 00:00:03', 'abc ',  'abc ', 'abc ',  'abc ',  'abc ', 3),
+('2026-01-01 00:00:04', 'abc  ', 'abç',  'abc  ', 'abc  ', 'N',    4),
+('2026-01-01 00:00:05', '',      '',     '',      '',      '',     5),
+('2026-01-01 00:00:06', 'ñandu', 'NANDU','ñandú', 'ñandú', 's',    6),
+('2026-01-01 00:00:07', '😀',    '😀',   '😀',    '😀',    NULL,   7),
+('2026-01-01 00:00:08', 'Straße','STRASSE','Straße','Straße','x',   8);
+INSERT INTO ctl VALUES ('2026-01-01 00:00:01', 'abc',   'abc',  'abc',   'abc',   'abc',  1),
+('2026-01-01 00:00:02', 'ABC',   'ÀBC',  'ABC',   'ABC',   'ABC',  2),
+('2026-01-01 00:00:03', 'abc ',  'abc ', 'abc ',  'abc ',  'abc ', 3),
+('2026-01-01 00:00:04', 'abc  ', 'abç',  'abc  ', 'abc  ', 'N',    4),
+('2026-01-01 00:00:05', '',      '',     '',      '',      '',     5),
+('2026-01-01 00:00:06', 'ñandu', 'NANDU','ñandú', 'ñandú', 's',    6),
+('2026-01-01 00:00:07', '😀',    '😀',   '😀',    '😀',    NULL,   7),
+('2026-01-01 00:00:08', 'Straße','STRASSE','Straße','Straße','x',   8);
+# 1. first use builds the indexes
+CALL sweep();
+status	predicate	moosedb	control
+OK	ci = 'abc'	4/10	4/10
+status	predicate	moosedb	control
+OK	ci IN ('ABC ', 'ñandu', 'zzz', '😀')	6/23	6/23
+status	predicate	moosedb	control
+OK	uni = 'ABÇ'	4/10	4/10
+status	predicate	moosedb	control
+OK	uni IN ('nandu', 'STRASSE', '')	3/19	3/19
+status	predicate	moosedb	control
+OK	bin = 'abc'	3/8	3/8
+status	predicate	moosedb	control
+OK	bin IN ('abc ', 'abc  ', 'ABC')	4/10	4/10
+status	predicate	moosedb	control
+OK	np = 'abc '	1/3	1/3
+status	predicate	moosedb	control
+OK	np IN ('abc', 'abc  ', '')	3/10	3/10
+status	predicate	moosedb	control
+OK	ch IN ('abc', 'N', 's  ')	5/16	5/16
+status	predicate	moosedb	control
+OK	ci = 'abc' AND ch = 'ABC'	3/6	3/6
+status	predicate	moosedb	control
+OK	ci = 'abc' COLLATE utf8mb4_bin	3/8	3/8
+status	predicate	moosedb	control
+OK	ci = 'abc ' COLLATE utf8mb4_general_nopad_ci	1/3	1/3
+# 2. new series appended: only the tail is indexed, old ones stay found
+INSERT INTO tf VALUES ('2026-01-02 00:00:01', 'ABC   ', 'abç ', 'abc', 'abc ', 'abc', 100), ('2026-01-02 00:00:02', 'zzz', 'Ñandu', 'new', 'abc  ', 'n', 101);
+INSERT INTO ctl VALUES ('2026-01-02 00:00:01', 'ABC   ', 'abç ', 'abc', 'abc ', 'abc', 100), ('2026-01-02 00:00:02', 'zzz', 'Ñandu', 'new', 'abc  ', 'n', 101);
+CALL sweep();
+status	predicate	moosedb	control
+OK	ci = 'abc'	5/110	5/110
+status	predicate	moosedb	control
+OK	ci IN ('ABC ', 'ñandu', 'zzz', '😀')	8/224	8/224
+status	predicate	moosedb	control
+OK	uni = 'ABÇ'	5/110	5/110
+status	predicate	moosedb	control
+OK	uni IN ('nandu', 'STRASSE', '')	4/120	4/120
+status	predicate	moosedb	control
+OK	bin = 'abc'	4/108	4/108
+status	predicate	moosedb	control
+OK	bin IN ('abc ', 'abc  ', 'ABC')	5/110	5/110
+status	predicate	moosedb	control
+OK	np = 'abc '	2/103	2/103
+status	predicate	moosedb	control
+OK	np IN ('abc', 'abc  ', '')	4/111	4/111
+status	predicate	moosedb	control
+OK	ch IN ('abc', 'N', 's  ')	7/217	7/217
+status	predicate	moosedb	control
+OK	ci = 'abc' AND ch = 'ABC'	4/106	4/106
+status	predicate	moosedb	control
+OK	ci = 'abc' COLLATE utf8mb4_bin	3/8	3/8
+status	predicate	moosedb	control
+OK	ci = 'abc ' COLLATE utf8mb4_general_nopad_ci	1/3	1/3
+# 3. flushed chunk + new series after the flush
+FLUSH TABLES tf;
+INSERT INTO tf VALUES ('2026-01-03 00:00:01', 'abc', 'abc', 'abc  ', 'abc', 'zz', 200);
+INSERT INTO ctl VALUES ('2026-01-03 00:00:01', 'abc', 'abc', 'abc  ', 'abc', 'zz', 200);
+CALL sweep();
+status	predicate	moosedb	control
+OK	ci = 'abc'	6/310	6/310
+status	predicate	moosedb	control
+OK	ci IN ('ABC ', 'ñandu', 'zzz', '😀')	9/424	9/424
+status	predicate	moosedb	control
+OK	uni = 'ABÇ'	6/310	6/310
+status	predicate	moosedb	control
+OK	uni IN ('nandu', 'STRASSE', '')	4/120	4/120
+status	predicate	moosedb	control
+OK	bin = 'abc'	5/308	5/308
+status	predicate	moosedb	control
+OK	bin IN ('abc ', 'abc  ', 'ABC')	6/310	6/310
+status	predicate	moosedb	control
+OK	np = 'abc '	2/103	2/103
+status	predicate	moosedb	control
+OK	np IN ('abc', 'abc  ', '')	5/311	5/311
+status	predicate	moosedb	control
+OK	ch IN ('abc', 'N', 's  ')	7/217	7/217
+status	predicate	moosedb	control
+OK	ci = 'abc' AND ch = 'ABC'	4/106	4/106
+status	predicate	moosedb	control
+OK	ci = 'abc' COLLATE utf8mb4_bin	4/208	4/208
+status	predicate	moosedb	control
+OK	ci = 'abc ' COLLATE utf8mb4_general_nopad_ci	1/3	1/3
+# 4. TRUNCATE drops the cache (an empty table is queried in between)
+TRUNCATE TABLE tf;
+TRUNCATE TABLE ctl;
+CALL sweep();
+status	predicate	moosedb	control
+OK	ci = 'abc'	0/0	0/0
+status	predicate	moosedb	control
+OK	ci IN ('ABC ', 'ñandu', 'zzz', '😀')	0/0	0/0
+status	predicate	moosedb	control
+OK	uni = 'ABÇ'	0/0	0/0
+status	predicate	moosedb	control
+OK	uni IN ('nandu', 'STRASSE', '')	0/0	0/0
+status	predicate	moosedb	control
+OK	bin = 'abc'	0/0	0/0
+status	predicate	moosedb	control
+OK	bin IN ('abc ', 'abc  ', 'ABC')	0/0	0/0
+status	predicate	moosedb	control
+OK	np = 'abc '	0/0	0/0
+status	predicate	moosedb	control
+OK	np IN ('abc', 'abc  ', '')	0/0	0/0
+status	predicate	moosedb	control
+OK	ch IN ('abc', 'N', 's  ')	0/0	0/0
+status	predicate	moosedb	control
+OK	ci = 'abc' AND ch = 'ABC'	0/0	0/0
+status	predicate	moosedb	control
+OK	ci = 'abc' COLLATE utf8mb4_bin	0/0	0/0
+status	predicate	moosedb	control
+OK	ci = 'abc ' COLLATE utf8mb4_general_nopad_ci	0/0	0/0
+INSERT INTO tf VALUES ('2026-02-01 00:00:01', 'xyz',   'xyz',  'xyz',   'xyz',   'xyz',  1),
+('2026-02-01 00:00:02', 'abc ',  'abc',  'abc',   'abc ',  'abc',  2),
+('2026-02-01 00:00:03', 'Ñandu', 'ñandú','ñandú', 'abc  ', 'n',    3),
+('2026-02-01 00:00:04', '😀',    '😀',   '😀',    '😀',    's',    4);
+INSERT INTO ctl VALUES ('2026-02-01 00:00:01', 'xyz',   'xyz',  'xyz',   'xyz',   'xyz',  1),
+('2026-02-01 00:00:02', 'abc ',  'abc',  'abc',   'abc ',  'abc',  2),
+('2026-02-01 00:00:03', 'Ñandu', 'ñandú','ñandú', 'abc  ', 'n',    3),
+('2026-02-01 00:00:04', '😀',    '😀',   '😀',    '😀',    's',    4);
+CALL sweep();
+status	predicate	moosedb	control
+OK	ci = 'abc'	1/2	1/2
+status	predicate	moosedb	control
+OK	ci IN ('ABC ', 'ñandu', 'zzz', '😀')	3/9	3/9
+status	predicate	moosedb	control
+OK	uni = 'ABÇ'	1/2	1/2
+status	predicate	moosedb	control
+OK	uni IN ('nandu', 'STRASSE', '')	1/3	1/3
+status	predicate	moosedb	control
+OK	bin = 'abc'	1/2	1/2
+status	predicate	moosedb	control
+OK	bin IN ('abc ', 'abc  ', 'ABC')	1/2	1/2
+status	predicate	moosedb	control
+OK	np = 'abc '	1/2	1/2
+status	predicate	moosedb	control
+OK	np IN ('abc', 'abc  ', '')	1/3	1/3
+status	predicate	moosedb	control
+OK	ch IN ('abc', 'N', 's  ')	3/9	3/9
+status	predicate	moosedb	control
+OK	ci = 'abc' AND ch = 'ABC'	1/2	1/2
+status	predicate	moosedb	control
+OK	ci = 'abc' COLLATE utf8mb4_bin	1/2	1/2
+status	predicate	moosedb	control
+OK	ci = 'abc ' COLLATE utf8mb4_general_nopad_ci	1/2	1/2
+INSERT INTO tf VALUES ('2026-02-02 00:00:01', 'abc', 'abc', 'abc', 'abc', 'abc', 50);
+INSERT INTO ctl VALUES ('2026-02-02 00:00:01', 'abc', 'abc', 'abc', 'abc', 'abc', 50);
+CALL sweep();
+status	predicate	moosedb	control
+OK	ci = 'abc'	2/52	2/52
+status	predicate	moosedb	control
+OK	ci IN ('ABC ', 'ñandu', 'zzz', '😀')	4/59	4/59
+status	predicate	moosedb	control
+OK	uni = 'ABÇ'	2/52	2/52
+status	predicate	moosedb	control
+OK	uni IN ('nandu', 'STRASSE', '')	1/3	1/3
+status	predicate	moosedb	control
+OK	bin = 'abc'	2/52	2/52
+status	predicate	moosedb	control
+OK	bin IN ('abc ', 'abc  ', 'ABC')	2/52	2/52
+status	predicate	moosedb	control
+OK	np = 'abc '	1/2	1/2
+status	predicate	moosedb	control
+OK	np IN ('abc', 'abc  ', '')	2/53	2/53
+status	predicate	moosedb	control
+OK	ch IN ('abc', 'N', 's  ')	4/59	4/59
+status	predicate	moosedb	control
+OK	ci = 'abc' AND ch = 'ABC'	2/52	2/52
+status	predicate	moosedb	control
+OK	ci = 'abc' COLLATE utf8mb4_bin	2/52	2/52
+status	predicate	moosedb	control
+OK	ci = 'abc ' COLLATE utf8mb4_general_nopad_ci	1/2	1/2
+# 5. many series and a large IN list (collation-equivalent values)
+TRUNCATE TABLE tf;
+TRUNCATE TABLE ctl;
+INSERT INTO tf SELECT '2026-03-01' + INTERVAL seq SECOND, CONCAT('Host', seq), CONCAT('hôst', seq MOD 5000), CONCAT('h', seq MOD 777, IF(seq MOD 3 = 0, ' ', '')), CONCAT('h', seq MOD 50), CONCAT('c', seq MOD 90), seq FROM seq_0_to_9999;
+INSERT INTO ctl SELECT * FROM tf;
+SELECT COUNT(*) FROM tf;
+COUNT(*)
+10000
+SELECT CONCAT(GROUP_CONCAT(CONCAT('\'HOST', seq, ' \', \'HÔST', seq, '\', \'h', seq, '  \'') SEPARATOR ', '), ', \'nope\'') INTO @in FROM seq_0_to_119;
+CALL cmpq('ci IN big list', CONCAT('ci IN (', @in, ')'));
+status	predicate	moosedb	control
+OK	ci IN big list	120/7140	120/7140
+CALL cmpq('uni IN big list', CONCAT('uni IN (', @in, ')'));
+status	predicate	moosedb	control
+OK	uni IN big list	240/614280	240/614280
+CALL cmpq('bin IN big list', CONCAT('bin IN (', @in, ')'));
+status	predicate	moosedb	control
+OK	bin IN big list	1560/7365540	1560/7365540
+CALL cmpq('np IN big list', CONCAT('np IN (', @in, ')'));
+status	predicate	moosedb	control
+OK	np IN big list	0/0	0/0
+CALL cmpq('ci IN big list AND ch', CONCAT('ci IN (', @in, ') AND ch IN (\'C1\', \'c2 \', \'c7\')'));
+status	predicate	moosedb	control
+OK	ci IN big list AND ch	6/290	6/290
+CALL cmp("uni = 'HOST5' OR ci = 'host5'");
+status	predicate	moosedb	control
+OK	uni = 'HOST5' OR ci = 'host5'	2/5010	2/5010
+INSERT INTO tf SELECT '2026-04-01' + INTERVAL seq SECOND, CONCAT('host', seq), CONCAT('HÔST', seq), 'zz', 'zz', 'zz', seq + 100000 FROM seq_0_to_199;
+INSERT INTO ctl SELECT * FROM tf WHERE n >= 100000;
+CALL cmpq('ci IN big list after append', CONCAT('ci IN (', @in, ')'));
+status	predicate	moosedb	control
+OK	ci IN big list after append	240/12014280	240/12014280
+CALL cmpq('uni IN big list after append', CONCAT('uni IN (', @in, ')'));
+status	predicate	moosedb	control
+OK	uni IN big list after append	360/12621420	360/12621420
+CALL cmp("ci = 'HOST150' AND uni = 'hôst150'");
+status	predicate	moosedb	control
+OK	ci = 'HOST150' AND uni = 'hôst150'	2/100300	2/100300
+# 6. pruning still happens (few rows read for one series)
+FLUSH STATUS;
+SELECT COUNT(*) FROM tf WHERE np = 'h7';
+COUNT(*)
+200
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	201
+# 7. TRUNCATE with a warm cache and the same number of series, no query
+#    in between: only the log identity (epoch) can tell the lists apart
+TRUNCATE TABLE tf;
+TRUNCATE TABLE ctl;
+INSERT INTO tf VALUES ('2026-05-01 00:00:01', 'aaa', 'aaa', 'aaa', 'aaa', 'a', 1), ('2026-05-01 00:00:02', 'bbb', 'bbb', 'bbb', 'bbb', 'b', 2);
+INSERT INTO ctl SELECT * FROM tf;
+CALL cmp("ci IN ('aaa', 'bbb')");
+status	predicate	moosedb	control
+OK	ci IN ('aaa', 'bbb')	2/3	2/3
+TRUNCATE TABLE tf;
+TRUNCATE TABLE ctl;
+INSERT INTO tf VALUES ('2026-05-02 00:00:01', 'bbb', 'bbb', 'bbb', 'bbb', 'b', 10), ('2026-05-02 00:00:02', 'ccc', 'ccc', 'ccc', 'ccc', 'c', 20);
+INSERT INTO ctl SELECT * FROM tf;
+CALL cmp("ci IN ('aaa', 'bbb')");
+status	predicate	moosedb	control
+OK	ci IN ('aaa', 'bbb')	1/10	1/10
+CALL cmp("ci = 'ccc'");
+status	predicate	moosedb	control
+OK	ci = 'ccc'	1/20	1/20
+CALL cmp("uni IN ('AAA', 'ccc')");
+status	predicate	moosedb	control
+OK	uni IN ('AAA', 'ccc')	1/20	1/20
+DROP PROCEDURE cmp;
+DROP PROCEDURE cmpq;
+DROP PROCEDURE sweep;
+DROP TABLE tf, ctl;
+# 8. expansions, contractions, ignorables and other collation families
+CREATE TABLE tx (
+ts  DATETIME NOT NULL,
+uni VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci COMMENT 'TAG',
+u14 VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_ai_ci COMMENT 'TAG',
+de  VARCHAR(32) CHARACTER SET latin1 COLLATE latin1_german2_ci COMMENT 'TAG',
+cz  VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_czech_ci COMMENT 'TAG',
+u16 VARCHAR(32) CHARACTER SET utf16 COLLATE utf16_general_ci COMMENT 'TAG',
+n   INT,
+INDEX(ts)
+) ENGINE=MooseDB;
+CREATE TABLE cx LIKE tx;
+ALTER TABLE cx ENGINE=MyISAM;
+CREATE PROCEDURE cmpx(p TEXT CHARACTER SET utf8mb4)
+BEGIN
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @a FROM tx WHERE ', p);
+EXECUTE IMMEDIATE CONCAT('SELECT CONCAT(COUNT(*), ''/'', IFNULL(SUM(n), 0)) INTO @b FROM cx WHERE ', p);
+SELECT IF(@a = @b, 'OK', 'FAIL') AS status, p AS predicate, @a AS moosedb, @b AS control;
+END//
+INSERT INTO tx VALUES ('2026-06-01 00:00:01', 'Straße', 'Straße', 'Straße', 'chata', 'Straße', 1),
+('2026-06-01 00:00:02', 'STRASSE', 'strasse', 'STRASSE', 'hata', 'strasse', 2),
+('2026-06-01 00:00:03', 'Mädchen', 'Madchen', 'Maedchen', 'cHata', 'MÄDCHEN', 3),
+('2026-06-01 00:00:04', CONCAT('ab', _utf8mb4 X'E2808B', 'c'), CONCAT('ab', _utf8mb4 X'C2AD', 'c'), 'abc', 'ch', 'abc ', 4),
+('2026-06-01 00:00:05', 'abc', 'abc', 'äbc', 'c', CONCAT('abc', _utf8mb4 X'E2808B'), 5),
+('2026-06-01 00:00:06', 'æ', 'ae', 'ä', 'h', 'ß', 6);
+INSERT INTO cx VALUES ('2026-06-01 00:00:01', 'Straße', 'Straße', 'Straße', 'chata', 'Straße', 1),
+('2026-06-01 00:00:02', 'STRASSE', 'strasse', 'STRASSE', 'hata', 'strasse', 2),
+('2026-06-01 00:00:03', 'Mädchen', 'Madchen', 'Maedchen', 'cHata', 'MÄDCHEN', 3),
+('2026-06-01 00:00:04', CONCAT('ab', _utf8mb4 X'E2808B', 'c'), CONCAT('ab', _utf8mb4 X'C2AD', 'c'), 'abc', 'ch', 'abc ', 4),
+('2026-06-01 00:00:05', 'abc', 'abc', 'äbc', 'c', CONCAT('abc', _utf8mb4 X'E2808B'), 5),
+('2026-06-01 00:00:06', 'æ', 'ae', 'ä', 'h', 'ß', 6);
+CALL cmpx("uni = 'strasse'");
+status	predicate	moosedb	control
+OK	uni = 'strasse'	2/3	2/3
+CALL cmpx("uni IN ('STRAßE', 'abc', 'ae')");
+status	predicate	moosedb	control
+OK	uni IN ('STRAßE', 'abc', 'ae')	4/12	4/12
+CALL cmpx("u14 IN ('STRASSE', 'MÄDCHEN', 'abc', 'AE')");
+status	predicate	moosedb	control
+OK	u14 IN ('STRASSE', 'MÄDCHEN', 'abc', 'AE')	6/21	6/21
+CALL cmpx("de IN ('strasse', 'MAEDCHEN', 'AEBC', 'ae')");
+status	predicate	moosedb	control
+OK	de IN ('strasse', 'MAEDCHEN', 'AEBC', 'ae')	5/17	5/17
+CALL cmpx("cz IN ('CHATA', 'ch', 'c', 'h')");
+status	predicate	moosedb	control
+OK	cz IN ('CHATA', 'ch', 'c', 'h')	4/16	4/16
+CALL cmpx("u16 IN ('STRASSE', 'mädchen', 'abc', 'ss')");
+status	predicate	moosedb	control
+OK	u16 IN ('STRASSE', 'mädchen', 'abc', 'ss')	3/9	3/9
+CALL cmpx(CONCAT("uni = 'ab", _utf8mb4 X'E2808B', "c'"));
+status	predicate	moosedb	control
+OK	uni = 'ab​c'	2/9	2/9
+INSERT INTO tx VALUES ('2026-06-02 00:00:01', 'strasse', 'STRAßE', 'straße', 'CH', 'STRASSE', 100);
+INSERT INTO cx VALUES ('2026-06-02 00:00:01', 'strasse', 'STRAßE', 'straße', 'CH', 'STRASSE', 100);
+CALL cmpx("uni = 'Straße' AND u14 = 'strasse'");
+status	predicate	moosedb	control
+OK	uni = 'Straße' AND u14 = 'strasse'	3/103	3/103
+CALL cmpx("de = 'STRASSE' AND cz = 'ch'");
+status	predicate	moosedb	control
+OK	de = 'STRASSE' AND cz = 'ch'	1/100	1/100
+DROP PROCEDURE cmpx;
+DROP TABLE tx, cx;

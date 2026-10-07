@@ -24,7 +24,11 @@ pub(crate) fn encode(bits: impl IntoIterator<Item = bool>, out: &mut Vec<u8>) {
 }
 
 pub(crate) fn decode(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<bool>> {
-    // `count` comes from the file: start small and let the runs grow the vector.
+    // `count` comes from the file: start small and let the runs grow the vector,
+    // and never grow past the decode limit (a run of a few bytes can be huge).
+    if count > super::MAX_DECODE_BYTES {
+        return Err(corrupt(format!("RLE stream claims {count} values")));
+    }
     let mut out = Vec::with_capacity(count.min(r.remaining().saturating_mul(64)));
     let mut current = false;
     while out.len() < count {

@@ -132,6 +132,22 @@ SET GLOBAL moosedb_chunk_cache_size = DEFAULT;
 SELECT @@GLOBAL.moosedb_chunk_cache_size;
 @@GLOBAL.moosedb_chunk_cache_size
 134217728
+SET GLOBAL moosedb_batch_memory_budget = 1;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_batch_memory_budget value: '1'
+SELECT @@GLOBAL.moosedb_batch_memory_budget;
+@@GLOBAL.moosedb_batch_memory_budget
+16777216
+SET GLOBAL moosedb_batch_memory_budget = 18446744073709551615;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_batch_memory_budget value: '18446744073709551615'
+SELECT @@GLOBAL.moosedb_batch_memory_budget;
+@@GLOBAL.moosedb_batch_memory_budget
+1099511627776
+SET GLOBAL moosedb_batch_memory_budget = DEFAULT;
+SELECT @@GLOBAL.moosedb_batch_memory_budget;
+@@GLOBAL.moosedb_batch_memory_budget
+1073741824
 SET GLOBAL moosedb_max_open_chunks = DEFAULT, moosedb_compaction_trigger_chunks = DEFAULT,
 moosedb_memtable_flush_threshold = DEFAULT, moosedb_bloom_filter_false_positive_rate = DEFAULT,
 moosedb_retention_check_interval = DEFAULT;
@@ -144,6 +160,7 @@ SELECT @@GLOBAL.moosedb_max_open_chunks, @@GLOBAL.moosedb_compaction_trigger_chu
 SELECT VARIABLE_NAME, VARIABLE_SCOPE, VARIABLE_TYPE, READ_ONLY, NUMERIC_MIN_VALUE, NUMERIC_MAX_VALUE
 FROM information_schema.SYSTEM_VARIABLES WHERE VARIABLE_NAME LIKE 'MOOSEDB%' ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_SCOPE	VARIABLE_TYPE	READ_ONLY	NUMERIC_MIN_VALUE	NUMERIC_MAX_VALUE
+MOOSEDB_BATCH_MEMORY_BUDGET	GLOBAL	BIGINT UNSIGNED	NO	16777216	1099511627776
 MOOSEDB_BLOOM_FILTER_FALSE_POSITIVE_RATE	GLOBAL	DOUBLE	NO	0.000001	0.5
 MOOSEDB_CHUNK_CACHE_SIZE	GLOBAL	BIGINT UNSIGNED	NO	0	18446744073709551615
 MOOSEDB_COMPACTION_THREADS	GLOBAL	INT UNSIGNED	YES	1	64
@@ -274,3 +291,4 @@ SET GLOBAL moosedb_retention_check_interval = DEFAULT;
 SET GLOBAL moosedb_bloom_filter_false_positive_rate = DEFAULT;
 SET GLOBAL moosedb_chunk_cache_size = DEFAULT;
 SET GLOBAL moosedb_max_open_chunks = DEFAULT;
+SET GLOBAL moosedb_batch_memory_budget = DEFAULT;

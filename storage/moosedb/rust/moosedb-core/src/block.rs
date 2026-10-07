@@ -167,8 +167,36 @@ pub(crate) fn unpack(bytes: &[u8]) -> Result<BlockPayload> {
     Ok(BlockPayload { encoding, data })
 }
 
-/// Decodes `n` values of type `ty` from an unpacked block.
-pub(crate) fn decode(ty: ColumnType, n: usize, block: &BlockPayload) -> Result<Vec<Value>> {
+/// Rejects a decode that would materialize more than `MAX_DECODE_BYTES`.
+/// `n` comes from the file and a few bytes can encode a huge run (RLE booleans,
+/// Simple8b zeros), so the size of what we are about to allocate is bounded by
+/// the count itself, before anything is allocated.
+pub(crate) fn check_materialization(n: usize, bytes_per_value: usize) -> Result<()> {
+    match n.checked_mul(bytes_per_value) {
+        Some(b) if b <= compression::MAX_DECODE_BYTES => Ok(()),
+        _ => Err(corrupt(format!(
+            "column block claims {n} values ({bytes_per_value} bytes each in memory): over the {} byte decode limit",
+            compression::MAX_DECODE_BYTES
+        ))),
+    }
+}
+
+/// The present (non-NULL) values of a block, still in their encoded domain.
+enum Present<'a> {
+    Ints(Vec<i64>),
+    Bits(Vec<u64>),
+    Bools(Vec<bool>),
+    Bytes(Vec<&'a [u8]>),
+}
+
+/// Null map, value count and the reader positioned at the values.
+struct Parsed<'a> {
+    r: ByteReader<'a>,
+    nulls: Option<Vec<bool>>,
+    present: usize,
+}
+
+fn parse_prefix(n: usize, block: &BlockPayload) -> Result<Parsed<'_>> {
     let mut r = ByteReader::new(&block.data);
     let nulls = match r.u8()? {
         0 => None,
@@ -180,60 +208,188 @@ pub(crate) fn decode(ty: ColumnType, n: usize, block: &BlockPayload) -> Result<V
         f => return Err(corrupt(format!("invalid null flag {f}"))),
     };
     let present = nulls.as_ref().map_or(n, |m| m.iter().filter(|b| !**b).count());
+    Ok(Parsed { r, nulls, present })
+}
+
+fn decode_present<'a>(ty: ColumnType, encoding: u8, r: &mut ByteReader<'a>, present: usize) -> Result<Present<'a>> {
     let expect = |e: u8| {
-        if block.encoding == e {
+        if encoding == e {
             Ok(())
         } else {
-            Err(corrupt(format!("encoding {} does not match column type {ty:?}", block.encoding)))
+            Err(corrupt(format!("encoding {encoding} does not match column type {ty:?}")))
         }
     };
-
-    let values: Vec<Value> = match ty {
+    let values = match ty {
         ColumnType::Timestamp => {
             expect(ENC_DELTA_OF_DELTA)?;
-            delta::decode_delta_of_delta(&mut r, present)?.into_iter().map(Value::Timestamp).collect()
+            Present::Ints(delta::decode_delta_of_delta(r, present)?)
         }
         ColumnType::Int64 => {
             expect(ENC_DELTA)?;
-            delta::decode_delta(&mut r, present)?.into_iter().map(Value::Int).collect()
+            Present::Ints(delta::decode_delta(r, present)?)
         }
         ColumnType::Float64 => {
             expect(ENC_GORILLA64)?;
-            gorilla::decode(r.take(r.remaining())?, present, 64)?
-                .into_iter()
-                .map(|b| Value::Float64(f64::from_bits(b)))
-                .collect()
+            Present::Bits(gorilla::decode(r.take(r.remaining())?, present, 64)?)
         }
         ColumnType::Float32 => {
             expect(ENC_GORILLA32)?;
-            gorilla::decode(r.take(r.remaining())?, present, 32)?
-                .into_iter()
-                .map(|b| Value::Float32(f32::from_bits(b as u32)))
-                .collect()
+            Present::Bits(gorilla::decode(r.take(r.remaining())?, present, 32)?)
         }
         ColumnType::Bool => {
             expect(ENC_BOOL_RLE)?;
-            rle::decode(&mut r, present)?.into_iter().map(Value::Bool).collect()
+            Present::Bools(rle::decode(r, present)?)
         }
         ColumnType::Varchar | ColumnType::Decimal => {
             expect(ENC_PLAIN)?;
-            (0..present).map(|_| Ok(Value::Bytes(r.bytes()?.to_vec()))).collect::<Result<_>>()?
+            // Every value takes at least its 4-byte length prefix.
+            if present > r.remaining() / 4 {
+                return Err(corrupt("column block holds fewer values than expected"));
+            }
+            let mut v = Vec::with_capacity(present);
+            for _ in 0..present {
+                v.push(r.bytes()?);
+            }
+            Present::Bytes(v)
         }
         ColumnType::Tag => return Err(corrupt("tag column stored as data block")),
     };
     if r.remaining() != 0 {
         return Err(corrupt("trailing bytes in column block"));
     }
-    if values.len() != present {
+    let got = match &values {
+        Present::Ints(v) => v.len(),
+        Present::Bits(v) => v.len(),
+        Present::Bools(v) => v.len(),
+        Present::Bytes(v) => v.len(),
+    };
+    if got != present {
         return Err(corrupt("column block value count mismatch"));
     }
+    Ok(values)
+}
 
+/// Decodes `n` values of type `ty` from an unpacked block.
+pub(crate) fn decode(ty: ColumnType, n: usize, block: &BlockPayload) -> Result<Vec<Value>> {
+    check_materialization(n, std::mem::size_of::<Value>())?;
+    let Parsed { mut r, nulls, present } = parse_prefix(n, block)?;
+    let values: Vec<Value> = match decode_present(ty, block.encoding, &mut r, present)? {
+        Present::Ints(v) if ty == ColumnType::Timestamp => v.into_iter().map(Value::Timestamp).collect(),
+        Present::Ints(v) => v.into_iter().map(Value::Int).collect(),
+        Present::Bits(v) if ty == ColumnType::Float64 => {
+            v.into_iter().map(|b| Value::Float64(f64::from_bits(b))).collect()
+        }
+        Present::Bits(v) => v.into_iter().map(|b| Value::Float32(f32::from_bits(b as u32))).collect(),
+        Present::Bools(v) => v.into_iter().map(Value::Bool).collect(),
+        Present::Bytes(v) => v.into_iter().map(|b| Value::Bytes(b.to_vec())).collect(),
+    };
     let Some(nulls) = nulls else { return Ok(values) };
     let mut it = values.into_iter();
     nulls
         .into_iter()
         .map(|is_null| if is_null { Ok(Value::Null) } else { it.next().ok_or_else(|| corrupt("null map mismatch")) })
         .collect()
+}
+
+/// One decoded column in its native width (8 bytes per number instead of the
+/// 24 of a `Value`), with NULL slots filled by a default and flagged in
+/// `nulls`. Random access by ordinal is O(1), which is what `rnd_pos` needs.
+pub(crate) struct ColumnData {
+    ty: ColumnType,
+    nulls: Option<Vec<bool>>,
+    values: Dense,
+}
+
+enum Dense {
+    Ints(Vec<i64>),
+    Bits64(Vec<u64>),
+    Bits32(Vec<u32>),
+    Bools(Vec<bool>),
+    /// `n + 1` offsets into `data`.
+    Bytes {
+        offsets: Vec<u32>,
+        data: Vec<u8>,
+    },
+}
+
+fn spread<T: Copy + Default>(present: Vec<T>, nulls: Option<&[bool]>) -> Result<Vec<T>> {
+    let Some(nulls) = nulls else { return Ok(present) };
+    let mut it = present.into_iter();
+    nulls
+        .iter()
+        .map(|&is_null| if is_null { Ok(T::default()) } else { it.next().ok_or_else(|| corrupt("null map mismatch")) })
+        .collect()
+}
+
+/// Like [`decode`], but keeps the column compact (see [`ColumnData`]).
+pub(crate) fn decode_compact(ty: ColumnType, n: usize, block: &BlockPayload) -> Result<ColumnData> {
+    check_materialization(n, 9)?;
+    let Parsed { mut r, nulls, present } = parse_prefix(n, block)?;
+    let nl = nulls.as_deref();
+    let values = match decode_present(ty, block.encoding, &mut r, present)? {
+        Present::Ints(v) => Dense::Ints(spread(v, nl)?),
+        Present::Bits(v) if ty == ColumnType::Float64 => Dense::Bits64(spread(v, nl)?),
+        Present::Bits(v) => Dense::Bits32(spread(v.into_iter().map(|b| b as u32).collect(), nl)?),
+        Present::Bools(v) => Dense::Bools(spread(v, nl)?),
+        Present::Bytes(v) => {
+            let total: usize = v.iter().map(|b| b.len()).sum();
+            let mut data = Vec::with_capacity(total);
+            let mut offsets = Vec::with_capacity(n + 1);
+            offsets.push(0u32);
+            let mut it = v.into_iter();
+            for k in 0..n {
+                if !nl.is_some_and(|m| m[k]) {
+                    data.extend_from_slice(it.next().ok_or_else(|| corrupt("null map mismatch"))?);
+                }
+                offsets.push(u32::try_from(data.len()).map_err(|_| corrupt("column block too large"))?);
+            }
+            Dense::Bytes { offsets, data }
+        }
+    };
+    Ok(ColumnData { ty, nulls, values })
+}
+
+impl ColumnData {
+    pub(crate) fn len(&self) -> usize {
+        match &self.values {
+            Dense::Ints(v) => v.len(),
+            Dense::Bits64(v) => v.len(),
+            Dense::Bits32(v) => v.len(),
+            Dense::Bools(v) => v.len(),
+            Dense::Bytes { offsets, .. } => offsets.len() - 1,
+        }
+    }
+
+    /// Heap bytes held (cache accounting).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let nulls = self.nulls.as_ref().map_or(0, Vec::len);
+        nulls
+            + match &self.values {
+                Dense::Ints(v) => v.len() * 8,
+                Dense::Bits64(v) => v.len() * 8,
+                Dense::Bits32(v) => v.len() * 4,
+                Dense::Bools(v) => v.len(),
+                Dense::Bytes { offsets, data } => offsets.len() * 4 + data.len(),
+            }
+    }
+
+    /// The value at `i`, or `None` past the end.
+    pub(crate) fn value_at(&self, i: usize) -> Option<Value> {
+        if i >= self.len() {
+            return None;
+        }
+        if self.nulls.as_ref().is_some_and(|m| m[i]) {
+            return Some(Value::Null);
+        }
+        Some(match &self.values {
+            Dense::Ints(v) if self.ty == ColumnType::Timestamp => Value::Timestamp(v[i]),
+            Dense::Ints(v) => Value::Int(v[i]),
+            Dense::Bits64(v) => Value::Float64(f64::from_bits(v[i])),
+            Dense::Bits32(v) => Value::Float32(f32::from_bits(v[i])),
+            Dense::Bools(v) => Value::Bool(v[i]),
+            Dense::Bytes { offsets, data } => Value::Bytes(data[offsets[i] as usize..offsets[i + 1] as usize].to_vec()),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +458,87 @@ mod tests {
         }
         // A consistent block still unpacks.
         assert!(unpack(&forge(compression::CODEC_ZSTD, small.len() as u32, &zstd)).is_ok());
+    }
+
+    /// A block whose valid RLE stream (a handful of bytes) claims 2^27 values.
+    fn forged_bool_block() -> BlockPayload {
+        let mut data = vec![0u8]; // no NULLs
+        put_varint(&mut data, 0);
+        put_varint(&mut data, (1 << 27) - 1);
+        BlockPayload { encoding: ENC_BOOL_RLE, data }
+    }
+
+    #[test]
+    fn a_tiny_block_cannot_make_decode_materialize_gigabytes() {
+        // Fuzz finding: BOOL, RLE, 2^27 rows ⇒ 2^27 × 24 B of `Value`.
+        let block = forged_bool_block();
+        for n in [1usize << 27, (1 << 27) - 1, 100_000_000, 30_000_000, usize::MAX] {
+            assert!(matches!(decode(ColumnType::Bool, n, &block), Err(crate::error::Error::Corrupt(_))), "{n}");
+            assert!(matches!(decode_compact(ColumnType::Bool, n, &block), Err(crate::error::Error::Corrupt(_))), "{n}");
+        }
+        // Delta streams: 4.5 MB of zero words claim 2^27 integers.
+        let mut ints = vec![0u8];
+        ints.extend_from_slice(&0i64.to_le_bytes());
+        ints.push(0);
+        for _ in 0..(1usize << 27).div_ceil(240) {
+            ints.extend_from_slice(&0u64.to_le_bytes());
+        }
+        for (ty, enc) in [(ColumnType::Int64, ENC_DELTA), (ColumnType::Timestamp, ENC_DELTA_OF_DELTA)] {
+            let block = BlockPayload { encoding: enc, data: ints.clone() };
+            assert!(matches!(decode(ty, 1 << 27, &block), Err(crate::error::Error::Corrupt(_))));
+            assert!(matches!(decode_compact(ty, 1 << 27, &block), Err(crate::error::Error::Corrupt(_))));
+        }
+        // What a writer produces still decodes: 1M identical booleans are a few bytes.
+        let vals = vec![Value::Bool(true); 1_000_000];
+        let refs: Vec<&Value> = vals.iter().collect();
+        let enc = encode(ColumnType::Bool, &refs, Codec::None).unwrap();
+        assert!(enc.bytes.len() < 64);
+        let p = unpack(&enc.bytes).unwrap();
+        assert_eq!(decode(ColumnType::Bool, vals.len(), &p).unwrap().len(), 1_000_000);
+    }
+
+    #[test]
+    fn compact_columns_return_exactly_what_the_value_decoder_does() {
+        let n = 1000;
+        let cases: Vec<(ColumnType, Vec<Value>)> = vec![
+            (ColumnType::Timestamp, (0..n).map(|i| Value::Timestamp(1_700_000_000 + i * 7)).collect()),
+            (
+                ColumnType::Int64,
+                (0..n).map(|i| if i % 5 == 0 { Value::Null } else { Value::Int(i * i - 99) }).collect(),
+            ),
+            (
+                ColumnType::Float64,
+                (0..n).map(|i| if i % 3 == 0 { Value::Null } else { Value::Float64(i as f64 / 7.0) }).collect(),
+            ),
+            (ColumnType::Float32, (0..n).map(|i| Value::Float32(i as f32 * 0.5)).collect()),
+            (
+                ColumnType::Bool,
+                (0..n).map(|i| if i % 11 == 0 { Value::Null } else { Value::Bool(i % 4 < 2) }).collect(),
+            ),
+            (
+                ColumnType::Varchar,
+                (0..n)
+                    .map(|i| match i % 4 {
+                        0 => Value::Null,
+                        1 => Value::Bytes(vec![]),
+                        _ => Value::Bytes(format!("v{i}").into_bytes()),
+                    })
+                    .collect(),
+            ),
+            (ColumnType::Decimal, vec![Value::Null, Value::Null]),
+            (ColumnType::Int64, vec![Value::Int(5)]),
+        ];
+        for (ty, vals) in cases {
+            let refs: Vec<&Value> = vals.iter().collect();
+            let p = unpack(&encode(ty, &refs, Codec::Lz4).unwrap().bytes).unwrap();
+            let compact = decode_compact(ty, vals.len(), &p).unwrap();
+            assert_eq!(compact.len(), vals.len(), "{ty:?}");
+            for (i, v) in vals.iter().enumerate() {
+                assert_eq!(&compact.value_at(i).unwrap(), v, "{ty:?} #{i}");
+            }
+            assert!(compact.value_at(vals.len()).is_none());
+            assert_eq!(decode(ty, vals.len(), &p).unwrap(), vals);
+        }
     }
 
     #[test]

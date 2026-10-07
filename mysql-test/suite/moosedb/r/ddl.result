@@ -4,6 +4,7 @@ ENGINE	SUPPORT	TRANSACTIONS	XA	SAVEPOINTS
 MooseDB	YES	NO	NO	NO
 SHOW VARIABLES LIKE 'moosedb%';
 Variable_name	Value
+moosedb_batch_memory_budget	1073741824
 moosedb_bloom_filter_false_positive_rate	0.010000
 moosedb_chunk_cache_size	134217728
 moosedb_compaction_threads	2

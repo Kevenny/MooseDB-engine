@@ -151,6 +151,53 @@ chave configurada não decifra a tabela, ela não abre (`Got error 192 ... from
 MooseDB`, erro de decriptação) — nada é descartado; corrija a configuração
 de chaves e reabra.
 
+## Backup
+
+> **Atenção: `mariadb-backup` NÃO copia tabelas MooseDB.** Ele termina com
+> sucesso (rc=0), mas ignora os diretórios `<banco>/<tabela>/` da engine; na
+> restauração as tabelas aparecem em `SHOW TABLES` e falham com
+> `ERROR 1932 ... doesn't exist in engine`. O mariabackup só copia arquivos de
+> uma lista fixa de extensões e pula subdiretórios — não há API para uma engine
+> de terceiros participar.
+
+Métodos suportados hoje:
+
+| Método | Consistência | Observação |
+|---|---|---|
+| `mariadb-dump --lock-all-tables` | consistente entre tabelas | bloqueia escritas durante todo o dump; dump em texto claro (mesmo de tabela cifrada) |
+| `BACKUP STAGE` + cópia do diretório (abaixo) | consistente | escritas pausadas só durante a cópia |
+
+Não use `mariadb-dump --single-transaction` nem `--skip-lock-tables`: a
+engine não é transacional, e tabelas diferentes saem de instantes diferentes.
+`FLUSH TABLES ... FOR EXPORT` não é suportado.
+
+Cópia física manual (testada com carga concorrente, inclusive cifrada):
+
+```sql
+-- sessão A, mantida aberta durante toda a cópia
+BACKUP STAGE START;
+BACKUP STAGE FLUSH;          -- a partir daqui INSERTs esperam
+BACKUP STAGE BLOCK_DDL;      -- espera statements em andamento terminarem inteiros
+BACKUP STAGE BLOCK_COMMIT;
+-- (fora do SQL) copie <datadir>/<banco>/<tabela>/ de cada tabela MooseDB,
+-- e rode `mariadb-backup --backup --no-lock` para InnoDB/Aria, se houver
+BACKUP STAGE END;
+```
+
+**Risco residual da cópia manual**: a manutenção em background não é pausada
+pelo `BACKUP STAGE` e pode substituir ou apagar chunks no meio da cópia
+(compactação, recodificação de chunks que esfriaram, retenção) — o backup
+fica desencontrado e a restauração falha com `table is marked as crashed`.
+Reduza o risco com `SET GLOBAL moosedb_retention_check_interval = 0` e
+`moosedb_compaction_trigger_chunks = 10000` antes (restaure depois), e
+**sempre** valide a cópia restaurada com `CHECK TABLE`. A recodificação de
+chunks frios não tem como ser desligada hoje. Até a integração com
+`BACKUP STAGE` (pausa da manutenção) ser implementada, prefira
+`mariadb-dump --lock-all-tables` para backups de produção.
+
+Na restauração, copie os diretórios de volta com o mesmo
+`file_key_management`; o WAL é reaplicado na abertura.
+
 ## Variáveis globais
 
 | Variável | Padrão | Efeito |
@@ -161,7 +208,8 @@ de chaves e reabra.
 | `moosedb_compaction_threads` | 2 | threads de manutenção (somente leitura) |
 | `moosedb_retention_check_interval` | 3600 | segundos entre varreduras de retenção (0 = desliga) |
 | `moosedb_bloom_filter_false_positive_rate` | 0.01 | Bloom filter dos chunks novos |
-| `moosedb_chunk_cache_size` | 128 MiB | cache de blocos decodificados |
+| `moosedb_chunk_cache_size` | 128 MiB | cache de blocos e de séries decodificadas (reduzir despeja na hora) |
+| `moosedb_batch_memory_budget` | 1 GiB | memória total de statements em andamento; acima disso, os grandes fazem spill antecipado |
 | `moosedb_max_open_chunks` | 100 | descritores de chunk mantidos abertos |
 
 ## Replicação

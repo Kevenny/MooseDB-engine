@@ -1,0 +1,33 @@
+CREATE TABLE t (ts DATETIME(6) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO t VALUES ('2025-12-31', 'X', 0);
+connect  wr,localhost,root,,test;
+connection default;
+connection wr;
+INSERT INTO t SELECT '2026-01-01' + INTERVAL seq SECOND, IF(seq MOD 2, 'X', 'Y1'), 1 FROM seq_1_to_300000;
+connection default;
+partial_seen = 0
+observed_during_insert = 1
+connection wr;
+connection default;
+connection wr;
+INSERT INTO t SELECT '2026-01-01' + INTERVAL seq SECOND, IF(seq MOD 2, 'X', 'Y2'), 2 FROM seq_1_to_300000;
+connection default;
+partial_seen = 0
+observed_during_insert = 1
+connection wr;
+connection default;
+connection wr;
+INSERT INTO t SELECT '2026-01-01' + INTERVAL seq SECOND, IF(seq MOD 2, 'X', 'Y3'), 3 FROM seq_1_to_300000;
+connection default;
+partial_seen = 0
+observed_during_insert = 1
+connection wr;
+connection default;
+SELECT host, COUNT(*) FROM t WHERE host IN ('X', 'Y1', 'Y2', 'Y3') GROUP BY host ORDER BY host;
+host	COUNT(*)
+X	450001
+Y1	150000
+Y2	150000
+Y3	150000
+disconnect wr;
+DROP TABLE t;
